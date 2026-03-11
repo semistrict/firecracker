@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
 use kvm_bindings::{
-    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KvmIrqRouting,
-    kvm_irq_routing_entry, kvm_userspace_memory_region,
+    kvm_irq_routing_entry, kvm_userspace_memory_region, KvmIrqRouting, KVM_IRQ_ROUTING_IRQCHIP,
+    KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID,
 };
 use kvm_ioctls::VmFd;
 use log::debug;
@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::arch::{host_page_size, GSI_MSI_END};
 pub use crate::arch::{ArchVm as Vm, ArchVmError, VmState};
-use crate::arch::{GSI_MSI_END, host_page_size};
 use crate::logger::info;
 use crate::pci::{DeviceRelocation, DeviceRelocationError, PciDevice};
 use crate::persist::CreateSnapshotError;
@@ -38,7 +38,7 @@ use crate::vstate::memory::{
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
-use crate::{DirtyBitmap, Vcpu, mem_size_mib};
+use crate::{mem_size_mib, DirtyBitmap, Vcpu};
 
 #[derive(Debug, Serialize, Deserialize)]
 /// A struct representing an interrupt line used by some device of the microVM
@@ -393,6 +393,60 @@ impl Vm {
             .map_err(|err| MemoryBackingFile("sync_all", err))
     }
 
+    /// Write guest memory to a loophole volume.
+    ///
+    /// For full snapshots, creates a new volume of the required size.
+    /// For diff snapshots, opens an existing volume and writes only dirty pages.
+    #[cfg(feature = "loophole")]
+    pub(crate) fn snapshot_memory_to_loophole(
+        &self,
+        volume_name: &str,
+        snapshot_type: SnapshotType,
+    ) -> Result<(), CreateSnapshotError> {
+        use crate::devices::virtio::block::virtio::io::loophole_io::{
+            LoopholeEngine, LoopholeMemWriter,
+        };
+
+        use self::CreateSnapshotError::*;
+
+        let mem_size_mib = mem_size_mib(self.guest_memory());
+        let expected_size = mem_size_mib * 1024 * 1024;
+
+        let engine = match snapshot_type {
+            SnapshotType::Full => LoopholeEngine::create(volume_name, expected_size),
+            SnapshotType::Diff => LoopholeEngine::open(volume_name),
+        }
+        .map_err(|e| {
+            MemoryBackingFile(
+                "loophole open/create",
+                std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")),
+            )
+        })?;
+
+        let mut writer = LoopholeMemWriter::new(engine);
+
+        match snapshot_type {
+            SnapshotType::Diff => {
+                let dirty_bitmap = self.get_dirty_bitmap()?;
+                self.guest_memory().dump_dirty(&mut writer, &dirty_bitmap)?;
+            }
+            SnapshotType::Full => {
+                self.guest_memory().dump(&mut writer)?;
+                self.reset_dirty_bitmap();
+                self.guest_memory().reset_dirty();
+            }
+        };
+
+        writer.engine().flush().map_err(|e| {
+            MemoryBackingFile(
+                "loophole flush",
+                std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")),
+            )
+        })?;
+
+        Ok(())
+    }
+
     /// Register a device IRQ
     pub fn register_irq(&self, fd: &EventFd, gsi: u32) -> Result<(), errno::Error> {
         self.common.fd.register_irqfd(fd, gsi)?;
@@ -552,8 +606,8 @@ impl DeviceRelocation for Vm {
 pub(crate) mod tests {
     use std::sync::atomic::Ordering;
 
-    use vm_memory::GuestAddress;
     use vm_memory::mmap::MmapRegionBuilder;
+    use vm_memory::GuestAddress;
 
     use super::*;
     use crate::snapshot::Persist;

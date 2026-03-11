@@ -22,9 +22,9 @@ use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
 use crate::cpu_config::templates::StaticCpuTemplate;
 #[cfg(target_arch = "x86_64")]
-use crate::cpu_config::x86_64::cpuid::CpuidTrait;
-#[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
+#[cfg(target_arch = "x86_64")]
+use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 use crate::device_manager::{DevicePersistError, DevicesState};
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
@@ -41,7 +41,7 @@ use crate::vstate::memory::{
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
-use crate::{EventManager, Vmm, vstate};
+use crate::{vstate, EventManager, Vmm};
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -168,14 +168,72 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
+    #[allow(unused_mut)]
+    let mut microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
+    // Clone loophole-backed block devices so the snapshot references a
+    // writable fork of the volume. Clone includes an implicit flush.
+    #[cfg(feature = "loophole")]
+    clone_loophole_volumes(&mut microvm_state, &params.snapshot_path)?;
+
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    vmm.vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    #[cfg(feature = "loophole")]
+    if let Some(ref mem_vol_name) = params.mem_volume_name {
+        // Write guest memory to a loophole volume and clone it for the snapshot.
+        vmm.vm
+            .snapshot_memory_to_loophole(mem_vol_name, params.snapshot_type)?;
+
+        // Clone the memory volume so the snapshot references a fork.
+        // The clone name is unique per invocation (includes timestamp) and is
+        // written to a sidecar file alongside the snapshot so that callers
+        // (e.g. loophole-clone.sh) can read it without guessing.
+        let clone_name = {
+            let stem = params
+                .snapshot_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("snap");
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            format!("{mem_vol_name}-{stem}-{ts}")
+        };
+        {
+            use crate::devices::virtio::block::virtio::io::loophole_io::LoopholeEngine;
+            let engine = LoopholeEngine::open(mem_vol_name).map_err(|e| {
+                CreateSnapshotError::SnapshotBackingFile(
+                    "loophole open for mem clone",
+                    io::Error::new(io::ErrorKind::Other, format!("{e}")),
+                )
+            })?;
+            engine.clone_volume(&clone_name).map_err(|e| {
+                CreateSnapshotError::SnapshotBackingFile(
+                    "loophole clone mem",
+                    io::Error::new(io::ErrorKind::Other, format!("{e}")),
+                )
+            })?;
+            info!("Loophole: cloned memory volume {mem_vol_name} -> {clone_name}");
+        }
+        // Write the clone name to a sidecar file so the caller can find it.
+        let sidecar = params.snapshot_path.with_extension("mem-clone");
+        std::fs::write(&sidecar, &clone_name).map_err(|e| {
+            CreateSnapshotError::SnapshotBackingFile("write mem-clone sidecar", e)
+        })?;
+    }
+
+    #[cfg(feature = "loophole")]
+    let use_file = params.mem_volume_name.is_none();
+    #[cfg(not(feature = "loophole"))]
+    let use_file = true;
+
+    if use_file {
+        vmm.vm
+            .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -183,6 +241,70 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
 
+    Ok(())
+}
+
+/// For each loophole-backed block device in the snapshot state, clone the
+/// volume and update the disk_path to the clone name. The running VM keeps
+/// using the original volume; the snapshot references the fork.
+#[cfg(feature = "loophole")]
+fn clone_loophole_volumes(
+    state: &mut MicrovmState,
+    snapshot_path: &Path,
+) -> Result<(), CreateSnapshotError> {
+    use crate::devices::virtio::block::persist::BlockState;
+    use crate::devices::virtio::block::virtio::persist::{FileEngineTypeState, VirtioBlockState};
+
+    // Derive a snapshot tag from the snapshot file name + unix timestamp so
+    // that repeated snapshots to the same path produce distinct clone names.
+    let snap_tag = {
+        let stem = snapshot_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("snap");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        format!("{stem}-{ts}")
+    };
+
+    // Helper closure to clone loophole volumes in block device state.
+    let clone_block = |vbs: &mut VirtioBlockState| -> Result<(), CreateSnapshotError> {
+        if vbs.file_engine_type != FileEngineTypeState::Loophole {
+            return Ok(());
+        }
+        let volume_name = &vbs.disk_path;
+        let clone_name = format!("{volume_name}-{snap_tag}");
+
+        use crate::devices::virtio::block::virtio::io::loophole_io::LoopholeEngine;
+        let engine = LoopholeEngine::open(volume_name).map_err(|e| {
+            CreateSnapshotError::SnapshotBackingFile(
+                "loophole open for clone",
+                io::Error::new(io::ErrorKind::Other, format!("{e}")),
+            )
+        })?;
+        engine.clone_volume(&clone_name).map_err(|e| {
+            CreateSnapshotError::SnapshotBackingFile(
+                "loophole clone",
+                io::Error::new(io::ErrorKind::Other, format!("{e}")),
+            )
+        })?;
+        info!("Loophole: cloned {volume_name} -> {clone_name}");
+        vbs.disk_path = clone_name;
+        Ok(())
+    };
+
+    for block_dev in &mut state.device_states.mmio_state.block_devices {
+        if let BlockState::Virtio(ref mut vbs) = block_dev.device_state {
+            clone_block(vbs)?;
+        }
+    }
+    for block_dev in &mut state.device_states.pci_state.block_devices {
+        if let BlockState::Virtio(ref mut vbs) = block_dev.device_state {
+            clone_block(vbs)?;
+        }
+    }
     Ok(())
 }
 
@@ -352,6 +474,9 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     File(#[from] GuestMemoryFromFileError),
     /// Error creating guest memory from uffd: {0}
     Uffd(#[from] GuestMemoryFromUffdError),
+    /// Error creating guest memory from loophole volume: {0}
+    #[cfg(feature = "loophole")]
+    Loophole(#[from] GuestMemoryFromLoopholeError),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -457,6 +582,24 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        #[cfg(feature = "loophole")]
+        MemBackendType::Loophole => {
+            let vol_name = mem_backend_path
+                .to_str()
+                .expect("loophole volume name must be valid UTF-8");
+            (
+                guest_memory_from_loophole(vol_name, mem_state, track_dirty_pages)
+                    .map_err(RestoreFromSnapshotGuestMemoryError::Loophole)?,
+                None,
+            )
+        }
+        #[cfg(not(feature = "loophole"))]
+        MemBackendType::Loophole => {
+            return Err(RestoreFromSnapshotGuestMemoryError::File(
+                GuestMemoryFromFileError::HugetlbfsSnapshot,
+            )
+            .into());
+        }
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -511,6 +654,70 @@ fn guest_memory_from_file(
     let mem_file = File::open(mem_file_path)?;
     let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
     Ok(guest_mem)
+}
+
+/// Error type for [`guest_memory_from_loophole`].
+#[cfg(feature = "loophole")]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum GuestMemoryFromLoopholeError {
+    /// Loophole engine error: {0}
+    Engine(String),
+    /// Failed to build memory region: {0}
+    MmapRegion(#[from] vm_memory::mmap::MmapRegionError),
+    /// Failed to create guest region (address overlap)
+    GuestRegion,
+}
+
+/// Restore guest memory from a loophole volume using demand-paged mmap.
+///
+/// The `LoopholeEngine` handle is leaked intentionally — its `Drop` would call
+/// `loophole_close`, tearing down the UFFD handler that backs the mapped memory.
+/// The handle lives until the process exits.
+#[cfg(feature = "loophole")]
+fn guest_memory_from_loophole(
+    volume_name: &str,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromLoopholeError> {
+    use vm_memory::bitmap::AtomicBitmap;
+    use vm_memory::mmap::NewBitmap;
+
+    use crate::devices::virtio::block::virtio::io::loophole_io::LoopholeEngine;
+    use crate::vstate::memory::MmapRegionBuilder;
+
+    let engine = LoopholeEngine::open(volume_name)
+        .map_err(|e| GuestMemoryFromLoopholeError::Engine(e.to_string()))?;
+    let base_ptr = engine
+        .mmap_ptr()
+        .map_err(|e| GuestMemoryFromLoopholeError::Engine(e.to_string()))?;
+
+    let mut regions = Vec::new();
+    let mut offset: usize = 0;
+
+    for (guest_addr, size) in mem_state.regions() {
+        // SAFETY: base_ptr + offset is within the loophole mmap region
+        // (total size == sum of all region sizes). The pointer is valid for
+        // `size` bytes and stays valid as long as the engine handle is alive.
+        let region = unsafe {
+            MmapRegionBuilder::new_with_bitmap(
+                size,
+                track_dirty_pages.then(|| AtomicBitmap::with_len(size)),
+            )
+            .with_raw_mmap_pointer(base_ptr.add(offset))
+            .build()?
+        };
+        let guest_region = GuestRegionMmap::new(region, guest_addr)
+            .ok_or(GuestMemoryFromLoopholeError::GuestRegion)?;
+        regions.push(guest_region);
+        offset += size;
+    }
+
+    // Engine must stay alive — its Drop calls loophole_close which
+    // would tear down the UFFD handler backing this memory.
+    // Leak it; the process exits when the VM shuts down anyway.
+    std::mem::forget(engine);
+
+    Ok(regions)
 }
 
 /// Error type for [`guest_memory_from_uffd`]
@@ -645,14 +852,13 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-    use crate::Vmm;
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmclock_device;
     #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
     use crate::builder::tests::{
-        CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
-        insert_block_devices, insert_net_device, insert_vsock_device,
+        default_kernel_cmdline, default_vmm, insert_balloon_device, insert_block_devices,
+        insert_net_device, insert_vsock_device, CustomBlockConfig,
     };
     #[cfg(target_arch = "aarch64")]
     use crate::construct_kvm_mpidrs;
@@ -662,6 +868,7 @@ mod tests {
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
+    use crate::Vmm;
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");
