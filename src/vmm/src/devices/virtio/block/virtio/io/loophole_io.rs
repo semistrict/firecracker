@@ -9,7 +9,7 @@
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::{GuestMemoryError, VolatileMemoryError, VolatileSlice, WriteVolatile};
 
-use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
+use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum LoopholeIoError {
@@ -120,6 +120,7 @@ impl LoopholeEngine {
         if rc < 0 {
             return Err(LoopholeIoError::Read(rc));
         }
+        mem.mark_dirty(addr, count as usize);
         Ok(rc as u32)
     }
 

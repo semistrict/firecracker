@@ -6,7 +6,7 @@ use std::io::{Seek, SeekFrom, Write};
 
 use vm_memory::{GuestMemoryError, ReadVolatile, WriteVolatile};
 
-use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
+use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum SyncIoError {
@@ -56,6 +56,7 @@ impl SyncFileEngine {
         mem.get_slice(addr, count as usize)
             .and_then(|mut slice| Ok(self.file.read_exact_volatile(&mut slice)?))
             .map_err(SyncIoError::Transfer)?;
+        mem.mark_dirty(addr, count as usize);
         Ok(count)
     }
 
