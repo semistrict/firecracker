@@ -575,7 +575,7 @@ pub fn restore_from_snapshot(
             .into());
         }
     };
-    builder::build_microvm_from_snapshot(
+    let vmm = builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
@@ -584,7 +584,19 @@ pub fn restore_from_snapshot(
         seccomp_filters,
         vm_resources,
     )
-    .map_err(RestoreFromSnapshotError::Build)
+    .map_err(RestoreFromSnapshotError::Build)?;
+
+    // Queue objects are not dirtied continuously at runtime. After restore,
+    // mark them dirty so the first diff snapshot taken from this VM captures
+    // any queue state updates before the next snapshot boundary.
+    {
+        let locked_vmm = vmm.lock().expect("Poisoned lock");
+        locked_vmm
+            .device_manager
+            .mark_virtio_queue_memory_dirty(locked_vmm.vm.guest_memory());
+    }
+
+    Ok(vmm)
 }
 
 /// Error type for [`snapshot_state_from_file`]
