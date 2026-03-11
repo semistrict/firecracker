@@ -31,6 +31,8 @@ pub enum MemBackendType {
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// Guest memory contents will be loaded from a loophole volume (demand-paged mmap).
+    Loophole,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -45,6 +47,9 @@ pub struct CreateSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
     pub mem_file_path: PathBuf,
+    /// If set, write guest memory to a loophole volume with this name instead of `mem_file_path`.
+    #[serde(default)]
+    pub mem_volume_name: Option<String>,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

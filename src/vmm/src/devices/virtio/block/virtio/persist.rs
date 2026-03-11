@@ -29,6 +29,8 @@ pub enum FileEngineTypeState {
     Sync,
     /// Async File Engine.
     Async,
+    /// Loophole volume engine.
+    Loophole,
 }
 
 impl From<FileEngineType> for FileEngineTypeState {
@@ -36,6 +38,7 @@ impl From<FileEngineType> for FileEngineTypeState {
         match file_engine_type {
             FileEngineType::Sync => FileEngineTypeState::Sync,
             FileEngineType::Async => FileEngineTypeState::Async,
+            FileEngineType::Loophole => FileEngineTypeState::Loophole,
         }
     }
 }
@@ -45,6 +48,7 @@ impl From<FileEngineTypeState> for FileEngineType {
         match file_engine_type_state {
             FileEngineTypeState::Sync => FileEngineType::Sync,
             FileEngineTypeState::Async => FileEngineType::Async,
+            FileEngineTypeState::Loophole => FileEngineType::Loophole,
         }
     }
 }
@@ -56,10 +60,10 @@ pub struct VirtioBlockState {
     partuuid: Option<String>,
     cache_type: CacheType,
     root_device: bool,
-    disk_path: String,
+    pub disk_path: String,
     pub virtio_state: VirtioDeviceState,
     rate_limiter_state: RateLimiterState,
-    file_engine_type: FileEngineTypeState,
+    pub file_engine_type: FileEngineTypeState,
 }
 
 impl Persist<'_> for VirtioBlock {
