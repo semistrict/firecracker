@@ -321,6 +321,16 @@ fn main_exec() -> Result<(), MainError> {
 
     register_signal_handlers().map_err(MainError::RegisterSignalHandlers)?;
 
+    // Initialize loophole runtime from ~/.loophole/config.toml (or env overrides).
+    // LOOPHOLE_INIT=1 triggers initialization.
+    // LOOPHOLE_CONFIG_DIR overrides the config directory.
+    // LOOPHOLE_PROFILE overrides the profile name.
+    if std::env::var("LOOPHOLE_INIT").is_ok() {
+        info!("Initializing loophole runtime");
+        vmm::devices::virtio::block::virtio::io::loophole_io::init(None, None)
+            .expect("loophole_init failed");
+    }
+
     #[cfg(target_arch = "aarch64")]
     enable_ssbd_mitigation();
 

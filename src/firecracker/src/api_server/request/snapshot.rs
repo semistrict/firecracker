@@ -146,6 +146,7 @@ mod tests {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
+            mem_volume_name: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -160,6 +161,7 @@ mod tests {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
+            mem_volume_name: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -191,12 +193,10 @@ mod tests {
             vsock_override: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
-        assert!(
-            parsed_request
-                .parsing_info()
-                .take_deprecation_message()
-                .is_none()
-        );
+        assert!(parsed_request
+            .parsing_info()
+            .take_deprecation_message()
+            .is_none());
         assert_eq!(
             vmm_action_from_request(parsed_request),
             VmmAction::LoadSnapshot(expected_config)
@@ -222,12 +222,10 @@ mod tests {
             vsock_override: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
-        assert!(
-            parsed_request
-                .parsing_info()
-                .take_deprecation_message()
-                .is_none()
-        );
+        assert!(parsed_request
+            .parsing_info()
+            .take_deprecation_message()
+            .is_none());
         assert_eq!(
             vmm_action_from_request(parsed_request),
             VmmAction::LoadSnapshot(expected_config)
@@ -253,12 +251,10 @@ mod tests {
             vsock_override: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
-        assert!(
-            parsed_request
-                .parsing_info()
-                .take_deprecation_message()
-                .is_none()
-        );
+        assert!(parsed_request
+            .parsing_info()
+            .take_deprecation_message()
+            .is_none());
         assert_eq!(
             vmm_action_from_request(parsed_request),
             VmmAction::LoadSnapshot(expected_config)
@@ -293,12 +289,10 @@ mod tests {
             vsock_override: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
-        assert!(
-            parsed_request
-                .parsing_info()
-                .take_deprecation_message()
-                .is_none()
-        );
+        assert!(parsed_request
+            .parsing_info()
+            .take_deprecation_message()
+            .is_none());
         assert_eq!(
             vmm_action_from_request(parsed_request),
             VmmAction::LoadSnapshot(expected_config)
@@ -408,20 +402,16 @@ mod tests {
         let body = r#"{
             "state": "Paused"
         }"#;
-        assert!(
-            parse_patch_vm_state(&Body::new(body))
-                .unwrap()
-                .eq(&ParsedRequest::new_sync(VmmAction::Pause))
-        );
+        assert!(parse_patch_vm_state(&Body::new(body))
+            .unwrap()
+            .eq(&ParsedRequest::new_sync(VmmAction::Pause)));
 
         let body = r#"{
             "state": "Resumed"
         }"#;
-        assert!(
-            parse_patch_vm_state(&Body::new(body))
-                .unwrap()
-                .eq(&ParsedRequest::new_sync(VmmAction::Resume))
-        );
+        assert!(parse_patch_vm_state(&Body::new(body))
+            .unwrap()
+            .eq(&ParsedRequest::new_sync(VmmAction::Resume)));
 
         let invalid_body = r#"{
             "invalid": "Paused"

@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod async_io;
+pub mod loophole_io;
 pub mod sync_io;
 
 use std::fmt::Debug;
 use std::fs::File;
 
 pub use self::async_io::{AsyncFileEngine, AsyncIoError};
+pub use self::loophole_io::{LoopholeEngine, LoopholeIoError, LoopholeMemWriter};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
@@ -31,6 +33,8 @@ pub enum BlockIoError {
     Sync(SyncIoError),
     /// Async error: {0}
     Async(AsyncIoError),
+    /// Loophole error: {0}
+    Loophole(LoopholeIoError),
 }
 
 impl BlockIoError {
@@ -54,6 +58,7 @@ pub enum FileEngine {
     #[allow(unused)]
     Async(AsyncFileEngine),
     Sync(SyncFileEngine),
+    Loophole(LoopholeEngine),
 }
 
 impl FileEngine {
@@ -63,13 +68,27 @@ impl FileEngine {
                 AsyncFileEngine::from_file(file).map_err(BlockIoError::Async)?,
             )),
             FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
+            FileEngineType::Loophole => {
+                panic!("Loophole engine cannot be created from a File; use from_loophole()")
+            }
         }
+    }
+
+    /// Create a `FileEngine` backed by a loophole volume.
+    pub fn from_loophole(volume_name: &str) -> Result<FileEngine, BlockIoError> {
+        Ok(FileEngine::Loophole(
+            LoopholeEngine::open(volume_name).map_err(BlockIoError::Loophole)?,
+        ))
     }
 
     pub fn update_file_path(&mut self, file: File) -> Result<(), BlockIoError> {
         match self {
             FileEngine::Async(engine) => engine.update_file(file).map_err(BlockIoError::Async)?,
             FileEngine::Sync(engine) => engine.update_file(file),
+            FileEngine::Loophole(_) => {
+                // Loophole volumes are identified by name, not file path.
+                // update_file_path is not applicable.
+            }
         };
 
         Ok(())
@@ -80,6 +99,7 @@ impl FileEngine {
         match self {
             FileEngine::Async(engine) => engine.file(),
             FileEngine::Sync(engine) => engine.file(),
+            FileEngine::Loophole(_) => panic!("loophole engine has no backing File"),
         }
     }
 
@@ -104,6 +124,13 @@ impl FileEngine {
                 Err(err) => Err(RequestError {
                     req,
                     error: BlockIoError::Sync(err),
+                }),
+            },
+            FileEngine::Loophole(engine) => match engine.read(offset, mem, addr, count) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Loophole(err),
                 }),
             },
         }
@@ -132,6 +159,13 @@ impl FileEngine {
                     error: BlockIoError::Sync(err),
                 }),
             },
+            FileEngine::Loophole(engine) => match engine.write(offset, mem, addr, count) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Loophole(err),
+                }),
+            },
         }
     }
 
@@ -154,6 +188,13 @@ impl FileEngine {
                     error: BlockIoError::Sync(err),
                 }),
             },
+            FileEngine::Loophole(engine) => match engine.flush() {
+                Ok(_) => Ok(FileEngineOk::Executed(RequestOk { req, count: 0 })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Loophole(err),
+                }),
+            },
         }
     }
 
@@ -161,6 +202,7 @@ impl FileEngine {
         match self {
             FileEngine::Async(engine) => engine.drain(discard).map_err(BlockIoError::Async),
             FileEngine::Sync(_engine) => Ok(()),
+            FileEngine::Loophole(_) => Ok(()),
         }
     }
 
@@ -170,6 +212,7 @@ impl FileEngine {
                 engine.drain_and_flush(discard).map_err(BlockIoError::Async)
             }
             FileEngine::Sync(engine) => engine.flush().map_err(BlockIoError::Sync),
+            FileEngine::Loophole(engine) => engine.flush().map_err(BlockIoError::Loophole),
         }
     }
 }

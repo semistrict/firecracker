@@ -41,7 +41,7 @@ use crate::vmm_config::RateLimiterConfig;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 
-/// The engine file type, either Sync or Async (through io_uring).
+/// The engine file type: Sync, Async (io_uring), or Loophole (volume FFI).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum FileEngineType {
     /// Use an Async engine, based on io_uring.
@@ -49,6 +49,8 @@ pub enum FileEngineType {
     /// Use a Sync engine, based on blocking system calls.
     #[default]
     Sync,
+    /// Use a Loophole volume engine, backed by loophole C FFI.
+    Loophole,
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
@@ -95,6 +97,10 @@ impl DiskProperties {
         is_disk_read_only: bool,
         file_engine_type: FileEngineType,
     ) -> Result<Self, VirtioBlockError> {
+        if file_engine_type == FileEngineType::Loophole {
+            return Self::new_loophole(disk_image_path);
+        }
+
         let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
         let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
         let image_id = Self::build_disk_image_id(&disk_image);
@@ -103,6 +109,39 @@ impl DiskProperties {
             file_path: disk_image_path,
             file_engine: FileEngine::from_file(disk_image, file_engine_type)
                 .map_err(VirtioBlockError::FileEngine)?,
+            nsectors: disk_size >> SECTOR_SHIFT,
+            image_id,
+        })
+    }
+
+    /// Create a DiskProperties backed by a loophole volume.
+    /// `volume_name` is the loophole volume name (passed in place of disk_image_path).
+    fn new_loophole(volume_name: String) -> Result<Self, VirtioBlockError> {
+        let file_engine = FileEngine::from_loophole(&volume_name)
+            .map_err(VirtioBlockError::FileEngine)?;
+
+        let disk_size = match &file_engine {
+            FileEngine::Loophole(engine) => engine.size(),
+            _ => unreachable!(),
+        };
+
+        if disk_size % u64::from(SECTOR_SIZE) != 0 {
+            warn!(
+                "Loophole volume size {} is not a multiple of sector size {}; the remainder will \
+                 not be visible to the guest.",
+                disk_size, SECTOR_SIZE
+            );
+        }
+
+        // Build a synthetic image_id from the volume name.
+        let mut image_id = [0u8; VIRTIO_BLK_ID_BYTES as usize];
+        let name_bytes = volume_name.as_bytes();
+        let copy_len = cmp::min(name_bytes.len(), VIRTIO_BLK_ID_BYTES as usize);
+        image_id[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+        Ok(Self {
+            file_path: volume_name,
+            file_engine,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id,
         })
@@ -271,7 +310,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
+            FileEngine::Sync(_) | FileEngine::Loophole(_) => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -559,6 +598,7 @@ impl VirtioBlock {
         match self.disk.file_engine {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
+            FileEngine::Loophole(_) => FileEngineType::Loophole,
         }
     }
 
@@ -577,6 +617,26 @@ impl VirtioBlock {
         self.drain_and_flush(false);
         if let FileEngine::Async(ref _engine) = self.disk.file_engine {
             self.process_async_completion_queue();
+        }
+    }
+
+    /// For loophole-backed drives, clone the volume (which includes an
+    /// implicit flush). Returns the clone name if this is a loophole drive.
+    /// The clone engine is dropped (releasing the handle) — the clone
+    /// volume name is what matters for restore.
+    pub fn snapshot_clone_loophole(
+        &self,
+        clone_name: &str,
+    ) -> Result<Option<String>, VirtioBlockError> {
+        if let FileEngine::Loophole(ref engine) = self.disk.file_engine {
+            let _clone_engine = engine
+                .clone_volume(clone_name)
+                .map_err(|e| VirtioBlockError::FileEngine(block_io::BlockIoError::Loophole(e)))?;
+            // _clone_engine is dropped here, releasing the handle.
+            // The clone volume persists in the store.
+            Ok(Some(clone_name.to_string()))
+        } else {
+            Ok(None)
         }
     }
 }

@@ -10,6 +10,7 @@ bench = false
 
 [features]
 default = []
+loophole = []
 tracing = ["log-instrument"]
 gdb = ["arrayvec", "gdbstub", "gdbstub_arch"]
 
