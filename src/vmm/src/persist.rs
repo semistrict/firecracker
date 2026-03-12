@@ -697,11 +697,22 @@ fn guest_memory_from_loophole(
     use crate::devices::virtio::block::virtio::io::loophole_io::LoopholeEngine;
     use crate::vstate::memory::MmapRegionBuilder;
 
+    info!(
+        "Loophole: restoring guest memory from volume {volume_name}, track_dirty_pages={track_dirty_pages}"
+    );
+
     let engine = LoopholeEngine::open(volume_name)
         .map_err(|e| GuestMemoryFromLoopholeError::Engine(e.to_string()))?;
+    let vol_size = engine.size();
     let base_ptr = engine
         .mmap_ptr()
         .map_err(|e| GuestMemoryFromLoopholeError::Engine(e.to_string()))?;
+
+    let total_region_size: usize = mem_state.regions().map(|(_, sz)| sz).sum();
+    info!(
+        "Loophole: volume size={vol_size}, total region size={total_region_size}, base_ptr={base_ptr:?}, regions={}",
+        mem_state.regions().count()
+    );
 
     let mut regions = Vec::new();
     let mut offset: usize = 0;

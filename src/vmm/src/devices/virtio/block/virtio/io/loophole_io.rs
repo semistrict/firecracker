@@ -29,6 +29,16 @@ pub enum LoopholeIoError {
     GuestMemory(GuestMemoryError),
 }
 
+/// A contiguous range of pages to write via the direct writeback path.
+/// Must match the C struct `loophole_write_range` in capi.go.
+#[derive(Debug)]
+#[repr(C)]
+pub(crate) struct WriteRange {
+    offset: u64,
+    buf: *const u8,
+    count: u32,
+}
+
 // FFI declarations — these symbols come from libloophole.a (Go c-archive).
 unsafe extern "C" {
     fn loophole_init(config_path: *const std::ffi::c_char, profile: *const std::ffi::c_char)
@@ -37,6 +47,7 @@ unsafe extern "C" {
     fn loophole_open(name: *const u8, name_len: u32) -> i64;
     fn loophole_read(handle: i64, buf: *mut u8, offset: u64, count: u32) -> i32;
     fn loophole_write(handle: i64, buf: *const u8, offset: u64, count: u32) -> i32;
+    fn loophole_write_direct(handle: i64, ranges: *const WriteRange, num_ranges: u32) -> i32;
     fn loophole_flush(handle: i64) -> i32;
     fn loophole_clone(handle: i64, clone_name: *const u8, clone_name_len: u32) -> i64;
     fn loophole_size(handle: i64) -> u64;
@@ -191,6 +202,22 @@ impl LoopholeEngine {
         Ok(rc as u32)
     }
 
+    /// Write page ranges through the direct writeback path in a single CGo
+    /// call. Each range must be page-aligned with a page-multiple length.
+    /// The volume must be in direct writeback mode (i.e. mmap'd).
+    pub fn write_direct(&self, ranges: &[WriteRange]) -> Result<(), LoopholeIoError> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let rc = unsafe {
+            loophole_write_direct(self.handle, ranges.as_ptr(), ranges.len() as u32)
+        };
+        if rc < 0 {
+            return Err(LoopholeIoError::Write(rc));
+        }
+        Ok(())
+    }
+
     /// Get a demand-paged mmap pointer to the volume's contents.
     /// The returned pointer is valid for `self.size()` bytes.
     /// Pages are faulted on demand from the volume by loophole's internal UFFD handler.
@@ -206,21 +233,56 @@ impl LoopholeEngine {
 
 /// Adapter that wraps a `LoopholeEngine` with a cursor, implementing
 /// `WriteVolatile + Seek` so it can be used with `dump()` / `dump_dirty()`.
+///
+/// In direct mode, writes are buffered as ranges and committed in a single
+/// `loophole_write_direct` CGo call via [`commit_direct`]. In normal mode,
+/// each write goes through `loophole_write` immediately.
 #[derive(Debug)]
 pub struct LoopholeMemWriter {
     engine: LoopholeEngine,
     cursor: u64,
+    direct: bool,
+    /// Buffered write ranges (direct mode only). Each entry holds
+    /// (offset, raw_ptr, len) — the pointer is into guest memory which
+    /// is pinned for the lifetime of the snapshot operation.
+    pending: Vec<WriteRange>,
 }
 
 impl LoopholeMemWriter {
     /// Create a new writer positioned at offset 0.
     pub fn new(engine: LoopholeEngine) -> Self {
-        Self { engine, cursor: 0 }
+        Self {
+            engine,
+            cursor: 0,
+            direct: false,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Create a new writer in direct mode. Writes are buffered and must be
+    /// committed with [`commit_direct`] before the writer is dropped.
+    pub fn new_direct(engine: LoopholeEngine) -> Self {
+        Self {
+            engine,
+            cursor: 0,
+            direct: true,
+            pending: Vec::new(),
+        }
     }
 
     /// Borrow the underlying engine (e.g. to clone the volume).
     pub fn engine(&self) -> &LoopholeEngine {
         &self.engine
+    }
+
+    /// Commit all buffered writes in a single CGo call (direct mode only).
+    pub fn commit_direct(&mut self) -> Result<(), LoopholeIoError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.engine.write_direct(&self.pending)?;
+        self.pending.clear();
+        Ok(())
     }
 }
 
@@ -263,20 +325,31 @@ impl WriteVolatile for LoopholeMemWriter {
         buf: &VolatileSlice<B>,
     ) -> Result<usize, VolatileMemoryError> {
         let len = buf.len();
-        // Limit each FFI call to u32::MAX; write_all_volatile loops for us.
         let to_write = len.min(u32::MAX as usize) as u32;
         let ptr = buf.ptr_guard().as_ptr();
-        let written = self
-            .engine
-            .write_raw(self.cursor, ptr, to_write)
-            .map_err(|e| {
-                VolatileMemoryError::IOError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("{e}"),
-                ))
-            })?;
-        self.cursor += written as u64;
-        Ok(written as usize)
+
+        if self.direct {
+            // Buffer the range — committed later in one CGo call.
+            self.pending.push(WriteRange {
+                offset: self.cursor,
+                buf: ptr,
+                count: to_write,
+            });
+            self.cursor += to_write as u64;
+            Ok(to_write as usize)
+        } else {
+            let written = self
+                .engine
+                .write_raw(self.cursor, ptr, to_write)
+                .map_err(|e| {
+                    VolatileMemoryError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{e}"),
+                    ))
+                })?;
+            self.cursor += written as u64;
+            Ok(written as usize)
+        }
     }
 }
 
