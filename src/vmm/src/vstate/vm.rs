@@ -423,14 +423,37 @@ impl Vm {
             )
         })?;
 
-        let mut writer = LoopholeMemWriter::new(engine);
+        let mut writer = match snapshot_type {
+            SnapshotType::Diff => LoopholeMemWriter::new_direct(engine),
+            SnapshotType::Full => LoopholeMemWriter::new(engine),
+        };
 
         match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
+                let total_dirty: usize = dirty_bitmap
+                    .values()
+                    .map(|bm| bm.iter().map(|w| w.count_ones() as usize).sum::<usize>())
+                    .sum();
+                let total_pages = expected_size as usize / 4096;
+                info!(
+                    "Loophole: diff snapshot to volume {volume_name}: {total_dirty}/{total_pages} dirty pages ({} MiB dirty)",
+                    total_dirty * 4096 / (1024 * 1024)
+                );
                 self.guest_memory().dump_dirty(&mut writer, &dirty_bitmap)?;
+                // Commit all buffered dirty pages in a single CGo call.
+                writer.commit_direct().map_err(|e| {
+                    MemoryBackingFile(
+                        "loophole commit direct",
+                        std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")),
+                    )
+                })?;
             }
             SnapshotType::Full => {
+                info!(
+                    "Loophole: full snapshot to volume {volume_name}: {} MiB total",
+                    expected_size / (1024 * 1024)
+                );
                 self.guest_memory().dump(&mut writer)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
