@@ -397,7 +397,7 @@ impl Vm {
     ///
     /// For full snapshots, creates a new volume of the required size.
     /// For diff snapshots, opens an existing volume and writes only dirty pages.
-    #[cfg(feature = "loophole")]
+    #[cfg(feature = "loophole_mmap")]
     pub(crate) fn snapshot_memory_to_loophole(
         &self,
         volume_name: &str,

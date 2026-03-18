@@ -180,7 +180,7 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    #[cfg(feature = "loophole")]
+    #[cfg(feature = "loophole_mmap")]
     if let Some(ref mem_vol_name) = params.mem_volume_name {
         // Write guest memory to a loophole volume and clone it for the snapshot.
         vmm.vm
@@ -225,9 +225,9 @@ pub fn create_snapshot(
         })?;
     }
 
-    #[cfg(feature = "loophole")]
+    #[cfg(feature = "loophole_mmap")]
     let use_file = params.mem_volume_name.is_none();
-    #[cfg(not(feature = "loophole"))]
+    #[cfg(not(feature = "loophole_mmap"))]
     let use_file = true;
 
     if use_file {
@@ -475,7 +475,7 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     /// Error creating guest memory from uffd: {0}
     Uffd(#[from] GuestMemoryFromUffdError),
     /// Error creating guest memory from loophole volume: {0}
-    #[cfg(feature = "loophole")]
+    #[cfg(feature = "loophole_mmap")]
     Loophole(#[from] GuestMemoryFromLoopholeError),
 }
 
@@ -582,7 +582,7 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
-        #[cfg(feature = "loophole")]
+        #[cfg(feature = "loophole_mmap")]
         MemBackendType::Loophole => {
             let vol_name = mem_backend_path
                 .to_str()
@@ -593,7 +593,7 @@ pub fn restore_from_snapshot(
                 None,
             )
         }
-        #[cfg(not(feature = "loophole"))]
+        #[cfg(not(feature = "loophole_mmap"))]
         MemBackendType::Loophole => {
             return Err(RestoreFromSnapshotGuestMemoryError::File(
                 GuestMemoryFromFileError::HugetlbfsSnapshot,
@@ -669,7 +669,7 @@ fn guest_memory_from_file(
 }
 
 /// Error type for [`guest_memory_from_loophole`].
-#[cfg(feature = "loophole")]
+#[cfg(feature = "loophole_mmap")]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum GuestMemoryFromLoopholeError {
     /// Loophole engine error: {0}
@@ -685,7 +685,7 @@ pub enum GuestMemoryFromLoopholeError {
 /// The `LoopholeEngine` handle is leaked intentionally — its `Drop` would call
 /// `loophole_close`, tearing down the UFFD handler that backs the mapped memory.
 /// The handle lives until the process exits.
-#[cfg(feature = "loophole")]
+#[cfg(feature = "loophole_mmap")]
 fn guest_memory_from_loophole(
     volume_name: &str,
     mem_state: &GuestMemoryState,
