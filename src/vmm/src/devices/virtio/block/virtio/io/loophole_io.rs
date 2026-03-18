@@ -13,8 +13,6 @@ use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, Gue
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum LoopholeIoError {
-    /// Init failed with code {0}
-    Init(i32),
     /// Open failed with code {0}
     Open(i64),
     /// Read failed with code {0}
@@ -23,12 +21,14 @@ pub enum LoopholeIoError {
     Write(i32),
     /// Flush failed with code {0}
     Flush(i32),
-    /// Mmap failed (null pointer returned)
-    Mmap,
     /// Guest memory error: {0}
     GuestMemory(GuestMemoryError),
+    /// Mmap failed (null pointer returned)
+    #[cfg(feature = "loophole_mmap")]
+    Mmap,
 }
 
+#[cfg(feature = "loophole_mmap")]
 /// A contiguous range of pages to write via the direct writeback path.
 /// Must match the C struct `loophole_write_range` in capi.go.
 #[derive(Debug)]
@@ -41,53 +41,23 @@ pub(crate) struct WriteRange {
 
 // FFI declarations — these symbols come from libloophole.a (Go c-archive).
 unsafe extern "C" {
-    fn loophole_init(config_path: *const std::ffi::c_char, profile: *const std::ffi::c_char)
-        -> i32;
-    fn loophole_create(name: *const u8, name_len: u32, size: u64) -> i64;
-    fn loophole_open(name: *const u8, name_len: u32) -> i64;
+    fn loophole_open(
+        config_dir: *const std::ffi::c_char,
+        profile: *const std::ffi::c_char,
+        name: *const u8,
+        name_len: u32,
+    ) -> i64;
     fn loophole_read(handle: i64, buf: *mut u8, offset: u64, count: u32) -> i32;
     fn loophole_write(handle: i64, buf: *const u8, offset: u64, count: u32) -> i32;
-    fn loophole_write_direct(handle: i64, ranges: *const WriteRange, num_ranges: u32) -> i32;
     fn loophole_flush(handle: i64) -> i32;
-    fn loophole_clone(handle: i64, clone_name: *const u8, clone_name_len: u32) -> i64;
+    fn loophole_clone(handle: i64, clone_name: *const u8, clone_name_len: u32) -> i32;
     fn loophole_size(handle: i64) -> u64;
-    fn loophole_mmap(handle: i64, offset: u64, size: u64) -> *mut u8;
     fn loophole_close(handle: i64) -> i32;
-    fn loophole_shutdown() -> i32;
-}
 
-/// Initialize the loophole runtime from ~/.loophole/config.toml.
-/// Must be called once before creating any `LoopholeEngine` instances.
-///
-/// `config_dir`: path to the config directory, or None to use the default
-/// (~/.loophole). The LOOPHOLE_CONFIG_DIR env var overrides the default.
-///
-/// `profile`: profile name, or None to use the default profile.
-/// The LOOPHOLE_PROFILE env var overrides the default.
-pub fn init(config_dir: Option<&str>, profile: Option<&str>) -> Result<(), LoopholeIoError> {
-    let c_config_dir = config_dir.map(|s| std::ffi::CString::new(s).unwrap());
-    let c_profile = profile.map(|s| std::ffi::CString::new(s).unwrap());
-    let rc = unsafe {
-        loophole_init(
-            c_config_dir
-                .as_ref()
-                .map_or(std::ptr::null(), |s| s.as_ptr()),
-            c_profile.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-        )
-    };
-    if rc < 0 {
-        return Err(LoopholeIoError::Init(rc));
-    }
-    Ok(())
-}
-
-/// Shut down the loophole runtime.
-pub fn shutdown() -> Result<(), LoopholeIoError> {
-    let rc = unsafe { loophole_shutdown() };
-    if rc < 0 {
-        return Err(LoopholeIoError::Init(rc));
-    }
-    Ok(())
+    #[cfg(feature = "loophole_mmap")]
+    fn loophole_write_direct(handle: i64, ranges: *const WriteRange, num_ranges: u32) -> i32;
+    #[cfg(feature = "loophole_mmap")]
+    fn loophole_mmap(handle: i64, offset: u64, size: u64) -> *mut u8;
 }
 
 #[derive(Debug)]
@@ -95,14 +65,34 @@ pub struct LoopholeEngine {
     handle: i64,
 }
 
-// SAFETY: The Go runtime is thread-safe and the handle is a simple integer
-// index into a sync.Map.
+// SAFETY: The Go runtime is thread-safe and the handle is a pointer to a
+// Go struct pinned in a map.
 unsafe impl Send for LoopholeEngine {}
 
 impl LoopholeEngine {
-    /// Open a loophole volume by name.
+    /// Open a loophole volume by name, using the default config and profile.
     pub fn open(volume_name: &str) -> Result<Self, LoopholeIoError> {
-        let h = unsafe { loophole_open(volume_name.as_ptr(), volume_name.len() as u32) };
+        Self::open_with(None, None, volume_name)
+    }
+
+    /// Open a loophole volume with explicit config dir and profile.
+    pub fn open_with(
+        config_dir: Option<&str>,
+        profile: Option<&str>,
+        volume_name: &str,
+    ) -> Result<Self, LoopholeIoError> {
+        let c_config_dir = config_dir.map(|s| std::ffi::CString::new(s).unwrap());
+        let c_profile = profile.map(|s| std::ffi::CString::new(s).unwrap());
+        let h = unsafe {
+            loophole_open(
+                c_config_dir
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s.as_ptr()),
+                c_profile.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                volume_name.as_ptr(),
+                volume_name.len() as u32,
+            )
+        };
         if h < 0 {
             return Err(LoopholeIoError::Open(h));
         }
@@ -163,30 +153,21 @@ impl LoopholeEngine {
         }
         Ok(())
     }
-}
-
-impl LoopholeEngine {
-    /// Create a new loophole volume and return an engine for it.
-    pub fn create(volume_name: &str, size: u64) -> Result<Self, LoopholeIoError> {
-        let h = unsafe { loophole_create(volume_name.as_ptr(), volume_name.len() as u32, size) };
-        if h < 0 {
-            return Err(LoopholeIoError::Open(h));
-        }
-        Ok(LoopholeEngine { handle: h })
-    }
 
     /// Clone a volume, creating a writable fork (includes implicit flush).
-    /// The clone is not opened — it's available for a restoring process to open.
     pub fn clone_volume(&self, clone_name: &str) -> Result<(), LoopholeIoError> {
         let rc =
             unsafe { loophole_clone(self.handle, clone_name.as_ptr(), clone_name.len() as u32) };
         if rc < 0 {
-            return Err(LoopholeIoError::Open(rc));
+            return Err(LoopholeIoError::Write(rc));
         }
         Ok(())
     }
 }
 
+// --- Memory snapshot support (requires loophole_mmap feature) ---
+
+#[cfg(feature = "loophole_mmap")]
 impl LoopholeEngine {
     /// Write from a raw host pointer to the volume at `offset`.
     pub fn write_raw(
@@ -202,9 +183,7 @@ impl LoopholeEngine {
         Ok(rc as u32)
     }
 
-    /// Write page ranges through the direct writeback path in a single CGo
-    /// call. Each range must be page-aligned with a page-multiple length.
-    /// The volume must be in direct writeback mode (i.e. mmap'd).
+    /// Write page ranges through the direct writeback path in a single CGo call.
     pub fn write_direct(&self, ranges: &[WriteRange]) -> Result<(), LoopholeIoError> {
         if ranges.is_empty() {
             return Ok(());
@@ -219,8 +198,6 @@ impl LoopholeEngine {
     }
 
     /// Get a demand-paged mmap pointer to the volume's contents.
-    /// The returned pointer is valid for `self.size()` bytes.
-    /// Pages are faulted on demand from the volume by loophole's internal UFFD handler.
     pub fn mmap_ptr(&self) -> Result<*mut u8, LoopholeIoError> {
         let size = self.size();
         let ptr = unsafe { loophole_mmap(self.handle, 0, size) };
@@ -232,24 +209,18 @@ impl LoopholeEngine {
 }
 
 /// Adapter that wraps a `LoopholeEngine` with a cursor, implementing
-/// `WriteVolatile + Seek` so it can be used with `dump()` / `dump_dirty()`.
-///
-/// In direct mode, writes are buffered as ranges and committed in a single
-/// `loophole_write_direct` CGo call via [`commit_direct`]. In normal mode,
-/// each write goes through `loophole_write` immediately.
+/// `WriteVolatile + Seek` for memory snapshot dump.
+#[cfg(feature = "loophole_mmap")]
 #[derive(Debug)]
 pub struct LoopholeMemWriter {
     engine: LoopholeEngine,
     cursor: u64,
     direct: bool,
-    /// Buffered write ranges (direct mode only). Each entry holds
-    /// (offset, raw_ptr, len) — the pointer is into guest memory which
-    /// is pinned for the lifetime of the snapshot operation.
     pending: Vec<WriteRange>,
 }
 
+#[cfg(feature = "loophole_mmap")]
 impl LoopholeMemWriter {
-    /// Create a new writer positioned at offset 0.
     pub fn new(engine: LoopholeEngine) -> Self {
         Self {
             engine,
@@ -259,8 +230,6 @@ impl LoopholeMemWriter {
         }
     }
 
-    /// Create a new writer in direct mode. Writes are buffered and must be
-    /// committed with [`commit_direct`] before the writer is dropped.
     pub fn new_direct(engine: LoopholeEngine) -> Self {
         Self {
             engine,
@@ -270,12 +239,10 @@ impl LoopholeMemWriter {
         }
     }
 
-    /// Borrow the underlying engine (e.g. to clone the volume).
     pub fn engine(&self) -> &LoopholeEngine {
         &self.engine
     }
 
-    /// Commit all buffered writes in a single CGo call (direct mode only).
     pub fn commit_direct(&mut self) -> Result<(), LoopholeIoError> {
         if self.pending.is_empty() {
             return Ok(());
@@ -286,6 +253,7 @@ impl LoopholeMemWriter {
     }
 }
 
+#[cfg(feature = "loophole_mmap")]
 impl std::io::Seek for LoopholeMemWriter {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         let new_pos = match pos {
@@ -319,6 +287,7 @@ impl std::io::Seek for LoopholeMemWriter {
     }
 }
 
+#[cfg(feature = "loophole_mmap")]
 impl WriteVolatile for LoopholeMemWriter {
     fn write_volatile<B: BitmapSlice>(
         &mut self,
@@ -329,7 +298,6 @@ impl WriteVolatile for LoopholeMemWriter {
         let ptr = buf.ptr_guard().as_ptr();
 
         if self.direct {
-            // Buffer the range — committed later in one CGo call.
             self.pending.push(WriteRange {
                 offset: self.cursor,
                 buf: ptr,
@@ -379,7 +347,6 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        // Write a config.toml with a local file store profile.
         let config_toml = format!(
             r#"default_profile = "test"
 
@@ -390,15 +357,15 @@ local_dir = "{}"
         );
         std::fs::write(config_dir.join("config.toml"), &config_toml).unwrap();
 
-        init(Some(config_dir.to_str().unwrap()), Some("test")).expect("loophole_init failed");
-
-        // Create a 256 GiB sparse volume.
         let vol_size: u64 = 256 << 30;
-        let engine =
-            LoopholeEngine::create("test-vol-256g", vol_size).expect("loophole_create failed");
+        let engine = LoopholeEngine::open_with(
+            Some(config_dir.to_str().unwrap()),
+            Some("test"),
+            "test-vol-256g",
+        )
+        .expect("loophole_open failed");
         assert_eq!(engine.size(), vol_size);
 
-        // Set up guest memory (1 MiB buffer).
         let buf_size: usize = 1 << 20;
         let mem = single_region_mem(buf_size);
 
@@ -453,7 +420,7 @@ local_dir = "{}"
         assert_eq!(readback3, pattern3);
 
         // Test 4: Read an unwritten region — should return zeros.
-        let unwritten_offset = 100 << 30; // 100 GiB in
+        let unwritten_offset = 100 << 30;
         assert_eq!(
             engine
                 .read(unwritten_offset, &mem, GuestAddress(0), 4096)
@@ -467,7 +434,6 @@ local_dir = "{}"
             "unwritten region should be zeros"
         );
 
-        // Clean up.
         drop(engine);
         let _ = std::fs::remove_dir_all(&tmp);
     }
