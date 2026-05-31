@@ -49,10 +49,14 @@ pub enum MemoryError {
     Memfd(memfd::Error),
     /// Cannot resize memfd file: {0}
     MemfdSetLen(std::io::Error),
+    /// Cannot resize memory backing file: {0}
+    FileSetLen(std::io::Error),
     /// Total sum of memory regions exceeds largest possible file offset
     OffsetTooLarge,
     /// Cannot retrieve snapshot file metadata: {0}
     FileMetadata(std::io::Error),
+    /// Cannot open memory backing file: {0}
+    FileOpen(std::io::Error),
     /// Memory region has zero slots
     ZeroSlots,
     /// Memory region of {region_size} bytes is not evenly divisible into {slot_count} slots
@@ -557,6 +561,15 @@ pub fn memfd_backed(
         Some(memfd_file),
         track_dirty_pages,
     )
+}
+
+/// Creates a GuestMemoryMmap backed by a shared file.
+pub fn file_backed(
+    file: File,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    create(regions, libc::MAP_SHARED, Some(file), track_dirty_pages)
 }
 
 /// Creates a GuestMemoryMmap from raw regions.

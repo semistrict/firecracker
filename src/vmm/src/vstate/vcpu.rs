@@ -20,6 +20,7 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::FcExitCode;
 pub use crate::arch::{KvmVcpu, KvmVcpuConfigureError, KvmVcpuError, Peripherals, VcpuState};
 use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
+use crate::devices::virtio::pmem::device::handle_pmem_memory_fault;
 #[cfg(feature = "gdb")]
 use crate::gdb::target::{GdbTargetError, get_raw_tid};
 use crate::logger::{IncMetric, METRICS, error, info, warn};
@@ -438,6 +439,19 @@ fn handle_kvm_exit(
                     METRICS.vcpu.exit_mmio_write.inc();
                 }
                 Ok(VcpuEmulation::Handled)
+            }
+            VcpuExit::MemoryFault { flags, gpa, size } => {
+                if handle_pmem_memory_fault(gpa, size) {
+                    Ok(VcpuEmulation::Handled)
+                } else {
+                    METRICS.vcpu.failures.inc();
+                    error!(
+                        "Unhandled KVM memory fault: gpa={gpa:#x}, size={size:#x}, flags={flags:#x}"
+                    );
+                    Err(VcpuError::FaultyKvmExit(format!(
+                        "Unhandled KVM memory fault: gpa={gpa:#x}, size={size:#x}, flags={flags:#x}"
+                    )))
+                }
             }
             // Documentation specifies that below kvm exits are considered
             // errors.

@@ -406,32 +406,20 @@ where
     }
 
     fn kick(&mut self) {
-        // Vsock has complicated protocol that isn't resilient to any packet loss,
-        // so for Vsock we don't support connection persistence through snapshot.
-        // Any in-flight packets or events are simply lost.
-        // Vsock is restored 'empty'.
-        // The only reason we still `kick` it is to make guest process
-        // `TRANSPORT_RESET_EVENT` event we sent during snapshot creation.
         if self.is_activated() {
-            self.pending_event_ack = true;
-
-            info!(
-                "[{:?}:{}] signaling event queue",
-                self.device_type(),
-                self.id()
-            );
-            self.signal_used_queue(EVQ_INDEX).unwrap();
+            self.send_transport_reset_event().unwrap_or_else(|err| {
+                error!(
+                    "Failed to send reset transport event after restore: {:?}",
+                    err
+                );
+            });
         }
     }
 
     fn prepare_save(&mut self) {
-        // Send Transport event to reset connections if device
-        // is activated.
-        if self.is_activated() {
-            self.send_transport_reset_event().unwrap_or_else(|err| {
-                error!("Failed to send reset transport event: {:?}", err);
-            });
-        }
+        // The Unix backend connection table is intentionally not persisted.
+        // Existing host connections are dropped, while guest listeners can
+        // accept new connections after the fresh reset emitted on restore.
     }
 }
 
@@ -595,33 +583,26 @@ mod tests {
     }
 
     #[test]
-    fn test_kick_when_active_arms_pending_event_ack() {
-        // Restore path: kick() is invoked after the snapshot is loaded to re-deliver the
-        // TRANSPORT_RESET interrupt. It must arm the RX gate so the post-restore RX/EVQ
-        // race cannot deliver data ahead of the guest ack.
+    fn test_kick_when_active_emits_fresh_transport_reset() {
+        // Restore path: kick() is invoked after the snapshot is loaded. Emit a
+        // fresh TRANSPORT_RESET event instead of relying on an event serialized
+        // into the paused snapshot.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        publish_evq_descriptor(&mut ctx);
 
         ctx.device.pending_event_ack = false;
         ctx.device.kick();
 
-        assert!(
-            ctx.device.pending_event_ack,
-            "kick() on an active device must arm the RX gate"
-        );
-
-        // After kick(), the gate must actually suppress RX delivery.
-        ctx.device.backend.set_pending_rx(true);
-        let progressed = ctx.device.process_rx().unwrap();
-        assert!(!progressed);
-        assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+        assert!(ctx.device.pending_event_ack);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
     }
 
     #[test]
-    fn test_prepare_save_emits_transport_reset_when_active() {
-        // The snapshot path goes through prepare_save -> send_transport_reset_event.
-        // Both the evq publication and the RX gate must be observable afterwards.
+    fn test_prepare_save_does_not_emit_stale_transport_reset() {
+        // prepare_save runs while the VM is already paused. Do not serialize a
+        // reset event that depends on a guest ACK before restore.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
@@ -629,8 +610,8 @@ mod tests {
 
         ctx.device.prepare_save();
 
-        assert!(ctx.device.pending_event_ack);
-        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        assert!(!ctx.device.pending_event_ack);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 0);
     }
 
     #[test]

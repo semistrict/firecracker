@@ -1,6 +1,7 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 use std::fmt::Debug;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -113,6 +114,9 @@ pub struct MachineConfig {
     /// Configures what page size Firecracker should use to back guest memory.
     #[serde(default)]
     pub huge_pages: HugePageConfig,
+    /// Optional file used to back fresh guest memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_backing_path: Option<PathBuf>,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +159,7 @@ impl Default for MachineConfig {
             cpu_template: None,
             track_dirty_pages: false,
             huge_pages: HugePageConfig::None,
+            memory_backing_path: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         }
@@ -188,6 +193,9 @@ pub struct MachineConfigUpdate {
     /// Configures what page size Firecracker should use to back guest memory.
     #[serde(default)]
     pub huge_pages: Option<HugePageConfig>,
+    /// Optional file used to back fresh guest memory.
+    #[serde(default)]
+    pub memory_backing_path: Option<PathBuf>,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default)]
@@ -212,6 +220,7 @@ impl From<MachineConfig> for MachineConfigUpdate {
             cpu_template: cfg.static_template(),
             track_dirty_pages: Some(cfg.track_dirty_pages),
             huge_pages: Some(cfg.huge_pages),
+            memory_backing_path: cfg.memory_backing_path,
             #[cfg(feature = "gdb")]
             gdb_socket_path: cfg.gdb_socket_path,
         }
@@ -279,6 +288,10 @@ impl MachineConfig {
             cpu_template,
             track_dirty_pages: update.track_dirty_pages.unwrap_or(self.track_dirty_pages),
             huge_pages: page_config,
+            memory_backing_path: update
+                .memory_backing_path
+                .clone()
+                .or_else(|| self.memory_backing_path.clone()),
             #[cfg(feature = "gdb")]
             gdb_socket_path: update.gdb_socket_path.clone(),
         })

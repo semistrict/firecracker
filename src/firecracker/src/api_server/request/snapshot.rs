@@ -111,6 +111,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         vsock_override: snapshot_config.vsock_override,
+        pmem_overrides: snapshot_config.pmem_overrides,
         clock_realtime: snapshot_config.clock_realtime,
     };
 
@@ -190,6 +191,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            pmem_overrides: vec![],
             clock_realtime: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -222,6 +224,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            pmem_overrides: vec![],
             clock_realtime: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -254,6 +257,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            pmem_overrides: vec![],
             clock_realtime: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -295,6 +299,7 @@ mod tests {
                 host_dev_name: String::from("vmtap2"),
             }],
             vsock_override: None,
+            pmem_overrides: vec![],
             clock_realtime: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -324,6 +329,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            pmem_overrides: vec![],
             clock_realtime: false,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();

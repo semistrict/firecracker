@@ -4,9 +4,11 @@
 use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use kvm_bindings::{KVM_MEM_READONLY, kvm_userspace_memory_region};
+use patchwork_firecracker::PatchworkMapping;
+use patchwork_firecracker::PatchworkPmemBacking;
 use serde::{Deserialize, Serialize};
 use vm_allocator::{AllocPolicy, RangeInclusive};
 use vm_memory::mmap::{MmapRegionBuilder, MmapRegionError};
@@ -41,6 +43,8 @@ pub enum PmemError {
     BackingFile(std::io::Error),
     /// Error backing file size is 0
     BackingFileZeroSize,
+    /// Error with patchwork backing: {0}
+    PatchworkBacking(String),
     /// Error with EventFd: {0}
     EventFd(std::io::Error),
     /// Unexpected read-only descriptor
@@ -68,6 +72,75 @@ pub enum PmemError {
 const VIRTIO_PMEM_REQ_TYPE_FLUSH: u32 = 0;
 const SUCCESS: i32 = 0;
 const FAILURE: i32 = -1;
+
+fn juicefs_binary() -> String {
+    std::env::var("FIRECRACKER_JUICEFS_BIN").unwrap_or_else(|_| "juicefs".to_string())
+}
+
+fn readonly_common_pmem_slots() -> bool {
+    std::env::var_os("PATCHWORK_PMEM_READONLY_COMMON").is_some()
+}
+
+fn patchwork_pmem_disabled() -> bool {
+    std::env::var_os("PATCHWORK_DISABLE_PMEM").is_some()
+}
+
+#[derive(Debug, Clone)]
+struct PmemFaultRange {
+    vm: Weak<KvmVm>,
+    slot: u32,
+    gpa: u64,
+    len: u64,
+    hva: u64,
+    mapping_addr: usize,
+    mapping_off: u64,
+    writable: bool,
+}
+
+static PMEM_FAULT_RANGES: OnceLock<Mutex<Vec<PmemFaultRange>>> = OnceLock::new();
+
+fn pmem_fault_ranges() -> &'static Mutex<Vec<PmemFaultRange>> {
+    PMEM_FAULT_RANGES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn handle_pmem_memory_fault(gpa: u64, size: u64) -> bool {
+    let mut ranges = pmem_fault_ranges()
+        .lock()
+        .expect("pmem fault registry poisoned");
+    let Some(range) = ranges.iter_mut().find(|range| {
+        !range.writable
+            && gpa >= range.gpa
+            && gpa
+                .checked_add(size)
+                .is_some_and(|end| end <= range.gpa + range.len)
+    }) else {
+        return false;
+    };
+    let Some(vm) = range.vm.upgrade() else {
+        return false;
+    };
+    // The read-only KVM slot pointed at an ancestor-backed patchwork span.  When
+    // the guest writes it, remap exactly that span from the leaf file and retry
+    // the fault with the same GPA/HVA now writable.
+    let mapping = unsafe { &*(range.mapping_addr as *const PatchworkMapping) };
+    if let Err(err) = mapping.remap_leaf_range(range.mapping_off, range.len) {
+        error!("pmem: failed to materialize leaf range for write fault: {err}");
+        return false;
+    }
+    let region = kvm_userspace_memory_region {
+        slot: range.slot,
+        guest_phys_addr: range.gpa,
+        memory_size: range.len,
+        userspace_addr: range.hva,
+        flags: 0,
+    };
+    if let Err(err) = vm.set_user_memory_region(region) {
+        error!("pmem: failed to make materialized range writable: {err}");
+        return false;
+    }
+    range.writable = true;
+    true
+}
 
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize)]
 #[repr(C)]
@@ -128,6 +201,10 @@ impl Drop for GuestPmemRegion {
 pub struct KvmMemSlot {
     vm: Arc<KvmVm>,
     slot: u32,
+    gpa: u64,
+    memory_size: u64,
+    hva: u64,
+    flags: u32,
 }
 
 impl KvmMemSlot {
@@ -152,7 +229,14 @@ impl KvmMemSlot {
         };
         vm.set_user_memory_region(region)
             .map_err(PmemError::SetUserMemoryRegion)?;
-        Ok(Self { vm, slot })
+        Ok(Self {
+            vm,
+            slot,
+            gpa,
+            memory_size,
+            hva,
+            flags,
+        })
     }
 }
 
@@ -175,26 +259,42 @@ pub struct PmemMmap {
     pub file_len: u64,
     pub mmap_ptr: u64,
     pub mmap_len: u64,
+    patchwork: Option<PatchworkPmemBacking>,
 }
 
 impl PmemMmap {
     const ALIGNMENT: u64 = Pmem::ALIGNMENT;
 
     pub fn new(path: &str, read_only: bool) -> Result<Self, PmemError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(!read_only)
-            .open(path)
-            .map_err(PmemError::BackingFile)?;
-        let file_len = file.metadata().unwrap().len();
+        let file_len = std::fs::metadata(path)
+            .map_err(PmemError::BackingFile)?
+            .len();
         if (file_len == 0) {
             return Err(PmemError::BackingFileZeroSize);
+        }
+
+        if !patchwork_pmem_disabled() && file_len % Self::ALIGNMENT == 0 {
+            if let Ok(patchwork) =
+                PatchworkPmemBacking::from_juicefs(juicefs_binary(), path, 0, file_len)
+            {
+                return Ok(Self {
+                    file_len,
+                    mmap_ptr: patchwork.kvm_userspace_addr(),
+                    mmap_len: file_len,
+                    patchwork: Some(patchwork),
+                });
+            }
         }
 
         let mut prot = libc::PROT_READ;
         if !read_only {
             prot |= libc::PROT_WRITE;
         }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(!read_only)
+            .open(path)
+            .map_err(PmemError::BackingFile)?;
 
         let mmap_len = align_up(file_len, Self::ALIGNMENT);
         let mmap_ptr = if (mmap_len == file_len) {
@@ -253,12 +353,89 @@ impl PmemMmap {
             file_len,
             mmap_ptr: mmap_ptr as u64,
             mmap_len,
+            patchwork: None,
         })
+    }
+
+    fn kvm_mem_slots(
+        &self,
+        vm: Arc<KvmVm>,
+        guest_start: u64,
+        read_only: bool,
+    ) -> Result<Vec<KvmMemSlot>, PmemError> {
+        if let Some(patchwork) = &self.patchwork {
+            let mapping_addr = patchwork.raw_mapping_addr();
+            let readonly_common = readonly_common_pmem_slots();
+            return patchwork
+                .kvm_ranges()
+                .into_iter()
+                .map(|range| {
+                    let range_read_only = readonly_common && range.read_only;
+                    let flags = if read_only || range_read_only {
+                        KVM_MEM_READONLY
+                    } else {
+                        0
+                    };
+                    let slot = KvmMemSlot::new(
+                        vm.clone(),
+                        guest_start + range.off,
+                        range.len,
+                        self.mmap_ptr + range.off,
+                        flags,
+                    )?;
+                    if range_read_only && !read_only {
+                        pmem_fault_ranges()
+                            .lock()
+                            .expect("pmem fault registry poisoned")
+                            .push(PmemFaultRange {
+                                vm: Arc::downgrade(&vm),
+                                slot: slot.slot,
+                                gpa: slot.gpa,
+                                len: slot.memory_size,
+                                hva: slot.hva,
+                                mapping_addr,
+                                mapping_off: range.off,
+                                writable: false,
+                            });
+                    }
+                    Ok(slot)
+                })
+                .collect();
+        }
+
+        let flags = if read_only { KVM_MEM_READONLY } else { 0 };
+        KvmMemSlot::new(vm, guest_start, self.mmap_len, self.mmap_ptr, flags).map(|slot| vec![slot])
+    }
+
+    fn flush(&mut self) -> Result<(), PmemError> {
+        if let Some(patchwork) = &mut self.patchwork {
+            patchwork
+                .flush()
+                .map(|_| ())
+                .map_err(|err| PmemError::PatchworkBacking(err.to_string()))
+        } else {
+            // SAFETY: We are calling the system call with valid arguments and checking the returned
+            // value.
+            unsafe {
+                let ret = libc::msync(
+                    self.mmap_ptr as *mut libc::c_void,
+                    u64_to_usize(self.file_len),
+                    libc::MS_SYNC,
+                );
+                if ret < 0 {
+                    return Err(PmemError::BackingFile(std::io::Error::last_os_error()));
+                }
+            }
+            Ok(())
+        }
     }
 }
 
 impl Drop for PmemMmap {
     fn drop(&mut self) {
+        if self.patchwork.is_some() {
+            return;
+        }
         // SAFETY: `mmap_ptr` is a valid pointer since PmemMmap can only be created via `new()`.
         //         `mmap_len` is the same value used for the original mmap call.
         unsafe {
@@ -283,9 +460,9 @@ pub struct Pmem {
     pub queue_events: Vec<EventFd>,
 
     // Pmem specific fields
-    // kvm_mem_slot must be declared before mmap so that its drop function runs
+    // kvm_mem_slots must be declared before mmap so that their drop functions run
     // first before the HVA gets unmapped
-    pub kvm_mem_slot: KvmMemSlot,
+    pub kvm_mem_slots: Vec<KvmMemSlot>,
     pub guest_region: GuestPmemRegion,
     pub mmap: PmemMmap,
     pub metrics: Arc<PmemMetrics>,
@@ -321,12 +498,7 @@ impl Pmem {
         };
 
         let cs = &guest_region.config_space;
-        let flags = if config.read_only {
-            KVM_MEM_READONLY
-        } else {
-            0
-        };
-        let kvm_mem_slot = KvmMemSlot::new(vm, cs.start, cs.size, mmap.mmap_ptr, flags)?;
+        let kvm_mem_slots = mmap.kvm_mem_slots(vm, cs.start, config.read_only)?;
 
         let rate_limiter = config
             .rate_limiter
@@ -347,14 +519,11 @@ impl Pmem {
             rate_limiter,
             config,
             mmap,
-            kvm_mem_slot,
+            kvm_mem_slots,
         })
     }
 
     pub fn handle_queue(&mut self) -> Result<(), PmemError> {
-        // This is safe since we checked in the event handler that the device is activated.
-        let active_state = self.device_state.active_state().unwrap();
-
         if self.queues[0].is_empty() {
             return Ok(());
         }
@@ -397,6 +566,8 @@ impl Pmem {
 
         self.queues[0].advance_used_ring_idx();
         if self.queues[0].prepare_kick() {
+            // This is safe since we checked in the event handler that the device is activated.
+            let active_state = self.device_state.active_state().unwrap();
             active_state
                 .interrupt
                 .trigger(VirtioInterruptType::Queue(0))
@@ -409,7 +580,7 @@ impl Pmem {
     }
 
     fn process_chain(
-        &self,
+        &mut self,
         head: DescriptorChain,
         cached_result: &mut Option<i32>,
     ) -> Result<(), PmemError> {
@@ -451,18 +622,9 @@ impl Pmem {
                 .write_obj(*result, status_descriptor.addr)?;
         } else {
             let mut status = SUCCESS;
-            // SAFETY: We are calling the system call with valid arguments and checking the returned
-            // value
-            unsafe {
-                let ret = libc::msync(
-                    self.mmap.mmap_ptr as *mut libc::c_void,
-                    u64_to_usize(self.mmap.file_len),
-                    libc::MS_SYNC,
-                );
-                if ret < 0 {
-                    error!("pmem: Unable to msync the file. Error: {}", ret);
-                    status = FAILURE;
-                }
+            if let Err(err) = self.mmap.flush() {
+                error!("pmem: Unable to flush the file. Error: {err}");
+                status = FAILURE;
             }
             *cached_result = Some(status);
 

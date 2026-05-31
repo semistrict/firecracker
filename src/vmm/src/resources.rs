@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::convert::From;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -490,6 +491,26 @@ impl VmResources {
             .devices
             .iter()
             .any(|b| b.lock().expect("Poisoned lock").is_vhost_user());
+
+        if let Some(path) = &self.machine_config.memory_backing_path {
+            let size = regions.iter().try_fold(0u64, |acc, &(_, size)| {
+                acc.checked_add(size as u64)
+                    .ok_or(MemoryError::OffsetTooLarge)
+            })?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .map_err(MemoryError::FileOpen)?;
+            file.set_len(size).map_err(MemoryError::FileSetLen)?;
+            return memory::file_backed(
+                file,
+                regions.iter().copied(),
+                self.machine_config.track_dirty_pages,
+            );
+        }
 
         // Page faults are more expensive for shared memory mapping, including  memfd.
         // For this reason, we only back guest memory with a memfd
@@ -1428,6 +1449,7 @@ mod tests {
             cpu_template: Some(StaticCpuTemplate::V1N1),
             track_dirty_pages: Some(false),
             huge_pages: Some(HugePageConfig::None),
+            memory_backing_path: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };

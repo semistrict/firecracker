@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use event_manager::SubscriberOps;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
+use patchwork_firecracker::PatchworkMapping;
 use userfaultfd::Uffd;
 use utils::time::TimestampUs;
 use vm_allocator::AllocPolicy;
@@ -53,7 +54,7 @@ use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
 use crate::vstate::kvm::{Kvm, KvmError};
-use crate::vstate::memory::GuestRegionMmap;
+use crate::vstate::memory::{GuestRegionMmap, MemoryError};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -89,6 +90,8 @@ pub enum StartMicrovmError {
     EnablePVTime(crate::arch::VcpuArchError),
     /// Invalid Memory Configuration: {0}
     GuestMemory(crate::vstate::memory::MemoryError),
+    /// Invalid patchwork memory configuration: {0}
+    PatchworkMemory(#[from] patchwork_firecracker::Error),
     /// Error with initrd initialization: {0}.
     Initrd(#[from] InitrdError),
     /// Internal error while starting microVM: {0}
@@ -157,9 +160,7 @@ pub fn build_microvm_for_boot(
         .as_ref()
         .ok_or(StartMicrovmError::MissingKernelConfig)?;
 
-    let guest_memory = vm_resources
-        .allocate_guest_memory()
-        .map_err(StartMicrovmError::GuestMemory)?;
+    let (guest_memory, patchwork_memory_mappings) = allocate_boot_guest_memory(vm_resources)?;
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -323,6 +324,7 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        patchwork_memory_mappings,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -393,6 +395,44 @@ pub fn build_and_boot_microvm(
     Ok(vmm)
 }
 
+fn allocate_boot_guest_memory(
+    vm_resources: &VmResources,
+) -> Result<(Vec<GuestRegionMmap>, Vec<PatchworkMapping>), StartMicrovmError> {
+    let Some(memory_path) = &vm_resources.machine_config.memory_backing_path else {
+        return vm_resources
+            .allocate_guest_memory()
+            .map(|regions| (regions, Vec::new()))
+            .map_err(StartMicrovmError::GuestMemory);
+    };
+
+    let regions =
+        crate::arch::arch_memory_regions(mib_to_bytes(vm_resources.machine_config.mem_size_mib));
+    let mut file_offset = 0_u64;
+    let patchwork_regions = regions
+        .iter()
+        .map(|&(guest_addr, len)| {
+            let current_offset = file_offset;
+            file_offset = file_offset
+                .checked_add(len as u64)
+                .ok_or(MemoryError::OffsetTooLarge)?;
+            Ok((guest_addr, current_offset, len as u64))
+        })
+        .collect::<Result<Vec<_>, MemoryError>>()
+        .map_err(StartMicrovmError::GuestMemory)?;
+
+    patchwork_firecracker::PatchworkGuestMemory::regions_from_juicefs_regions(
+        juicefs_binary(),
+        memory_path,
+        patchwork_regions,
+        vm_resources.machine_config.track_dirty_pages,
+    )
+    .map_err(StartMicrovmError::PatchworkMemory)
+}
+
+fn juicefs_binary() -> String {
+    std::env::var("FIRECRACKER_JUICEFS_BIN").unwrap_or_else(|_| "juicefs".to_string())
+}
+
 /// Error type for [`build_microvm_from_snapshot`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum BuildMicrovmFromSnapshotError {
@@ -440,6 +480,7 @@ pub fn build_microvm_from_snapshot(
     event_manager: &mut EventManager,
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
+    patchwork_memory_mappings: Vec<PatchworkMapping>,
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
@@ -528,6 +569,7 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        patchwork_memory_mappings,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -873,6 +915,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            patchwork_memory_mappings: Vec::new(),
         }
     }
 

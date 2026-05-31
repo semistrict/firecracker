@@ -1330,6 +1330,7 @@ mod tests {
                 resume_vm: false,
                 network_overrides: vec![],
                 vsock_override: None,
+                pmem_overrides: vec![],
                 clock_realtime: false,
             },
         )));

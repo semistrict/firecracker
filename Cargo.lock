@@ -1047,6 +1047,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5a797f0e07bdf071d15742978fc3128ec6c22891c31a3a931513263904c982a"
 
 [[package]]
+name = "patchwork-firecracker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "patchwork-mmap",
+ "thiserror 2.0.18",
+ "vm-memory",
+]
+
+[[package]]
+name = "patchwork-mmap"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1645,6 +1665,7 @@ dependencies = [
  "log-instrument",
  "memfd",
  "micro_http",
+ "patchwork-firecracker",
  "proptest",
  "semver",
  "serde",

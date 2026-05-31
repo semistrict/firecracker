@@ -9,9 +9,10 @@ use std::io::{self, Write};
 use std::mem::forget;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use patchwork_firecracker::PatchworkMapping;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
@@ -56,6 +57,8 @@ pub struct VmInfo {
     pub boot_source: BootSourceConfig,
     /// Huge page configuration
     pub huge_pages: HugePageConfig,
+    /// Optional file used to back fresh guest memory.
+    pub memory_backing_path: Option<PathBuf>,
 }
 
 impl From<&VmResources> for VmInfo {
@@ -66,6 +69,7 @@ impl From<&VmResources> for VmInfo {
             cpu_template: StaticCpuTemplate::from(&value.machine_config.cpu_template),
             boot_source: value.boot_source.config.clone(),
             huge_pages: value.machine_config.huge_pages,
+            memory_backing_path: value.machine_config.memory_backing_path.clone(),
         }
     }
 }
@@ -79,6 +83,7 @@ impl From<&Vmm> for VmInfo {
             cpu_template: StaticCpuTemplate::from(&machine_config.cpu_template),
             boot_source: value.boot_source_config.clone(),
             huge_pages: machine_config.huge_pages,
+            memory_backing_path: machine_config.memory_backing_path.clone(),
         }
     }
 }
@@ -157,6 +162,8 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Cannot flush patchwork memory: {0}
+    PatchworkMemory(#[from] crate::VmmError),
 }
 
 /// Snapshot version
@@ -168,6 +175,8 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    vmm.flush_patchwork_memory()?;
+
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -179,7 +188,9 @@ pub fn create_snapshot(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    if !snapshot_memory_already_backed(vm_info, &params.mem_file_path) {
+        kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -188,6 +199,21 @@ pub fn create_snapshot(
         .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
     Ok(())
+}
+
+fn snapshot_memory_already_backed(vm_info: &VmInfo, mem_file_path: &Path) -> bool {
+    let Some(backing_path) = &vm_info.memory_backing_path else {
+        return false;
+    };
+
+    paths_match(backing_path, mem_file_path)
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn snapshot_state_to_file(
@@ -412,6 +438,26 @@ pub fn restore_from_snapshot(
             .clone_from(&vsock_override.uds_path);
     }
 
+    for entry in &params.pmem_overrides {
+        microvm_state
+            .device_states
+            .mmio_state
+            .pmem_devices
+            .iter_mut()
+            .map(|device| &mut device.device_state)
+            .chain(
+                microvm_state
+                    .device_states
+                    .pci_state
+                    .pmem_devices
+                    .iter_mut()
+                    .map(|device| &mut device.device_state),
+            )
+            .find(|state| state.config.id == entry.id)
+            .map(|state| state.config.path_on_host.clone_from(&entry.path_on_host))
+            .ok_or(SnapshotStateFromFileError::UnknownPmemDevice)?;
+    }
+
     let track_dirty_pages = params.track_dirty_pages;
 
     let vcpu_count = microvm_state
@@ -429,6 +475,10 @@ pub fn restore_from_snapshot(
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
             huge_pages: Some(microvm_state.vm_info.huge_pages),
+            memory_backing_path: match params.mem_backend.backend_type {
+                MemBackendType::File => Some(params.mem_backend.backend_path.clone()),
+                MemBackendType::Uffd => None,
+            },
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })
@@ -440,7 +490,7 @@ pub fn restore_from_snapshot(
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
 
-    let (guest_memory, uffd) = match params.mem_backend.backend_type {
+    let (guest_memory, patchwork_memory_mappings, uffd) = match params.mem_backend.backend_type {
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
                 return Err(RestoreFromSnapshotGuestMemoryError::File(
@@ -448,25 +498,28 @@ pub fn restore_from_snapshot(
                 )
                 .into());
             }
-            (
+            let (guest_memory, patchwork_memory_mappings) =
                 guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
-                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
-                None,
-            )
+                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?;
+            (guest_memory, patchwork_memory_mappings, None)
         }
-        MemBackendType::Uffd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Uffd => {
+            let (guest_memory, uffd) = guest_memory_from_uffd(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
+            (guest_memory, Vec::new(), uffd)
+        }
     };
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
         guest_memory,
+        patchwork_memory_mappings,
         uffd,
         seccomp_filters,
         vm_resources,
@@ -486,6 +539,8 @@ pub enum SnapshotStateFromFileError {
     UnknownNetworkDevice,
     /// Unknown Vsock Device.
     UnknownVsockDevice,
+    /// Unknown Pmem Device.
+    UnknownPmemDevice,
 }
 
 fn snapshot_state_from_file(
@@ -506,16 +561,39 @@ pub enum GuestMemoryFromFileError {
     Restore(#[from] MemoryError),
     /// Cannot restore hugetlbfs backed snapshot by mapping the memory file. Please use uffd.
     HugetlbfsSnapshot,
+    /// Failed to map patchwork memory: {0}
+    Patchwork(#[from] patchwork_firecracker::Error),
 }
 
 fn guest_memory_from_file(
     mem_file_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
-) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
-    let mem_file = File::open(mem_file_path)?;
-    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
-    Ok(guest_mem)
+) -> Result<(Vec<GuestRegionMmap>, Vec<PatchworkMapping>), GuestMemoryFromFileError> {
+    let mut file_offset = 0_u64;
+    let regions = mem_state
+        .regions()
+        .map(|(guest_addr, len)| {
+            let current_offset = file_offset;
+            file_offset = file_offset
+                .checked_add(len as u64)
+                .ok_or(MemoryError::OffsetTooLarge)?;
+            Ok((guest_addr, current_offset, len as u64))
+        })
+        .collect::<Result<Vec<_>, MemoryError>>()?;
+
+    Ok(
+        patchwork_firecracker::PatchworkGuestMemory::regions_from_juicefs_regions(
+            juicefs_binary(),
+            mem_file_path,
+            regions,
+            track_dirty_pages,
+        )?,
+    )
+}
+
+fn juicefs_binary() -> String {
+    std::env::var("FIRECRACKER_JUICEFS_BIN").unwrap_or_else(|_| "juicefs".to_string())
 }
 
 /// Error type for [`guest_memory_from_uffd`]

@@ -124,6 +124,7 @@ use std::time::Duration;
 
 use device_manager::DeviceManager;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
+use patchwork_firecracker::{PatchworkMapping, WritableFlushReport};
 use snapshot::Persist;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::terminal::Terminal;
@@ -270,6 +271,8 @@ pub enum VmmError {
     Balloon(#[from] BalloonError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
+    /// Patchwork memory error: {0}
+    PatchworkMemory(String),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -307,9 +310,55 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+    patchwork_memory_mappings: Vec<PatchworkMapping>,
 }
 
 impl Vmm {
+    /// Flushes writable patchwork memory mappings into their leaf backing files.
+    pub fn flush_patchwork_memory(&mut self) -> Result<Vec<WritableFlushReport>, VmmError> {
+        if std::env::var_os("PATCHWORK_LOG_KVM_DIRTY").is_some() {
+            if let Some(kvm_vm) = self.vm.as_kvm() {
+                match kvm_vm.get_dirty_bitmap() {
+                    Ok(bitmap) => {
+                        let pages: u64 = bitmap
+                            .values()
+                            .flat_map(|words| words.iter())
+                            .map(|word| u64::from(word.count_ones()))
+                            .sum();
+                        info!(
+                            "patchwork memory diagnostic kvm_dirty_pages={} kvm_dirty_slots={}",
+                            pages,
+                            bitmap.len()
+                        );
+                    }
+                    Err(err) => {
+                        info!("patchwork memory diagnostic kvm_dirty_error={}", err);
+                    }
+                }
+            }
+        }
+        let reports = self
+            .patchwork_memory_mappings
+            .iter_mut()
+            .map(|mapping| {
+                mapping.flush().map_err(|err| {
+                    VmmError::PatchworkMemory(format!("failed to flush patchwork memory: {err}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, report) in reports.iter().enumerate() {
+            let written_bytes: u64 = report.written_pages.iter().map(|page| page.len).sum();
+            info!(
+                "patchwork memory flush index={} dirty_pages={} written_ranges={} written_bytes={}",
+                index,
+                report.dirty_pages,
+                report.written_pages.len(),
+                written_bytes
+            );
+        }
+        Ok(reports)
+    }
+
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()

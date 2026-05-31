@@ -41,6 +41,7 @@ log = { version = "0.4.29", features = ["std", "serde"] }
 log-instrument = { path = "../log-instrument", optional = true }
 memfd = "0.6.5"
 micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
+patchwork-firecracker = { path = "../../../patchwork-firecracker" }
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
