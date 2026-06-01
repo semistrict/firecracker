@@ -116,7 +116,7 @@ pub mod vstate;
 /// Module with initrd.
 pub mod initrd;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -126,10 +126,12 @@ use device_manager::DeviceManager;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use patchwork_firecracker::{GuestMemoryBacking, WritableFlushReport};
 use snapshot::Persist;
+use vm_memory::bitmap::Bitmap;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::terminal::Terminal;
 use vstate::vcpu::{self, VcpuSendEventError};
 
+use crate::arch::host_page_size;
 use crate::cpu_config::templates::CpuConfiguration;
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
 use crate::devices::virtio::balloon::{
@@ -161,7 +163,9 @@ use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
-use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use crate::vstate::memory::{
+    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
@@ -278,6 +282,42 @@ pub enum VmmError {
 /// Shorthand type for KVM dirty page bitmap.
 pub type DirtyBitmap = HashMap<u32, Vec<u64>>;
 
+fn add_dirty_bitmap_offsets(
+    pages: &mut BTreeSet<u64>,
+    words: &[u64],
+    slot_len: usize,
+    page_size: usize,
+) {
+    for (word_index, word) in words.iter().enumerate() {
+        let mut word = *word;
+        while word != 0 {
+            let bit = word.trailing_zeros() as usize;
+            let page_index = word_index * u64::BITS as usize + bit;
+            let off = page_index * page_size;
+            if off < slot_len {
+                pages.insert(off as u64);
+            }
+            word &= !(1_u64 << bit);
+        }
+    }
+}
+
+fn log_patchwork_kvm_dirty_diagnostic(dirty_bitmap: &DirtyBitmap) {
+    if std::env::var_os("PATCHWORK_LOG_KVM_DIRTY").is_none() {
+        return;
+    }
+    let pages: u64 = dirty_bitmap
+        .values()
+        .flat_map(|words| words.iter())
+        .map(|word| u64::from(word.count_ones()))
+        .sum();
+    info!(
+        "patchwork memory diagnostic kvm_dirty_pages={} kvm_dirty_slots={}",
+        pages,
+        dirty_bitmap.len()
+    );
+}
+
 /// Returns the size of guest memory, in MiB.
 pub(crate) fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
     guest_memory.iter().map(|region| region.len()).sum::<u64>() >> 20
@@ -316,24 +356,37 @@ pub struct Vmm {
 impl Vmm {
     /// Flushes writable patchwork memory mappings into their leaf backing files.
     pub fn flush_patchwork_memory(&mut self) -> Result<Vec<WritableFlushReport>, VmmError> {
+        if self
+            .patchwork_memory_mappings
+            .iter()
+            .any(GuestMemoryBacking::uses_external_dirty_tracking)
+        {
+            let kvm_vm = Arc::clone(self.vm.as_kvm().ok_or_else(|| {
+                VmmError::PatchworkMemory(
+                    "cannot flush patchwork memory with KVM dirty tracking: VM is not KVM".into(),
+                )
+            })?);
+            let dirty_bitmap = kvm_vm
+                .get_dirty_bitmap()
+                .map_err(|err| VmmError::PatchworkMemory(format!("get KVM dirty bitmap: {err}")))?;
+            log_patchwork_kvm_dirty_diagnostic(&dirty_bitmap);
+            let dirty_offsets =
+                self.patchwork_dirty_page_offsets(kvm_vm.guest_memory(), &dirty_bitmap);
+            let flush_result = self.flush_patchwork_memory_with_offsets(dirty_offsets);
+            if flush_result.is_err() {
+                kvm_vm
+                    .guest_memory()
+                    .store_dirty_bitmap(&dirty_bitmap, host_page_size());
+            } else {
+                kvm_vm.guest_memory().reset_dirty();
+            }
+            return flush_result;
+        }
+
         if std::env::var_os("PATCHWORK_LOG_KVM_DIRTY").is_some() {
             if let Some(kvm_vm) = self.vm.as_kvm() {
-                match kvm_vm.get_dirty_bitmap() {
-                    Ok(bitmap) => {
-                        let pages: u64 = bitmap
-                            .values()
-                            .flat_map(|words| words.iter())
-                            .map(|word| u64::from(word.count_ones()))
-                            .sum();
-                        info!(
-                            "patchwork memory diagnostic kvm_dirty_pages={} kvm_dirty_slots={}",
-                            pages,
-                            bitmap.len()
-                        );
-                    }
-                    Err(err) => {
-                        info!("patchwork memory diagnostic kvm_dirty_error={}", err);
-                    }
+                if let Ok(bitmap) = kvm_vm.get_dirty_bitmap() {
+                    log_patchwork_kvm_dirty_diagnostic(&bitmap);
                 }
             }
         }
@@ -357,6 +410,73 @@ impl Vmm {
             );
         }
         Ok(reports)
+    }
+
+    fn flush_patchwork_memory_with_offsets(
+        &mut self,
+        mut dirty_offsets: Vec<Vec<u64>>,
+    ) -> Result<Vec<WritableFlushReport>, VmmError> {
+        dirty_offsets.reverse();
+        let reports = self
+            .patchwork_memory_mappings
+            .iter_mut()
+            .map(|mapping| {
+                if mapping.uses_external_dirty_tracking() {
+                    let offsets = dirty_offsets.pop().ok_or_else(|| {
+                        VmmError::PatchworkMemory(
+                            "missing KVM dirty slot for patchwork mapping".into(),
+                        )
+                    })?;
+                    mapping.flush_dirty_page_offsets(offsets).map_err(|err| {
+                        VmmError::PatchworkMemory(format!(
+                            "failed to flush patchwork memory from KVM dirty bitmap: {err}"
+                        ))
+                    })
+                } else {
+                    mapping.flush().map_err(|err| {
+                        VmmError::PatchworkMemory(format!(
+                            "failed to flush patchwork memory: {err}"
+                        ))
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, report) in reports.iter().enumerate() {
+            let written_bytes: u64 = report.written_pages.iter().map(|page| page.len).sum();
+            info!(
+                "patchwork memory flush index={} dirty_pages={} written_ranges={} written_bytes={}",
+                index,
+                report.dirty_pages,
+                report.written_pages.len(),
+                written_bytes
+            );
+        }
+        Ok(reports)
+    }
+
+    fn patchwork_dirty_page_offsets(
+        &self,
+        guest_memory: &GuestMemoryMmap,
+        dirty_bitmap: &DirtyBitmap,
+    ) -> Vec<Vec<u64>> {
+        let page_size = host_page_size();
+        guest_memory
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+            .map(|mem_slot| {
+                let mut pages = BTreeSet::new();
+                if let Some(words) = dirty_bitmap.get(&mem_slot.slot) {
+                    add_dirty_bitmap_offsets(&mut pages, words, mem_slot.slice.len(), page_size);
+                }
+                let firecracker_bitmap = mem_slot.slice.bitmap();
+                for off in (0..mem_slot.slice.len()).step_by(page_size) {
+                    if firecracker_bitmap.dirty_at(off) {
+                        pages.insert(off as u64);
+                    }
+                }
+                pages.into_iter().collect()
+            })
+            .collect()
     }
 
     /// Gets Vmm version.
