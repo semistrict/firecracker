@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use patchwork_firecracker::PatchworkMapping;
+use patchwork_firecracker::GuestMemoryBacking;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
@@ -569,7 +569,7 @@ fn guest_memory_from_file(
     mem_file_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
-) -> Result<(Vec<GuestRegionMmap>, Vec<PatchworkMapping>), GuestMemoryFromFileError> {
+) -> Result<(Vec<GuestRegionMmap>, Vec<GuestMemoryBacking>), GuestMemoryFromFileError> {
     let mut file_offset = 0_u64;
     let regions = mem_state
         .regions()

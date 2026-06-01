@@ -124,7 +124,7 @@ use std::time::Duration;
 
 use device_manager::DeviceManager;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
-use patchwork_firecracker::{PatchworkMapping, WritableFlushReport};
+use patchwork_firecracker::{GuestMemoryBacking, WritableFlushReport};
 use snapshot::Persist;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::terminal::Terminal;
@@ -310,7 +310,7 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
-    patchwork_memory_mappings: Vec<PatchworkMapping>,
+    patchwork_memory_mappings: Vec<GuestMemoryBacking>,
 }
 
 impl Vmm {

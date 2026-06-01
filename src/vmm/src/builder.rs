@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use event_manager::SubscriberOps;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
-use patchwork_firecracker::PatchworkMapping;
+use patchwork_firecracker::GuestMemoryBacking;
 use userfaultfd::Uffd;
 use utils::time::TimestampUs;
 use vm_allocator::AllocPolicy;
@@ -397,7 +397,7 @@ pub fn build_and_boot_microvm(
 
 fn allocate_boot_guest_memory(
     vm_resources: &VmResources,
-) -> Result<(Vec<GuestRegionMmap>, Vec<PatchworkMapping>), StartMicrovmError> {
+) -> Result<(Vec<GuestRegionMmap>, Vec<GuestMemoryBacking>), StartMicrovmError> {
     let Some(memory_path) = &vm_resources.machine_config.memory_backing_path else {
         return vm_resources
             .allocate_guest_memory()
@@ -480,7 +480,7 @@ pub fn build_microvm_from_snapshot(
     event_manager: &mut EventManager,
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
-    patchwork_memory_mappings: Vec<PatchworkMapping>,
+    patchwork_memory_mappings: Vec<GuestMemoryBacking>,
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
