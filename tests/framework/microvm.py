@@ -99,6 +99,7 @@ class Snapshot:
     ssh_key: Path
     snapshot_type: SnapshotType
     meta: dict
+    mem_overlays: tuple = ()
 
     def rebase_snapshot(
         self, base, use_snapshot_editor=False, binary_dir=DEFAULT_BINARY_DIR
@@ -106,6 +107,9 @@ class Snapshot:
         """Rebases current incremental snapshot onto a specified base layer."""
         if not self.snapshot_type.needs_rebase:
             raise ValueError(f"Cannot rebase {self.snapshot_type}")
+        # base.mem_overlays would be discarded, silently losing layers.
+        if base.mem_overlays:
+            raise ValueError("cannot rebase onto an overlay-composite snapshot")
         if use_snapshot_editor:
             build_tools.run_snap_editor_rebase(
                 base.mem, self.mem, binary_dir=binary_dir
@@ -114,6 +118,37 @@ class Snapshot:
             build_tools.run_rebase_snap_bin(base.mem, self.mem)
 
         new_args = self.__dict__ | {"mem": base.mem}
+        return Snapshot(**new_args)
+
+    def on_base(self, *layers: "Snapshot") -> "Snapshot":
+        """Expresses current incremental snapshot as an overlay chain on top of
+        the specified base layer(s), for direct restoration without rebasing.
+
+        Composites (snapshots that already carry mem_overlays) are only allowed
+        as the base layer, whose mem+mem_overlays are absorbed naturally;
+        elsewhere their chain semantics are ambiguous, so reject them."""
+        if not self.snapshot_type.needs_rebase:
+            raise ValueError(f"Cannot rebase {self.snapshot_type}")
+        if self.mem_overlays or any(layer.mem_overlays for layer in layers[1:]):
+            raise ValueError("Composite snapshots may only be the base layer")
+
+        overlays = (
+            layers[0].mem_overlays
+            + tuple(layer.mem for layer in layers[1:])
+            + (self.mem,)
+        )
+
+        # copy_to_chroot/save_to key files by basename; a collision would raise
+        # FileExistsError from the hardlink. Catch it here with a clear message.
+        basenames = [layers[0].mem.name] + [p.name for p in overlays]
+        for name in basenames:
+            if basenames.count(name) > 1:
+                raise ValueError(f"Duplicate snapshot file basename: {name}")
+
+        new_args = self.__dict__ | {
+            "mem": layers[0].mem,
+            "mem_overlays": overlays,
+        }
         return Snapshot(**new_args)
 
     def copy_to_chroot(self, chroot) -> "Snapshot":
@@ -126,6 +161,12 @@ class Snapshot:
         vmstate_src = chroot / self.vmstate.with_suffix(".src").name
         hardlink_or_copy(self.vmstate, vmstate_src)
 
+        overlay_srcs = []
+        for overlay in self.mem_overlays:
+            overlay_src = chroot / overlay.with_suffix(".src").name
+            hardlink_or_copy(overlay, overlay_src)
+            overlay_srcs.append(overlay_src)
+
         return Snapshot(
             vmstate=vmstate_src,
             mem=mem_src,
@@ -134,6 +175,7 @@ class Snapshot:
             ssh_key=self.ssh_key,
             snapshot_type=self.snapshot_type,
             meta=self.meta,
+            mem_overlays=tuple(overlay_srcs),
         )
 
     @classmethod
@@ -150,6 +192,7 @@ class Snapshot:
             ssh_key=src / obj["ssh_key"],
             snapshot_type=SnapshotType(obj["snapshot_type"]),
             meta=obj["meta"],
+            mem_overlays=tuple(src / p for p in obj.get("mem_overlays", [])),
         )
 
     def save_to(self, dst: Path):
@@ -157,7 +200,7 @@ class Snapshot:
 
         Deserialize the snapshot with `load_from`
         """
-        for path in [self.vmstate, self.mem, self.ssh_key]:
+        for path in [self.vmstate, self.mem, self.ssh_key, *self.mem_overlays]:
             new_path = dst / path.name
             hardlink_or_copy(path, new_path)
         new_disks = {}
@@ -173,6 +216,7 @@ class Snapshot:
             "ssh_key": self.ssh_key.name,
             "snapshot_type": self.snapshot_type.value,
             "meta": self.meta,
+            "mem_overlays": [path.name for path in self.mem_overlays],
         }
         snap_json = dst / "snapshot.json"
         snap_json.write_text(json.dumps(obj))
@@ -1101,6 +1145,11 @@ class Microvm:
 
         jailed_snapshot = snapshot.copy_to_chroot(Path(self.chroot()))
 
+        # The Uffd backend serves only the base layer; overlays would be
+        # silently dropped, running a stale guest. Fail fast instead.
+        if (uffd_handler_name or self.uffd_handler) and jailed_snapshot.mem_overlays:
+            raise ValueError("UFFD restore does not support snapshot overlays")
+
         if uffd_handler_name:
             self.uffd_handler = spawn_pf_handler(
                 self,
@@ -1110,6 +1159,9 @@ class Microvm:
 
         jailed_mem = Path("/") / jailed_snapshot.mem.name
         jailed_vmstate = Path("/") / jailed_snapshot.vmstate.name
+        jailed_overlays = [
+            Path("/") / overlay.name for overlay in jailed_snapshot.mem_overlays
+        ]
 
         snapshot_disks = [v for k, v in jailed_snapshot.disks.items()]
         assert len(snapshot_disks) > 0, "Snapshot requires at least one disk."
@@ -1124,6 +1176,10 @@ class Microvm:
             self.add_net_iface(iface, api=False)
 
         mem_backend = {"backend_type": "File", "backend_path": str(jailed_mem)}
+        if jailed_overlays:
+            # Only sent when used, for backwards-compatibility ab testing
+            # against older release baselines.
+            mem_backend["overlays"] = [str(overlay) for overlay in jailed_overlays]
         if self.uffd_handler is not None:
             mem_backend = {
                 "backend_type": "Uffd",
@@ -1170,6 +1226,15 @@ class Microvm:
         if self.memory_monitor:
             response = self.api.machine_config.get()
             self.mem_size_bytes = int(response.json()["mem_size_mib"]) * 2**20
+            if jailed_snapshot.mem_overlays:
+                # Both path forms: /proc/<pid>/smaps reports paths as seen
+                # from Firecracker's chrooted mount namespace.
+                for host_path, jail_path in [
+                    (jailed_snapshot.mem, jailed_mem),
+                    *zip(jailed_snapshot.mem_overlays, jailed_overlays),
+                ]:
+                    self.memory_monitor.guest_mem_paths.add(str(host_path))
+                    self.memory_monitor.guest_mem_paths.add(str(jail_path))
             # Notify monitor that this is a restored VM
             self.memory_monitor.set_threshold_for_restored_vm()
             self.memory_monitor.start()

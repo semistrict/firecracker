@@ -17,6 +17,16 @@ and this project adheres to
   emits the microVM instance id under a top-level `id` field, and `properties`
   emits operator-defined key-value pairs under a top-level `properties` field.
   Each is opt-in and independent. See [metrics documentation](docs/metrics.md).
+- [#5990](https://github.com/firecracker-microvm/firecracker/pull/5990):
+  `PUT /snapshot/load` `mem_backend` now accepts an optional `overlays` list of
+  diff snapshot memory files that are memory-mapped lazily over the base memory
+  file when loading (rather than merged into it), enabling restore directly from
+  a diff snapshot chain without rebasing via
+  `snapshot-editor edit-memory rebase` first. Because the diff data faults in on
+  demand rather than being read upfront, this is suited to keeping diff files on
+  a network filesystem. The base and every overlay file back live guest memory
+  and must remain immutable while the microVM runs. See the
+  [snapshotting documentation](docs/snapshotting/snapshot-support.md).
 
 ### Changed
 

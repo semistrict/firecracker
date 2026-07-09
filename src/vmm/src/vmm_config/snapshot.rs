@@ -130,6 +130,10 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// Diff snapshot memory files mapped, in order, over the file at
+    /// `backend_path`. `File` backend only.
+    #[serde(default)]
+    pub overlays: Vec<PathBuf>,
 }
 
 /// The microVM state options.

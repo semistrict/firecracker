@@ -6,7 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -572,6 +572,7 @@ impl KvmVm {
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
+        overlay_files: &[File],
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -584,6 +585,14 @@ impl KvmVm {
             .truncate(false)
             .open(mem_file_path)
             .map_err(|err| MemoryBackingFile("open", err))?;
+
+        // An overlay backs live guest memory; writing onto one would corrupt the running guest.
+        // fstat the opened handle (not the path) to avoid a re-point between check and use.
+        if crate::persist::file_aliases_overlay(&file, overlay_files)
+            .map_err(|err| MemoryBackingFile("metadata", err))?
+        {
+            return Err(TargetIsOverlay);
+        }
 
         // Determine what size our total memory area is.
         let mem_size_mib = mem_size_mib(self.guest_memory());
