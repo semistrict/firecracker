@@ -3,6 +3,7 @@
 """Basic tests scenarios for snapshot save/restore."""
 
 import dataclasses
+import errno
 import filecmp
 import logging
 import os
@@ -18,8 +19,10 @@ import pytest
 import host_tools.cargo_build as host
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools
+from framework import microvm as microvm_module
 from framework import utils
 from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel, pin_rootfs_mode
+from framework.microvm import hardlink_or_copy
 from framework.properties import global_props
 from framework.utils import check_filesystem, check_output
 from framework.utils_cpu_templates import ALL_CPU_TEMPLATES, pin_cpu_template
@@ -464,6 +467,48 @@ def test_diff_snapshot_overlay(uvm, microvm_factory, mem_size):
     _ = microvm_factory.build_from_snapshot(merged_snapshot)
 
     # Check that the restored VM works
+
+
+def test_overlay_copy_preserves_sparse_holes(tmp_path, monkeypatch):
+    """Cross-device overlay copies retain the source file's data extents."""
+
+    def data_extents(path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            size = os.fstat(fd).st_size
+            cursor = 0
+            extents = []
+            while cursor < size:
+                try:
+                    data_start = os.lseek(fd, cursor, os.SEEK_DATA)
+                except OSError as err:
+                    if err.errno == errno.ENXIO:
+                        break
+                    raise
+                data_end = os.lseek(fd, data_start, os.SEEK_HOLE)
+                extents.append((data_start, data_end))
+                cursor = data_end
+            return extents
+        finally:
+            os.close(fd)
+
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    source = tmp_path / "overlay_source"
+    destination = tmp_path / "overlay_destination"
+    with source.open("wb") as file:
+        file.truncate(3 * page_size)
+        file.seek(page_size)
+        file.write(b"x" * page_size)
+
+    monkeypatch.setattr(microvm_module, "_same_device", lambda _src, _dst: False)
+    hardlink_or_copy(source, destination, preserve_sparse=True)
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert (
+        data_extents(destination)
+        == data_extents(source)
+        == [(page_size, 2 * page_size)]
+    )
 
 
 def test_load_snapshot_with_overlays(uvm, microvm_factory):

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use bitvec::vec::BitVec;
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use serde::{Deserialize, Serialize};
+use utils::{MAX_MAP_COUNT_ENV_VAR, PROC_MAX_MAP_COUNT_PATH};
 pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
 use vm_memory::mmap::{MmapRegionError, NewBitmap};
@@ -78,8 +79,8 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
-    /// Overlay file of {overlay_size} bytes is larger than the guest memory size of {memory_size} bytes
-    OverlayTooLarge {
+    /// Overlay file size of {overlay_size} bytes does not match the guest memory size of {memory_size} bytes
+    OverlaySizeMismatch {
         /// Logical size of the overlay file in bytes.
         overlay_size: u64,
         /// Total guest memory size in bytes.
@@ -99,6 +100,10 @@ pub enum MemoryError {
         /// Value of vm.max_map_count.
         max_map_count: u64,
     },
+    /// Cannot determine vm.max_map_count from procfs or the jailer environment
+    MaxMapCountUnavailable,
+    /// Invalid vm.max_map_count value: {0}
+    InvalidMaxMapCount(String),
     /// Cannot resolve overlay host address: {0}
     OverlayAddress(GuestMemoryError),
     /// Cannot map overlay over guest memory: {0}
@@ -675,6 +680,10 @@ pub fn snapshot_file_with_overlays(
             .all(|r| r.file_offset().is_some() && r.flags() & libc::MAP_PRIVATE != 0)
     );
 
+    if overlays.is_empty() {
+        return Ok(guest_regions);
+    }
+
     // Derive each region's (file offset, size) from the mappings `snapshot_file` just built.
     let region_layout: Vec<(u64, usize)> = guest_regions
         .iter()
@@ -688,7 +697,7 @@ pub fn snapshot_file_with_overlays(
     // Validate everything before mapping anything, so a failure never leaves a half-applied
     // quilt.
     let page_size = host_page_size() as u64;
-    let max_map_count = read_max_map_count();
+    let max_map_count = read_max_map_count()?;
     let mut plans: Vec<(File, Vec<(u64, u64)>)> = Vec::with_capacity(overlays.len());
     let mut mappings = 0usize;
     for mut overlay in overlays {
@@ -713,11 +722,25 @@ pub fn snapshot_file_with_overlays(
     Ok(guest_regions)
 }
 
-/// `None` when `/proc` is unreadable (e.g. jailed), which skips the fragmentation check.
-fn read_max_map_count() -> Option<u64> {
-    std::fs::read_to_string("/proc/sys/vm/max_map_count")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
+fn max_map_count_from_sources(
+    procfs_value: Option<String>,
+    jailer_value: Option<String>,
+) -> Result<u64, MemoryError> {
+    let value = procfs_value
+        .or(jailer_value)
+        .ok_or(MemoryError::MaxMapCountUnavailable)?;
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| MemoryError::InvalidMaxMapCount(value.trim().to_string()))
+}
+
+/// Reads the live procfs value, falling back to the value retained by the jailer before chroot.
+fn read_max_map_count() -> Result<u64, MemoryError> {
+    max_map_count_from_sources(
+        std::fs::read_to_string(PROC_MAX_MAP_COUNT_PATH).ok(),
+        std::env::var(MAX_MAP_COUNT_ENV_VAR).ok(),
+    )
 }
 
 /// The `[start, end)` data extents of `overlay`, via `SEEK_DATA`/`SEEK_HOLE`.
@@ -763,11 +786,13 @@ fn validate_overlay_extents(
     page_size: u64,
     region_layout: &[(u64, usize)],
     prior_mappings: usize,
-    max_map_count: Option<u64>,
+    max_map_count: u64,
 ) -> Result<usize, MemoryError> {
-    // Diff files are sized to guest memory; anything larger is the wrong file.
-    if overlay_size > memory_size {
-        return Err(MemoryError::OverlayTooLarge {
+    // Firecracker diff files always have the full logical guest-memory size. A shorter file is
+    // truncated or belongs to another VM; treating its missing tail as holes would restore stale
+    // lower-layer data.
+    if overlay_size != memory_size {
+        return Err(MemoryError::OverlaySizeMismatch {
             overlay_size,
             memory_size,
         });
@@ -783,9 +808,7 @@ fn validate_overlay_extents(
         mappings += 2 * count_extent_mappings(start, end, region_layout);
     }
 
-    if let Some(max_map_count) = max_map_count
-        && mappings as u64 + OVERLAY_VMA_HEADROOM > max_map_count
-    {
+    if mappings as u64 + OVERLAY_VMA_HEADROOM > max_map_count {
         return Err(MemoryError::OverlayTooFragmented {
             mappings,
             max_map_count,
@@ -1337,23 +1360,45 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_file_with_overlays_too_large() {
+    fn test_snapshot_file_with_overlays_size_mismatch() {
         let page_size = host_page_size();
-        // Base: 1 page.
-        let base = make_base_file(page_size, 0x11);
-        let base_file = File::open(base.as_path()).unwrap();
-        // Overlay logical size of 2 pages exceeds the 1-page guest memory.
-        let overlay = make_overlay_file(2 * page_size, &[(0, vec![0x22u8; page_size])]);
+        let memory_size = 2 * page_size;
 
-        let regions = vec![(GuestAddress(0), page_size)];
-        let err = snapshot_file_with_overlays(base_file, vec![overlay], regions.into_iter(), false)
-            .unwrap_err();
+        for overlay_size in [0, page_size, 3 * page_size] {
+            let base = make_base_file(memory_size, 0x11);
+            let base_file = File::open(base.as_path()).unwrap();
+            let overlay = if overlay_size == 0 {
+                make_overlay_file(0, &[])
+            } else {
+                make_overlay_file(overlay_size, &[(0, vec![0x22u8; page_size])])
+            };
+            let regions = vec![(GuestAddress(0), memory_size)];
+            let err =
+                snapshot_file_with_overlays(base_file, vec![overlay], regions.into_iter(), false)
+                    .unwrap_err();
+            assert!(matches!(
+                err,
+                MemoryError::OverlaySizeMismatch {
+                    overlay_size: actual,
+                    memory_size: expected,
+                } if actual == overlay_size as u64 && expected == memory_size as u64
+            ));
+        }
+    }
+
+    #[test]
+    fn test_max_map_count_uses_jailer_fallback() {
+        assert_eq!(
+            max_map_count_from_sources(None, Some("65530\n".to_string())).unwrap(),
+            65530
+        );
         assert!(matches!(
-            err,
-            MemoryError::OverlayTooLarge {
-                overlay_size,
-                memory_size,
-            } if overlay_size == 2 * page_size as u64 && memory_size == page_size as u64
+            max_map_count_from_sources(None, None).unwrap_err(),
+            MemoryError::MaxMapCountUnavailable
+        ));
+        assert!(matches!(
+            max_map_count_from_sources(None, Some("invalid".to_string())).unwrap_err(),
+            MemoryError::InvalidMaxMapCount(value) if value == "invalid"
         ));
     }
 
@@ -1425,7 +1470,7 @@ mod tests {
             page_size as u64,
             &region_layout,
             0,
-            None,
+            u64::MAX,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1448,7 +1493,7 @@ mod tests {
             page_size as u64,
             &region_layout,
             0,
-            None,
+            u64::MAX,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1481,7 +1526,7 @@ mod tests {
             page_size as u64,
             &region_layout,
             0,
-            Some(10),
+            10,
         )
         .unwrap_err();
         assert!(matches!(

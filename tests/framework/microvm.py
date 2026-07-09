@@ -10,6 +10,7 @@ destroy microvms.
 - Use the Firecracker Open API spec to populate Microvm API resource URLs.
 """
 
+import errno
 import json
 import logging
 import os
@@ -78,12 +79,51 @@ class SnapshotType(Enum):
                 return "Diff"
 
 
-def hardlink_or_copy(src, dst):
-    """If src and dst are in the same device, hardlink. Otherwise, copy."""
+def _same_device(src, dst):
+    """Return whether two paths reside on the same device."""
+    return dst.stat().st_dev == src.stat().st_dev
+
+
+def _copy_sparse(src, dst):
+    """Copy a sparse file without turning holes into allocated zero blocks."""
+    with src.open("rb", buffering=0) as source, dst.open("r+b", buffering=0) as target:
+        file_size = os.fstat(source.fileno()).st_size
+        target.truncate(file_size)
+        cursor = 0
+
+        while cursor < file_size:
+            try:
+                data_start = os.lseek(source.fileno(), cursor, os.SEEK_DATA)
+            except OSError as err:
+                if err.errno == errno.ENXIO:
+                    break
+                raise
+
+            data_end = os.lseek(source.fileno(), data_start, os.SEEK_HOLE)
+            source.seek(data_start)
+            target.seek(data_start)
+            remaining = data_end - data_start
+
+            while remaining:
+                chunk = source.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise OSError(errno.EIO, "unexpected end of sparse source file")
+                written = target.write(chunk)
+                if written != len(chunk):
+                    raise OSError(errno.EIO, "short write while copying sparse file")
+                remaining -= written
+
+            cursor = data_end
+
+
+def hardlink_or_copy(src, dst, preserve_sparse=False):
+    """Hardlink files on one device; otherwise copy, optionally preserving holes."""
     dst.touch(exist_ok=False)
-    if dst.stat().st_dev == src.stat().st_dev:
+    if _same_device(src, dst):
         dst.unlink()
         dst.hardlink_to(src)
+    elif preserve_sparse:
+        _copy_sparse(src, dst)
     else:
         shutil.copyfile(src, dst)
 
@@ -164,7 +204,7 @@ class Snapshot:
         overlay_srcs = []
         for overlay in self.mem_overlays:
             overlay_src = chroot / overlay.with_suffix(".src").name
-            hardlink_or_copy(overlay, overlay_src)
+            hardlink_or_copy(overlay, overlay_src, preserve_sparse=True)
             overlay_srcs.append(overlay_src)
 
         return Snapshot(
@@ -200,9 +240,12 @@ class Snapshot:
 
         Deserialize the snapshot with `load_from`
         """
-        for path in [self.vmstate, self.mem, self.ssh_key, *self.mem_overlays]:
+        for path in [self.vmstate, self.mem, self.ssh_key]:
             new_path = dst / path.name
             hardlink_or_copy(path, new_path)
+        for path in self.mem_overlays:
+            new_path = dst / path.name
+            hardlink_or_copy(path, new_path, preserve_sparse=True)
         new_disks = {}
         for disk_id, path in self.disks.items():
             new_path = dst / path.name
