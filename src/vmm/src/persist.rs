@@ -7,9 +7,10 @@ use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::forget;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use semver::Version;
@@ -157,6 +158,8 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// The snapshot target file is currently mapped as a diff overlay of this VM's guest memory
+    TargetIsOverlay,
 }
 
 /// Snapshot version
@@ -172,14 +175,19 @@ pub fn create_snapshot(
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+    snapshot_state_to_file(&microvm_state, &params.snapshot_path, &vmm.overlay_files)?;
 
     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+
+    kvm_vm.snapshot_memory_to_file(
+        &params.mem_file_path,
+        params.snapshot_type,
+        &vmm.overlay_files,
+    )?;
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -193,14 +201,27 @@ pub fn create_snapshot(
 fn snapshot_state_to_file(
     microvm_state: &MicrovmState,
     snapshot_path: &Path,
+    overlay_files: &[File],
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;
+    // Open without truncating: truncating a live overlay would corrupt the running guest.
     let mut snapshot_file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(false)
         .open(snapshot_path)
         .map_err(|err| SnapshotBackingFile("open", err))?;
+
+    if file_aliases_overlay(&snapshot_file, overlay_files)
+        .map_err(|err| SnapshotBackingFile("metadata", err))?
+    {
+        return Err(TargetIsOverlay);
+    }
+
+    // Guard passed: restore the truncate-on-open semantics.
+    snapshot_file
+        .set_len(0)
+        .map_err(|err| SnapshotBackingFile("truncate", err))?;
 
     let snapshot = Snapshot::new(microvm_state);
     snapshot.save(&mut snapshot_file)?;
@@ -210,6 +231,23 @@ fn snapshot_state_to_file(
     snapshot_file
         .sync_all()
         .map_err(|err| SnapshotBackingFile("sync_all", err))
+}
+
+/// Whether the open `file` is the same file (`st_dev`+`st_ino`) as any retained overlay. Uses
+/// `fstat` on already-open handles, so there is no path to re-point between check and use.
+pub(crate) fn file_aliases_overlay(file: &File, overlay_files: &[File]) -> Result<bool, io::Error> {
+    if overlay_files.is_empty() {
+        return Ok(false);
+    }
+    let meta = file.metadata()?;
+    let (dev, ino) = (meta.dev(), meta.ino());
+    for overlay in overlay_files {
+        let overlay_meta = overlay.metadata()?;
+        if overlay_meta.dev() == dev && overlay_meta.ino() == ino {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Validates that snapshot CPU vendor matches the host CPU vendor.
@@ -440,7 +478,7 @@ pub fn restore_from_snapshot(
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
 
-    let (guest_memory, uffd) = match params.mem_backend.backend_type {
+    let (guest_memory, uffd, overlay_files) = match params.mem_backend.backend_type {
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
                 return Err(RestoreFromSnapshotGuestMemoryError::File(
@@ -448,19 +486,31 @@ pub fn restore_from_snapshot(
                 )
                 .into());
             }
-            (
-                guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
-                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
-                None,
+            let (guest_memory, overlay_files) = guest_memory_from_file(
+                mem_backend_path,
+                &params.mem_backend.overlays,
+                mem_state,
+                track_dirty_pages,
             )
+            .map_err(RestoreFromSnapshotGuestMemoryError::File)?;
+            (guest_memory, None, overlay_files)
         }
-        MemBackendType::Uffd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Uffd => {
+            if !params.mem_backend.overlays.is_empty() {
+                return Err(RestoreFromSnapshotGuestMemoryError::Uffd(
+                    GuestMemoryFromUffdError::OverlaysUnsupported,
+                )
+                .into());
+            }
+            let (guest_memory, uffd) = guest_memory_from_uffd(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
+            (guest_memory, uffd, Vec::new())
+        }
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -468,6 +518,7 @@ pub fn restore_from_snapshot(
         microvm_state,
         guest_memory,
         uffd,
+        overlay_files,
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
@@ -502,25 +553,48 @@ fn snapshot_state_from_file(
 pub enum GuestMemoryFromFileError {
     /// Failed to load guest memory: {0}
     File(#[from] std::io::Error),
+    /// Failed to open overlay file: {0}
+    OpenOverlay(std::io::Error),
     /// Failed to restore guest memory: {0}
     Restore(#[from] MemoryError),
     /// Cannot restore hugetlbfs backed snapshot by mapping the memory file. Please use uffd.
     HugetlbfsSnapshot,
 }
 
+/// Maps the base memory file and any diff `overlays` into guest memory. The returned overlay
+/// handles are held for the VM's lifetime so [`file_aliases_overlay`] can identify them.
 fn guest_memory_from_file(
     mem_file_path: &Path,
+    overlays: &[PathBuf],
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
-) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
+) -> Result<(Vec<GuestRegionMmap>, Vec<File>), GuestMemoryFromFileError> {
     let mem_file = File::open(mem_file_path)?;
-    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
-    Ok(guest_mem)
+    let overlay_files = overlays
+        .iter()
+        .map(File::open)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(GuestMemoryFromFileError::OpenOverlay)?;
+    // `snapshot_file_with_overlays` consumes the handles it is given.
+    let retained_overlays = overlay_files
+        .iter()
+        .map(File::try_clone)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(GuestMemoryFromFileError::OpenOverlay)?;
+    let guest_mem = memory::snapshot_file_with_overlays(
+        mem_file,
+        overlay_files,
+        mem_state.regions(),
+        track_dirty_pages,
+    )?;
+    Ok((guest_mem, retained_overlays))
 }
 
 /// Error type for [`guest_memory_from_uffd`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum GuestMemoryFromUffdError {
+    /// Overlays are not supported with the Uffd backend; the page fault handler process is responsible for applying diff layers.
+    OverlaysUnsupported,
     /// Failed to restore guest memory: {0}
     Restore(#[from] MemoryError),
     /// Failed to UFFD object: {0}
@@ -763,6 +837,24 @@ mod tests {
             restored_microvm_state.device_states.mmio_state,
             microvm_state.device_states.mmio_state
         )
+    }
+
+    #[test]
+    fn test_file_aliases_overlay() {
+        let overlay = TempFile::new().unwrap();
+        let overlay_file = File::open(overlay.as_path()).unwrap();
+
+        // A separate handle to the same file (same dev+inode) as a retained overlay aliases.
+        let same = File::open(overlay.as_path()).unwrap();
+        assert!(file_aliases_overlay(&same, std::slice::from_ref(&overlay_file)).unwrap());
+
+        // A different existing file does not alias.
+        let other = TempFile::new().unwrap();
+        let other_file = File::open(other.as_path()).unwrap();
+        assert!(!file_aliases_overlay(&other_file, std::slice::from_ref(&overlay_file)).unwrap());
+
+        // With no overlays, nothing aliases.
+        assert!(!file_aliases_overlay(&overlay_file, &[]).unwrap());
     }
 
     #[test]

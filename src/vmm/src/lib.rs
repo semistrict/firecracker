@@ -117,6 +117,7 @@ pub mod vstate;
 pub mod initrd;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -307,6 +308,9 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+    /// Diff overlay files mapped into guest memory; held open for the VM's lifetime and used to
+    /// refuse snapshotting onto a live overlay.
+    overlay_files: Vec<File>,
 }
 
 impl Vmm {

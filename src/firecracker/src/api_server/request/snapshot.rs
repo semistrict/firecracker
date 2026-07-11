@@ -22,6 +22,9 @@ pub const MISSING_FIELD: &str =
 /// Only specifying one of them is allowed.
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
+/// `overlays` were specified together with the `Uffd` memory backend.
+pub const UFFD_WITH_OVERLAYS: &str =
+    "invalid field: `overlays` is only supported with the `File` backend type";
 
 pub(crate) fn parse_put_snapshot(
     body: &Body,
@@ -98,9 +101,17 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 // either `mem_file_path` or `mem_backend` field is always specified.
                 backend_path: snapshot_config.mem_file_path.unwrap(),
                 backend_type: MemBackendType::File,
+                overlays: vec![],
             }
         }
     };
+
+    // With `Uffd`, the page fault handler process owns diff layering.
+    if mem_backend.backend_type == MemBackendType::Uffd && !mem_backend.overlays.is_empty() {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            UFFD_WITH_OVERLAYS,
+        )));
+    }
 
     let snapshot_params = LoadSnapshotParams {
         snapshot_path: snapshot_config.snapshot_path,
@@ -185,6 +196,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                overlays: vec![],
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -217,6 +229,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                overlays: vec![],
             },
             track_dirty_pages: true,
             resume_vm: false,
@@ -249,6 +262,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                overlays: vec![],
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -287,6 +301,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                overlays: vec![],
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -319,6 +334,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                overlays: vec![],
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -407,6 +423,57 @@ mod tests {
         );
         parse_put_snapshot(&Body::new(body), Some("invalid")).unwrap_err();
         parse_put_snapshot(&Body::new(body), None).unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_load_with_overlays() {
+        use std::path::PathBuf;
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "base_mem",
+                "backend_type": "File",
+                "overlays": ["diff1", "diff2"]
+            }
+        }"#;
+        let expected_config = LoadSnapshotParams {
+            snapshot_path: PathBuf::from("foo"),
+            mem_backend: MemBackendConfig {
+                backend_path: PathBuf::from("base_mem"),
+                backend_type: MemBackendType::File,
+                overlays: vec![PathBuf::from("diff1"), PathBuf::from("diff2")],
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("load")).unwrap()),
+            VmmAction::LoadSnapshot(expected_config)
+        );
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_load_uffd_with_overlays() {
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "Uffd",
+                "overlays": ["diff1"]
+            }
+        }"#;
+        assert_eq!(
+            parse_put_snapshot(&Body::new(body), Some("load"))
+                .err()
+                .unwrap()
+                .to_string(),
+            RequestError::SerdeJson(serde_json::Error::custom(UFFD_WITH_OVERLAYS.to_string()))
+                .to_string()
+        );
     }
 
     #[test]

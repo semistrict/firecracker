@@ -4,6 +4,7 @@
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
 use std::fmt::Debug;
+use std::fs::File;
 use std::io;
 #[cfg(feature = "gdb")]
 use std::sync::mpsc;
@@ -328,6 +329,7 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        overlay_files: vec![],
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -431,6 +433,7 @@ pub fn build_microvm_from_snapshot(
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
     uffd: Option<Uffd>,
+    overlay_files: Vec<File>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
@@ -518,6 +521,7 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        overlay_files,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -849,6 +853,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            overlay_files: vec![],
         }
     }
 

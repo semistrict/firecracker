@@ -14,13 +14,19 @@ from framework.properties import global_props
 class MemoryUsageExceededError(Exception):
     """A custom exception containing details on excessive memory usage."""
 
-    def __init__(self, usage, threshold, *args):
+    def __init__(self, usage, threshold, counted_mmaps, *args):
         """Compose the error message containing the memory consumption."""
-        super().__init__(
+        msg = (
             f"Memory usage ({usage / (1 << 20):.2f} MiB) exceeded maximum threshold "
-            f"({threshold / (1 << 20)} MiB)",
-            *args,
+            f"({threshold / (1 << 20)} MiB)"
         )
+        if counted_mmaps:
+            msg += "\nLargest counted mappings:\n" + "\n".join(
+                f"  rss={rss / (1 << 20):.2f} MiB size={size / (1 << 20):.2f} MiB "
+                f"path={path!r}"
+                for path, size, rss in counted_mmaps
+            )
+        super().__init__(msg, *args)
 
 
 class MemoryMonitor(Thread):
@@ -60,9 +66,15 @@ class MemoryMonitor(Thread):
         # Start with booted threshold by default
         self.threshold = threshold_booted
         self._exceeded = None
+        # Non-excluded (path, size, rss) mappings counted in the sample that
+        # exceeded the threshold, largest rss first. For diagnostics only.
+        self._exceeded_mmaps = []
         self._period_s = period_s
         self._should_stop = False
         self._current_rss = 0
+        # Guest-memory backing files, excluded by path: overlay restores
+        # fragment guest memory into VMAs the size heuristic can't recognise.
+        self.guest_mem_paths = set()
         self.daemon = True
 
     def signal_stop(self):
@@ -101,14 +113,21 @@ class MemoryMonitor(Thread):
             except psutil.NoSuchProcess:
                 return
             mem_total = 0
+            counted_mmaps = []
             for mmap in mmaps:
+                if mmap.path in self.guest_mem_paths:
+                    continue
                 if self.is_guest_mem(mmap.size, guest_mem_bytes):
                     continue
 
                 mem_total += mmap.rss
+                counted_mmaps.append((mmap.path, mmap.size, mmap.rss))
             self._current_rss = mem_total
             if mem_total > self.threshold:
                 self._exceeded = ps
+                self._exceeded_mmaps = sorted(
+                    counted_mmaps, key=lambda m: m[2], reverse=True
+                )[:10]
                 return
 
             time.sleep(self._period_s)
@@ -170,7 +189,7 @@ class MemoryMonitor(Thread):
         """Check that there are no samples over the threshold."""
         if self._exceeded is not None:
             raise MemoryUsageExceededError(
-                self._current_rss, self.threshold, self._exceeded
+                self._current_rss, self.threshold, self._exceeded_mmaps, self._exceeded
             )
 
     @property

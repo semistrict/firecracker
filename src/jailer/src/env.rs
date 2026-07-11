@@ -13,7 +13,7 @@ use std::process::{Command, Stdio, exit, id};
 
 use utils::arg_parser::UtilsArgParserError::MissingValue;
 use utils::time::{ClockType, get_time_us};
-use utils::{arg_parser, validators};
+use utils::{MAX_MAP_COUNT_ENV_VAR, PROC_MAX_MAP_COUNT_PATH, arg_parser, validators};
 use vmm_sys_util::syscall::SyscallReturnCode;
 
 use crate::JailerError;
@@ -347,7 +347,11 @@ impl Env {
         Ok(())
     }
 
-    fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+    fn exec_into_new_pid_ns(
+        &mut self,
+        chroot_exec_file: PathBuf,
+        max_map_count: Option<&str>,
+    ) -> Result<(), JailerError> {
         // https://man7.org/linux/man-pages/man7/pid_namespaces.7.html
         // > a process in an ancestor namespace can send signals to the "init" process of a child
         // > PID namespace only if the "init" process has established a handler for that signal.
@@ -392,7 +396,9 @@ impl Env {
                         .into_empty_result()
                         .map_err(JailerError::SetSid)?;
                 }
-                Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
+                Err(JailerError::Exec(
+                    self.exec_command(chroot_exec_file, max_map_count),
+                ))
             }
             child_pid => {
                 // Save the PID of the process running the exec file provided
@@ -550,8 +556,18 @@ impl Env {
             .map_err(JailerError::SetNetNs)
     }
 
-    fn exec_command(&self, chroot_exec_file: PathBuf) -> io::Error {
-        Command::new(chroot_exec_file)
+    fn exec_command(&self, chroot_exec_file: PathBuf, max_map_count: Option<&str>) -> io::Error {
+        self.build_exec_command(chroot_exec_file, max_map_count)
+            .exec()
+    }
+
+    fn build_exec_command(
+        &self,
+        chroot_exec_file: PathBuf,
+        max_map_count: Option<&str>,
+    ) -> Command {
+        let mut command = Command::new(chroot_exec_file);
+        command
             .args(["--id", &self.id])
             .args(["--start-time-us", &self.start_time_us.to_string()])
             .args([
@@ -564,8 +580,13 @@ impl Env {
             .stderr(Stdio::inherit())
             .uid(self.uid())
             .gid(self.gid())
-            .args(&self.extra_args)
-            .exec()
+            .args(&self.extra_args);
+
+        if let Some(max_map_count) = max_map_count {
+            command.env(MAX_MAP_COUNT_ENV_VAR, max_map_count);
+        }
+
+        command
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -646,6 +667,9 @@ impl Env {
     pub fn run(mut self) -> Result<(), JailerError> {
         let exec_file_name = self.copy_exec_to_chroot()?;
         let chroot_exec_file = PathBuf::from("/").join(exec_file_name);
+        // Preserve this host-wide limit across pivot_root without exposing procfs in the jail.
+        // Overlay restores fail safely if neither this value nor procfs is available.
+        let max_map_count = fs::read_to_string(PROC_MAX_MAP_COUNT_PATH).ok();
 
         // Join the specified network namespace, if applicable.
         if let Some(ref path) = self.netns {
@@ -769,10 +793,13 @@ impl Env {
 
         // If specified, exec the provided binary into a new PID namespace.
         if self.new_pid_ns {
-            self.exec_into_new_pid_ns(chroot_exec_file)
+            self.exec_into_new_pid_ns(chroot_exec_file, max_map_count.as_deref().map(str::trim))
         } else {
             self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
-            Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
+            Err(JailerError::Exec(self.exec_command(
+                chroot_exec_file,
+                max_map_count.as_deref().map(str::trim),
+            )))
         }
     }
 }
@@ -1046,6 +1073,18 @@ mod tests {
         let file2 = fs::File::open("/dev/kvm").unwrap();
 
         dup2(file1.as_raw_fd(), file2.as_raw_fd()).unwrap();
+    }
+
+    #[test]
+    fn test_exec_command_carries_max_map_count() {
+        let mut mock_cgroups = MockCgroupFs::new().unwrap();
+        mock_cgroups.add_v1_mounts().unwrap();
+        let env = create_env(&mock_cgroups.proc_mounts_path);
+
+        let command = env.build_exec_command(PathBuf::from("/firecracker"), Some("65530"));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == MAX_MAP_COUNT_ENV_VAR && value == Some(std::ffi::OsStr::new("65530"))
+        }));
     }
 
     #[test]

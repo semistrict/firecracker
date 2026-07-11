@@ -1463,6 +1463,18 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults
+      overlays:
+        type: array
+        items:
+          type: string
+        description: Paths to diff snapshot memory files that are memory-mapped
+          lazily, in the given order, over the memory file at 'backend_path' when
+          loading the microVM (later overlays win). This allows resuming directly
+          from a diff snapshot chain without first merging the layers into the base
+          with 'snapshot-editor edit-memory rebase'. Overlays must be listed in the
+          order the diff snapshots were created and must remain unmodified while the
+          microVM runs, as they back its guest memory. Only supported with
+          'backend_type' File.
 
   Metrics:
     type: object

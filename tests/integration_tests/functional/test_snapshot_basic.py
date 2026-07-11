@@ -3,6 +3,7 @@
 """Basic tests scenarios for snapshot save/restore."""
 
 import dataclasses
+import errno
 import filecmp
 import logging
 import os
@@ -18,8 +19,10 @@ import pytest
 import host_tools.cargo_build as host
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools
+from framework import microvm as microvm_module
 from framework import utils
 from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel, pin_rootfs_mode
+from framework.microvm import hardlink_or_copy
 from framework.properties import global_props
 from framework.utils import check_filesystem, check_output
 from framework.utils_cpu_templates import ALL_CPU_TEMPLATES, pin_cpu_template
@@ -32,6 +35,11 @@ from framework.utils_vsock import (
     make_blob,
     make_host_port_path,
     start_guest_echo_server,
+)
+from integration_tests.functional.test_balloon import (
+    STATS_POLLING_INTERVAL_S,
+    get_stable_rss_mem,
+    make_guest_dirty_memory,
 )
 
 # Kernel emits this message when it resumes from a snapshot with VMGenID device
@@ -459,6 +467,159 @@ def test_diff_snapshot_overlay(uvm, microvm_factory, mem_size):
     _ = microvm_factory.build_from_snapshot(merged_snapshot)
 
     # Check that the restored VM works
+
+
+def test_overlay_copy_preserves_sparse_holes(tmp_path, monkeypatch):
+    """Cross-device overlay copies retain the source file's data extents."""
+
+    def data_extents(path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            size = os.fstat(fd).st_size
+            cursor = 0
+            extents = []
+            while cursor < size:
+                try:
+                    data_start = os.lseek(fd, cursor, os.SEEK_DATA)
+                except OSError as err:
+                    if err.errno == errno.ENXIO:
+                        break
+                    raise
+                data_end = os.lseek(fd, data_start, os.SEEK_HOLE)
+                extents.append((data_start, data_end))
+                cursor = data_end
+            return extents
+        finally:
+            os.close(fd)
+
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    source = tmp_path / "overlay_source"
+    destination = tmp_path / "overlay_destination"
+    with source.open("wb") as file:
+        file.truncate(3 * page_size)
+        file.seek(page_size)
+        file.write(b"x" * page_size)
+
+    monkeypatch.setattr(microvm_module, "_same_device", lambda _src, _dst: False)
+    hardlink_or_copy(source, destination, preserve_sparse=True)
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert (
+        data_extents(destination)
+        == data_extents(source)
+        == [(page_size, 2 * page_size)]
+    )
+
+
+def test_load_snapshot_with_overlays(uvm, microvm_factory):
+    """
+    Test restoring directly from a diff snapshot chain via `mem_backend` overlays,
+    later layers winning, without rebasing or modifying any host file.
+    """
+    vm = uvm
+    vm.spawn()
+    vm.basic_config(track_dirty_pages=True)
+    vm.add_net_iface()
+    vm.start()
+
+    # The first diff snapshot of a freshly booted VM contains all of guest memory.
+    base = vm.snapshot_diff()
+    vm.resume()
+
+    # Dirty some pages: write the layer-1 marker and a file only layer 1 touches.
+    vm.ssh.check_output(
+        "echo layer1 > /tmp/overlay_marker && echo first > /tmp/overlay_layer1"
+    )
+    diff1 = vm.snapshot_diff(mem_path="mem_diff1", vmstate_path="vmstate_diff1")
+    vm.resume()
+
+    # Overwrite only the marker; /tmp/overlay_layer1 stays exclusive to diff1.
+    vm.ssh.check_output("echo layer2 > /tmp/overlay_marker")
+    diff2 = vm.snapshot_diff(mem_path="mem_diff2", vmstate_path="vmstate_diff2")
+    vm.kill()
+
+    # Backups prove the restore modifies no host file.
+    base_backup = Path(f"{base.mem}.backup")
+    diff1_backup = Path(f"{diff1.mem}.backup")
+    diff2_backup = Path(f"{diff2.mem}.backup")
+    shutil.copyfile(base.mem, base_backup)
+    shutil.copyfile(diff1.mem, diff1_backup)
+    shutil.copyfile(diff2.mem, diff2_backup)
+
+    restored = microvm_factory.build()
+    restored.spawn()
+    restored.restore_from_snapshot(diff2.on_base(base, diff1), resume=True)
+
+    # Later layers win.
+    _, marker, _ = restored.ssh.check_output("cat /tmp/overlay_marker")
+    assert marker == "layer2\n"
+
+    # Middle layers are applied too.
+    _, layer1, _ = restored.ssh.check_output("cat /tmp/overlay_layer1")
+    assert layer1 == "first\n"
+
+    assert filecmp.cmp(base.mem, base_backup, shallow=False)
+    assert filecmp.cmp(diff1.mem, diff1_backup, shallow=False)
+    assert filecmp.cmp(diff2.mem, diff2_backup, shallow=False)
+
+
+def test_load_snapshot_with_overlays_balloon_reporting(uvm, microvm_factory):
+    """
+    Test balloon free page reporting over an overlay restore.
+
+    A broken discard over overlay-mapped memory (wrong branch, seccomp denial)
+    only increments `free_page_report_fails` while the VM keeps running, so we
+    assert on metrics: reporting must fire and every discard must succeed.
+    """
+    vm = uvm
+    vm.spawn()
+    # Free page reporting fragments guest memory VMAs, making them harder to
+    # identify in the memory monitor.
+    vm.memory_monitor = None
+    vm.basic_config(vcpu_count=2, mem_size_mib=256, track_dirty_pages=True)
+    vm.add_net_iface()
+
+    # Add a balloon with free page reporting enabled.
+    vm.api.balloon.put(
+        amount_mib=0,
+        deflate_on_oom=True,
+        stats_polling_interval_s=STATS_POLLING_INTERVAL_S,
+        free_page_reporting=True,
+    )
+
+    vm.start()
+
+    # The first diff snapshot of a freshly booted VM contains all of guest memory.
+    base = vm.snapshot_diff()
+    vm.resume()
+
+    # Dirty enough memory that the diff layer is large.
+    make_guest_dirty_memory(vm.ssh, amount_mib=128)
+    vm.ssh.check_output("echo balloon_marker > /tmp/overlay_marker")
+    diff2 = vm.snapshot_diff(mem_path="mem_diff2", vmstate_path="vmstate_diff2")
+    vm.kill()
+
+    restored = microvm_factory.build()
+    restored.memory_monitor = None
+    restored.spawn()
+    restored.restore_from_snapshot(diff2.on_base(base), resume=True)
+
+    # Dirtying then freeing memory makes the guest report overlay-mapped
+    # pages free, so the discards land on overlay-backed ranges.
+    make_guest_dirty_memory(restored.ssh, amount_mib=128)
+    _ = get_stable_rss_mem(restored)
+    # Reporting can take up to 2 seconds to complete.
+    time.sleep(2)
+
+    _, marker, _ = restored.ssh.check_output("cat /tmp/overlay_marker")
+    assert marker == "balloon_marker\n"
+
+    metrics = restored.flush_metrics()
+    assert metrics["balloon"]["free_page_report_count"] > 0
+    assert metrics["balloon"]["free_page_report_fails"] == 0
+
+    _, echo, _ = restored.ssh.check_output("echo still_alive")
+    assert echo == "still_alive\n"
 
 
 def test_snapshot_overwrite_self(uvm, microvm_factory):

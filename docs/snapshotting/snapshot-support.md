@@ -239,6 +239,12 @@ not merge state files which resulted from `/snapshot/create` API calls and they
 should use the state file created in the same call as the memory file which was
 merged last on top of the base.
 
+Alternatively, the diff layers can be mapped lazily over the base at load time
+by passing them in the `overlays` field of `mem_backend`, instead of merging
+them into the base beforehand. This leaves all snapshot files unmodified, but
+requires them to stay available and untouched for the microVM's entire lifetime.
+See [Loading snapshots](#loading-snapshots) for details.
+
 #### Creating full snapshots
 
 For creating a full snapshot, you can use the following API command:
@@ -432,6 +438,69 @@ The meaning of `backend_path` depends on the `backend_type` chosen:
   used for communication between Firecracker and the user space process that
   handles page faults.
 
+With the `File` backend, `mem_backend` also accepts an optional `overlays`
+field: a list of diff snapshot memory files that are mapped, in order, over the
+base memory file in `backend_path` when the microVM is loaded. Each overlay is
+applied as a `MAP_PRIVATE | MAP_FIXED` mapping over the base for the data
+extents it contains, so guest pages fault in lazily from the overlay files on
+demand rather than being copied at load time. This lets you resume directly from
+a diff snapshot chain without first merging the layers into the base with
+`snapshot-editor edit-memory rebase`, and keeps load time proportional to the
+number of overlay extents rather than to the total number of overlay bytes,
+which makes it well suited to keeping diff files on a network filesystem (e.g.
+JuiceFS) where reading whole diff files upfront would make VM start unacceptably
+slow. The rules are:
+
+- The base memory file goes in `backend_path` and the diff memory files go in
+  `overlays`, listed in the order the diff snapshots were created (the base's
+  layers first, later layers last, later layers winning).
+- `snapshot_path` must be the vmstate file created by the same
+  `/snapshot/create` call as the last overlay.
+- None of the files are modified at load time, but the base memory file *and*
+  every overlay file back live guest memory for the microVM's entire lifetime.
+  All of them must remain untouched while the VM runs: modifying or truncating
+  any of them corrupts the guest or makes the VM `SIGBUS`.
+- Firecracker refuses a `PUT /snapshot/create` whose `mem_file_path` or
+  `snapshot_path` is a file currently mapped as an overlay of the running
+  microVM.
+- `overlays` is only supported with `backend_type` `File`. Using it with `Uffd`
+  returns an error, because there the page fault handler process is responsible
+  for applying the diff layers.
+
+A few caveats apply. Overlay data extents must be page-aligned; this holds for
+diff files produced by Firecracker, and the load fails with a clear error
+otherwise. Applying overlays creates one memory mapping per data extent, so a
+long, heavily fragmented chain can approach the `vm.max_map_count` kernel limit;
+the load fails upfront if it would, and such chains should be compacted offline
+with `snapshot-editor edit-memory rebase`. Note that diff snapshots taken after
+an overlay restore contain only the pages dirtied since the restore, so chains
+grow by one layer per generation and are only shortened by offline rebasing. The
+filesystem holding the overlay files must report `SEEK_HOLE` and `SEEK_DATA`
+accurately, as Firecracker relies on them to tell diff data from holes; on a
+filesystem that reports sparse files as fully populated, restoring would overlay
+zeros over the base memory. Finally, the balloon device (including free page
+reporting and hinting) remains supported with overlays: discards over
+overlay-mapped ranges are replaced with zeroed anonymous memory and never
+re-read from the files.
+
+For example, to resume from a base plus two diff layers:
+
+```bash
+curl --unix-socket /tmp/firecracker.socket -i \
+    -X PUT 'http://localhost/snapshot/load' \
+    -H  'Accept: application/json' \
+    -H  'Content-Type: application/json' \
+    -d '{
+            "snapshot_path": "./diff2_vmstate",
+            "mem_backend": {
+                "backend_type": "File",
+                "backend_path": "./base_mem",
+                "overlays": ["./diff1_mem", "./diff2_mem"]
+            },
+            "resume_vm": true
+    }'
+```
+
 When relying on the OS to handle page faults, the command below is also
 accepted. Note that `mem_file_path` field is currently under the deprecation
 policy. `mem_file_path` and `mem_backend` are mutually exclusive, therefore
@@ -470,10 +539,11 @@ to the new Firecracker process as they were to the original one.
   - The loaded microVM is now in the `Paused` state, so it needs to be resumed
     for it to run.
   - The memory file (pointed by `backend_path` when using `File` backend type,
-    or pointed by `mem_file_path`) **must** be considered immutable from
-    Firecracker and host point of view. It backs the guest OS memory for read
-    access through the page cache. External modification to this file corrupts
-    the guest memory and leads to undefined behavior.
+    or pointed by `mem_file_path`), together with any `overlays` files, **must**
+    be considered immutable from Firecracker and host point of view. They back
+    the guest OS memory for the microVM's entire lifetime. External modification
+    to any of these files corrupts the guest memory and leads to undefined
+    behavior.
   - The file indicated by `snapshot_path`, that is used to load from, is
     released and no longer used by this process.
   - If `track_dirty_pages` is set, subsequent diff snapshots will be based on

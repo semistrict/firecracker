@@ -8,11 +8,13 @@
 use std::fs::File;
 use std::io::SeekFrom;
 use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use bitvec::vec::BitVec;
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use serde::{Deserialize, Serialize};
+use utils::{MAX_MAP_COUNT_ENV_VAR, PROC_MAX_MAP_COUNT_PATH};
 pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
 use vm_memory::mmap::{MmapRegionError, NewBitmap};
@@ -21,6 +23,7 @@ pub use vm_memory::{
     GuestUsize, MemoryRegionAddress, MmapRegion, address,
 };
 use vm_memory::{GuestMemoryError, GuestMemoryRegionBytes, VolatileSlice, WriteVolatile};
+use vmm_sys_util::seek_hole::SeekHole;
 
 use crate::DirtyBitmap;
 use crate::arch::host_page_size;
@@ -76,6 +79,35 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
+    /// Overlay file size of {overlay_size} bytes does not match the guest memory size of {memory_size} bytes
+    OverlaySizeMismatch {
+        /// Logical size of the overlay file in bytes.
+        overlay_size: u64,
+        /// Total guest memory size in bytes.
+        memory_size: u64,
+    },
+    /// Overlay data extents must be page-aligned, but found extent [{start}, {end})
+    UnalignedOverlayExtent {
+        /// Start file offset of the offending extent.
+        start: u64,
+        /// End file offset of the offending extent.
+        end: u64,
+    },
+    /// Applying the overlays would create {mappings} memory mappings, too close to the vm.max_map_count limit of {max_map_count}
+    OverlayTooFragmented {
+        /// Number of memory mappings the overlays would create.
+        mappings: usize,
+        /// Value of vm.max_map_count.
+        max_map_count: u64,
+    },
+    /// Cannot determine vm.max_map_count from procfs or the jailer environment
+    MaxMapCountUnavailable,
+    /// Invalid vm.max_map_count value: {0}
+    InvalidMaxMapCount(String),
+    /// Cannot resolve overlay host address: {0}
+    OverlayAddress(GuestMemoryError),
+    /// Cannot map overlay over guest memory: {0}
+    OverlayMmap(std::io::Error),
 }
 
 impl From<vm_memory::VolatileMemoryError> for MemoryError {
@@ -622,6 +654,220 @@ pub fn snapshot_file(
     )
 }
 
+/// VMAs to leave free below `vm.max_map_count` for the rest of Firecracker and for balloon
+/// discards (each splits a VMA).
+const OVERLAY_VMA_HEADROOM: u64 = 4096;
+
+/// Builds guest memory from a base snapshot `file` plus ordered diff `overlays`, later overlays
+/// winning. Extents are `mmap(MAP_FIXED)`ed over the base rather than copied, so pages fault in
+/// lazily; every file must stay untouched for the VM's whole lifetime.
+///
+/// INVARIANT: regions keep `Some(file_offset)` + `MAP_PRIVATE`, routing balloon discards through
+/// the mmap-anonymous branch of [`GuestRegionMmapExt::discard_range`] — the only discard that is
+/// correct over a quilt. Do not change region construction or `discard_range`.
+pub fn snapshot_file_with_overlays(
+    file: File,
+    overlays: Vec<File>,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    let guest_regions = snapshot_file(file, regions, track_dirty_pages)?;
+
+    // Pins the discard_range-branch invariant documented above.
+    debug_assert!(
+        guest_regions
+            .iter()
+            .all(|r| r.file_offset().is_some() && r.flags() & libc::MAP_PRIVATE != 0)
+    );
+
+    if overlays.is_empty() {
+        return Ok(guest_regions);
+    }
+
+    // Derive each region's (file offset, size) from the mappings `snapshot_file` just built.
+    let region_layout: Vec<(u64, usize)> = guest_regions
+        .iter()
+        .map(|r| (r.file_offset().unwrap().start(), u64_to_usize(r.len())))
+        .collect();
+    let memory_size = region_layout
+        .iter()
+        .try_fold(0u64, |acc, &(_, size)| acc.checked_add(size as u64))
+        .ok_or(MemoryError::OffsetTooLarge)?;
+
+    // Validate everything before mapping anything, so a failure never leaves a half-applied
+    // quilt.
+    let page_size = host_page_size() as u64;
+    let max_map_count = read_max_map_count()?;
+    let mut plans: Vec<(File, Vec<(u64, u64)>)> = Vec::with_capacity(overlays.len());
+    let mut mappings = 0usize;
+    for mut overlay in overlays {
+        let overlay_size = overlay.metadata().map_err(MemoryError::FileMetadata)?.len();
+        let extents = collect_overlay_extents(&mut overlay, overlay_size)?;
+        mappings = validate_overlay_extents(
+            &extents,
+            overlay_size,
+            memory_size,
+            page_size,
+            &region_layout,
+            mappings,
+            max_map_count,
+        )?;
+        plans.push((overlay, extents));
+    }
+
+    for (overlay, extents) in &plans {
+        apply_overlay(&guest_regions, &region_layout, overlay, extents)?;
+    }
+
+    Ok(guest_regions)
+}
+
+fn max_map_count_from_sources(
+    procfs_value: Option<String>,
+    jailer_value: Option<String>,
+) -> Result<u64, MemoryError> {
+    let value = procfs_value
+        .or(jailer_value)
+        .ok_or(MemoryError::MaxMapCountUnavailable)?;
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| MemoryError::InvalidMaxMapCount(value.trim().to_string()))
+}
+
+/// Reads the live procfs value, falling back to the value retained by the jailer before chroot.
+fn read_max_map_count() -> Result<u64, MemoryError> {
+    max_map_count_from_sources(
+        std::fs::read_to_string(PROC_MAX_MAP_COUNT_PATH).ok(),
+        std::env::var(MAX_MAP_COUNT_ENV_VAR).ok(),
+    )
+}
+
+/// The `[start, end)` data extents of `overlay`, via `SEEK_DATA`/`SEEK_HOLE`.
+fn collect_overlay_extents(
+    overlay: &mut File,
+    overlay_size: u64,
+) -> Result<Vec<(u64, u64)>, MemoryError> {
+    let mut extents = Vec::new();
+    let mut cursor = 0u64;
+    while let Some(data_start) = overlay.seek_data(cursor).map_err(MemoryError::SeekError)? {
+        let data_end = match overlay
+            .seek_hole(data_start)
+            .map_err(MemoryError::SeekError)?
+        {
+            Some(hole_start) => hole_start,
+            None => overlay_size,
+        };
+        extents.push((data_start, data_end));
+        cursor = data_end;
+    }
+    Ok(extents)
+}
+
+/// Number of mmap calls the extent `[start, end)` will take (one per region it intersects).
+fn count_extent_mappings(start: u64, end: u64, region_layout: &[(u64, usize)]) -> usize {
+    region_layout
+        .iter()
+        .filter(|&&(region_offset, region_size)| {
+            let region_end = region_offset + region_size as u64;
+            start.max(region_offset) < end.min(region_end)
+        })
+        .count()
+}
+
+/// Validates one overlay's `extents` and returns the cumulative worst-case VMA count. Pure so it
+/// can be unit-tested with synthetic extents (real filesystems can't produce sub-page ones).
+/// Alignment must reject rather than round: rounding outward would map file holes (zeros) over
+/// base data.
+fn validate_overlay_extents(
+    extents: &[(u64, u64)],
+    overlay_size: u64,
+    memory_size: u64,
+    page_size: u64,
+    region_layout: &[(u64, usize)],
+    prior_mappings: usize,
+    max_map_count: u64,
+) -> Result<usize, MemoryError> {
+    // Firecracker diff files always have the full logical guest-memory size. A shorter file is
+    // truncated or belongs to another VM; treating its missing tail as holes would restore stale
+    // lower-layer data.
+    if overlay_size != memory_size {
+        return Err(MemoryError::OverlaySizeMismatch {
+            overlay_size,
+            memory_size,
+        });
+    }
+
+    let mut mappings = prior_mappings;
+    for &(start, end) in extents {
+        if start % page_size != 0 || end % page_size != 0 {
+            return Err(MemoryError::UnalignedOverlayExtent { start, end });
+        }
+        // Each interior MAP_FIXED punch splits the underlying VMA (net +2), and hole-separated
+        // extents never coalesce, so count two VMAs per mapping as the worst case.
+        mappings += 2 * count_extent_mappings(start, end, region_layout);
+    }
+
+    if mappings as u64 + OVERLAY_VMA_HEADROOM > max_map_count {
+        return Err(MemoryError::OverlayTooFragmented {
+            mappings,
+            max_map_count,
+        });
+    }
+
+    Ok(mappings)
+}
+
+/// Maps `extents` (already validated) of `overlay` over `guest_regions` with `mmap(MAP_FIXED)`.
+/// Overlay pages are deliberately not dirty-marked, so the next diff snapshot stays incremental
+/// relative to the whole chain.
+fn apply_overlay(
+    guest_regions: &[GuestRegionMmap],
+    region_layout: &[(u64, usize)],
+    overlay: &File,
+    extents: &[(u64, u64)],
+) -> Result<(), MemoryError> {
+    let overlay_fd = overlay.as_raw_fd();
+
+    for &(data_start, data_end) in extents {
+        for (region, &(region_offset, region_size)) in guest_regions.iter().zip(region_layout) {
+            let region_end = region_offset + region_size as u64;
+            let chunk_start = data_start.max(region_offset);
+            let chunk_end = data_end.min(region_end);
+            if chunk_start >= chunk_end {
+                continue;
+            }
+            let chunk_len = u64_to_usize(chunk_end - chunk_start);
+            // Cannot wrap: region offsets are validated to stay below i64::MAX in `create`.
+            let chunk_offset =
+                libc::off_t::try_from(chunk_start).map_err(|_| MemoryError::OffsetTooLarge)?;
+
+            let host_addr = region
+                .get_host_address(MemoryRegionAddress(chunk_start - region_offset))
+                .map_err(MemoryError::OverlayAddress)?;
+
+            // SAFETY: the chunk lies inside the region's existing mapping (intersected above),
+            // address and length are page-aligned (region base is; extents were validated), and
+            // the region munmaps its whole range on drop, taking this sub-mapping with it.
+            let ret = unsafe {
+                libc::mmap(
+                    host_addr.cast(),
+                    chunk_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_NORESERVE | libc::MAP_FIXED,
+                    overlay_fd,
+                    chunk_offset,
+                )
+            };
+            if ret == libc::MAP_FAILED {
+                return Err(MemoryError::OverlayMmap(std::io::Error::last_os_error()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Defines the interface for snapshotting memory.
 pub trait GuestMemoryExtension
 where
@@ -987,6 +1233,307 @@ mod tests {
         let regions = vec![(GuestAddress(0), 2 * page_size)];
         let result = snapshot_file(file, regions.into_iter(), false);
         assert!(matches!(result.unwrap_err(), MemoryError::OffsetTooLarge));
+    }
+
+    /// Creates a base memory file of `size` bytes filled with `fill`.
+    fn make_base_file(size: usize, fill: u8) -> TempFile {
+        let base = TempFile::new().unwrap();
+        let mut base_file = base.as_file();
+        base_file.set_len(size as u64).unwrap();
+        base_file.write_all(&vec![fill; size]).unwrap();
+        base
+    }
+
+    /// Creates a sparse overlay file of `logical_size` bytes, writing each `(offset, bytes)` in
+    /// `writes` and leaving the rest of the file as holes.
+    fn make_overlay_file(logical_size: usize, writes: &[(usize, Vec<u8>)]) -> File {
+        let mut overlay = TempFile::new().unwrap().into_file();
+        overlay.set_len(logical_size as u64).unwrap();
+        for (offset, bytes) in writes {
+            overlay.seek(SeekFrom::Start(*offset as u64)).unwrap();
+            overlay.write_all(bytes).unwrap();
+        }
+        overlay
+    }
+
+    #[test]
+    fn test_snapshot_file_with_overlays_single_region() {
+        let page_size = host_page_size();
+        // Base: 3 pages of 0x11.
+        let base = make_base_file(3 * page_size, 0x11);
+        let base_file = File::open(base.as_path()).unwrap();
+        // Overlay: data 0x22 at page 1, holes at pages 0 and 2.
+        let overlay = make_overlay_file(3 * page_size, &[(page_size, vec![0x22u8; page_size])]);
+
+        let regions = vec![(GuestAddress(0), 3 * page_size)];
+        let mem = into_region_ext(
+            snapshot_file_with_overlays(base_file, vec![overlay], regions.into_iter(), false)
+                .unwrap(),
+        );
+
+        let mut page = vec![0u8; page_size];
+        // Page 0: base content (hole in the overlay).
+        mem.read(page.as_mut_slice(), GuestAddress(0)).unwrap();
+        assert_eq!(page, vec![0x11u8; page_size]);
+        // Page 1: overlay content.
+        mem.read(page.as_mut_slice(), GuestAddress(page_size as u64))
+            .unwrap();
+        assert_eq!(page, vec![0x22u8; page_size]);
+        // Page 2: base content (hole in the overlay).
+        mem.read(page.as_mut_slice(), GuestAddress(2 * page_size as u64))
+            .unwrap();
+        assert_eq!(page, vec![0x11u8; page_size]);
+    }
+
+    #[test]
+    fn test_snapshot_file_with_overlays_spanning_region_boundary() {
+        let page_size = host_page_size();
+        // Two regions of two pages each. File offsets: region A [0, 2p), region B [2p, 4p).
+        let region_a = GuestAddress(0);
+        let region_b = GuestAddress(4 * page_size as u64); // gap in the guest address space
+        let region_size = 2 * page_size;
+
+        let base = make_base_file(4 * page_size, 0x11);
+        let base_file = File::open(base.as_path()).unwrap();
+        // Overlay data [1p, 3p) spans the region A/B boundary at 2p.
+        let overlay = make_overlay_file(4 * page_size, &[(page_size, vec![0x22u8; 2 * page_size])]);
+
+        let regions = vec![(region_a, region_size), (region_b, region_size)];
+        let mem = into_region_ext(
+            snapshot_file_with_overlays(base_file, vec![overlay], regions.into_iter(), false)
+                .unwrap(),
+        );
+
+        let mut page = vec![0u8; page_size];
+        // Region A page 0 (file offset 0): base content.
+        mem.read(page.as_mut_slice(), region_a).unwrap();
+        assert_eq!(page, vec![0x11u8; page_size]);
+        // Region A page 1 (file offset 1p): overlay content.
+        mem.read(
+            page.as_mut_slice(),
+            region_a.unchecked_add(page_size as u64),
+        )
+        .unwrap();
+        assert_eq!(page, vec![0x22u8; page_size]);
+        // Region B page 0 (file offset 2p): overlay content.
+        mem.read(page.as_mut_slice(), region_b).unwrap();
+        assert_eq!(page, vec![0x22u8; page_size]);
+        // Region B page 1 (file offset 3p): base content.
+        mem.read(
+            page.as_mut_slice(),
+            region_b.unchecked_add(page_size as u64),
+        )
+        .unwrap();
+        assert_eq!(page, vec![0x11u8; page_size]);
+    }
+
+    #[test]
+    fn test_snapshot_file_with_overlays_layering() {
+        let page_size = host_page_size();
+        // Base: 2 pages of 0x11.
+        let base = make_base_file(2 * page_size, 0x11);
+        let base_file = File::open(base.as_path()).unwrap();
+        // Overlay 1: 0x22 over both pages.
+        let overlay1 = make_overlay_file(2 * page_size, &[(0, vec![0x22u8; 2 * page_size])]);
+        // Overlay 2: 0x33 over page 1 only (hole at page 0).
+        let overlay2 = make_overlay_file(2 * page_size, &[(page_size, vec![0x33u8; page_size])]);
+
+        let regions = vec![(GuestAddress(0), 2 * page_size)];
+        let mem = into_region_ext(
+            snapshot_file_with_overlays(
+                base_file,
+                vec![overlay1, overlay2],
+                regions.into_iter(),
+                false,
+            )
+            .unwrap(),
+        );
+
+        let mut page = vec![0u8; page_size];
+        // Page 0: overlay 1 wins (overlay 2 has a hole here).
+        mem.read(page.as_mut_slice(), GuestAddress(0)).unwrap();
+        assert_eq!(page, vec![0x22u8; page_size]);
+        // Page 1: overlay 2 overwrites overlay 1.
+        mem.read(page.as_mut_slice(), GuestAddress(page_size as u64))
+            .unwrap();
+        assert_eq!(page, vec![0x33u8; page_size]);
+    }
+
+    #[test]
+    fn test_snapshot_file_with_overlays_size_mismatch() {
+        let page_size = host_page_size();
+        let memory_size = 2 * page_size;
+
+        for overlay_size in [0, page_size, 3 * page_size] {
+            let base = make_base_file(memory_size, 0x11);
+            let base_file = File::open(base.as_path()).unwrap();
+            let overlay = if overlay_size == 0 {
+                make_overlay_file(0, &[])
+            } else {
+                make_overlay_file(overlay_size, &[(0, vec![0x22u8; page_size])])
+            };
+            let regions = vec![(GuestAddress(0), memory_size)];
+            let err =
+                snapshot_file_with_overlays(base_file, vec![overlay], regions.into_iter(), false)
+                    .unwrap_err();
+            assert!(matches!(
+                err,
+                MemoryError::OverlaySizeMismatch {
+                    overlay_size: actual,
+                    memory_size: expected,
+                } if actual == overlay_size as u64 && expected == memory_size as u64
+            ));
+        }
+    }
+
+    #[test]
+    fn test_max_map_count_uses_jailer_fallback() {
+        assert_eq!(
+            max_map_count_from_sources(None, Some("65530\n".to_string())).unwrap(),
+            65530
+        );
+        assert!(matches!(
+            max_map_count_from_sources(None, None).unwrap_err(),
+            MemoryError::MaxMapCountUnavailable
+        ));
+        assert!(matches!(
+            max_map_count_from_sources(None, Some("invalid".to_string())).unwrap_err(),
+            MemoryError::InvalidMaxMapCount(value) if value == "invalid"
+        ));
+    }
+
+    #[test]
+    fn test_snapshot_file_with_overlays_base_file_unchanged() {
+        let page_size = host_page_size();
+        let base = make_base_file(2 * page_size, 0x11);
+        let base_file = File::open(base.as_path()).unwrap();
+        // Overlay writes 0x22 into page 0.
+        let overlay = make_overlay_file(2 * page_size, &[(0, vec![0x22u8; page_size])]);
+
+        let regions = vec![(GuestAddress(0), 2 * page_size)];
+        let mem = into_region_ext(
+            snapshot_file_with_overlays(base_file, vec![overlay], regions.into_iter(), false)
+                .unwrap(),
+        );
+
+        // Guest memory reflects the overlay.
+        let mut page = vec![0u8; page_size];
+        mem.read(page.as_mut_slice(), GuestAddress(0)).unwrap();
+        assert_eq!(page, vec![0x22u8; page_size]);
+
+        let mut on_disk = File::open(base.as_path()).unwrap();
+        let mut contents = vec![0u8; 2 * page_size];
+        on_disk.read_exact(&mut contents).unwrap();
+        assert_eq!(contents, vec![0x11u8; 2 * page_size]);
+    }
+
+    #[test]
+    fn test_snapshot_file_with_overlays_is_mapped_not_copied() {
+        let page_size = host_page_size();
+        // Base: 2 pages of 0x11.
+        let base = make_base_file(2 * page_size, 0x11);
+        let base_file = File::open(base.as_path()).unwrap();
+
+        // Keep the TempFile alive so its path is findable in /proc/self/maps.
+        let overlay_temp = TempFile::new().unwrap();
+        {
+            let mut f = overlay_temp.as_file();
+            f.set_len(2 * page_size as u64).unwrap();
+            f.write_all(&vec![0x22u8; page_size]).unwrap();
+        }
+        let overlay_file = File::open(overlay_temp.as_path()).unwrap();
+
+        let regions = vec![(GuestAddress(0), 2 * page_size)];
+        let _mem = into_region_ext(
+            snapshot_file_with_overlays(base_file, vec![overlay_file], regions.into_iter(), false)
+                .unwrap(),
+        );
+
+        let overlay_path = overlay_temp.as_path().to_str().unwrap().to_string();
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        assert!(
+            maps.contains(&overlay_path),
+            "overlay path {overlay_path} not found in /proc/self/maps; it was copied, not mapped"
+        );
+    }
+
+    #[test]
+    fn test_validate_overlay_extents_unaligned_start() {
+        let page_size = host_page_size();
+        let region_layout = vec![(0u64, 4 * page_size)];
+        // Extent start is one byte past a page boundary.
+        let extents = vec![(page_size as u64 + 1, 2 * page_size as u64)];
+        let err = validate_overlay_extents(
+            &extents,
+            4 * page_size as u64,
+            4 * page_size as u64,
+            page_size as u64,
+            &region_layout,
+            0,
+            u64::MAX,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MemoryError::UnalignedOverlayExtent { start, end }
+                if start == page_size as u64 + 1 && end == 2 * page_size as u64
+        ));
+    }
+
+    #[test]
+    fn test_validate_overlay_extents_unaligned_end() {
+        let page_size = host_page_size();
+        let region_layout = vec![(0u64, 4 * page_size)];
+        // Extent end is one byte short of a page boundary.
+        let extents = vec![(0, page_size as u64 + 1)];
+        let err = validate_overlay_extents(
+            &extents,
+            4 * page_size as u64,
+            4 * page_size as u64,
+            page_size as u64,
+            &region_layout,
+            0,
+            u64::MAX,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MemoryError::UnalignedOverlayExtent { start, end }
+                if start == 0 && end == page_size as u64 + 1
+        ));
+    }
+
+    #[test]
+    fn test_validate_overlay_extents_too_fragmented() {
+        let page_size = host_page_size();
+        // One region big enough to hold all extents.
+        let region_layout = vec![(0u64, 100 * page_size)];
+        // 50 single-page extents, each spaced two pages apart, all inside the one region. Each
+        // punch is worst-cased at two VMAs, so 50 mappings count as 100.
+        let extents: Vec<(u64, u64)> = (0..50u64)
+            .map(|i| {
+                (
+                    i * 2 * page_size as u64,
+                    i * 2 * page_size as u64 + page_size as u64,
+                )
+            })
+            .collect();
+        // Inject a tiny max_map_count so that 100 + OVERLAY_VMA_HEADROOM exceeds it.
+        let err = validate_overlay_extents(
+            &extents,
+            100 * page_size as u64,
+            100 * page_size as u64,
+            page_size as u64,
+            &region_layout,
+            0,
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MemoryError::OverlayTooFragmented { mappings, max_map_count }
+                if mappings == 100 && max_map_count == 10
+        ));
     }
 
     #[test]
