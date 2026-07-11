@@ -20,7 +20,7 @@ use crate::devices::virtio::device::VirtioDeviceId;
 use crate::devices::virtio::mem::VirtioMemStatus;
 use crate::logger::{LoggerConfig, info, warn, *};
 use crate::mmds::data_store::{self, Mmds, MmdsDatastoreError};
-use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
+use crate::persist::{CreateSnapshotError, MicrovmStateError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::HotplugDeviceConfig;
@@ -31,7 +31,7 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
@@ -926,8 +926,45 @@ impl RuntimeApiController {
         }
 
         let mut locked_vmm = self.vmm.lock().unwrap();
-        let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
+
+        if create_params.precopy {
+            if create_params.snapshot_type != SnapshotType::Diff {
+                return Err(
+                    CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                        "pre-copy is only available for differential snapshots".into(),
+                    ))
+                    .into(),
+                );
+            }
+            if locked_vmm.instance_info.state != VmState::Running {
+                return Err(
+                    CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                        "pre-copy requires a running microVM".into(),
+                    ))
+                    .into(),
+                );
+            }
+
+            let kvm_vm = locked_vmm.vm.as_kvm().ok_or_else(|| {
+                CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                    "snapshot requires KVM".into(),
+                ))
+            })?;
+            kvm_vm
+                .precopy_memory_to_file(&create_params.mem_file_path, locked_vmm.overlay_files())?;
+            locked_vmm
+                .device_manager
+                .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+
+            info!(
+                "'pre-copy diff snapshot' VMM action took {} us.",
+                get_time_us(ClockType::Monotonic) - create_start_us
+            );
+            return Ok(VmmData::Empty);
+        }
+
+        let vm_info = VmInfo::from(&*locked_vmm);
 
         create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
 
@@ -1240,6 +1277,7 @@ mod tests {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
+                precopy: false,
             },
         )));
         #[cfg(target_arch = "x86_64")]

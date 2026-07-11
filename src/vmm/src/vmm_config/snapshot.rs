@@ -45,6 +45,11 @@ pub struct CreateSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
     pub mem_file_path: PathBuf,
+    /// Copy one differential-memory batch while the microVM is running.
+    /// No VM state file is produced; a normal paused differential snapshot
+    /// must finalize the same memory file.
+    #[serde(default)]
+    pub precopy: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

@@ -314,6 +314,11 @@ pub struct Vmm {
 }
 
 impl Vmm {
+    /// Returns the memory overlay files retained by this VMM.
+    pub(crate) fn overlay_files(&self) -> &[File] {
+        &self.overlay_files
+    }
+
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()

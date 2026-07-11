@@ -764,10 +764,13 @@ paths:
 
   /snapshot/create:
     put:
-      summary: Creates a full or diff snapshot. Post-boot only.
+      summary: Creates or pre-copies a full or diff snapshot. Post-boot only.
       description:
-        Creates a snapshot of the microVM state. The microVM should be
-        in the `Paused` state.
+        Creates a snapshot of the microVM state. The microVM should normally be
+        in the `Paused` state. A differential request with `precopy` enabled
+        instead copies one dirty-memory batch while the microVM is running and
+        must later be finalized by a normal paused differential request using
+        the same memory file.
       operationId: createSnapshot
       parameters:
         - name: body
@@ -1649,6 +1652,13 @@ definitions:
         description:
           Type of snapshot to create. It is optional and by default, a full
           snapshot is created.
+      precopy:
+        type: boolean
+        default: false
+        description:
+          When true, copies one differential-memory batch while the microVM is
+          running. No state file is produced. The same memory file must be
+          finalized by a normal paused differential snapshot request.
 
   NetworkOverride:
     type: object
