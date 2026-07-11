@@ -273,6 +273,13 @@ impl<'a> GuestMemorySlot<'a> {
 }
 
 impl GuestRegionMmapExt {
+    /// Atomically harvest and clear the userspace dirty bitmap for this region.
+    pub(crate) fn take_dirty_bitmap(&self) -> Option<Vec<u64>> {
+        MmapRegion::bitmap(&self.inner)
+            .as_ref()
+            .map(AtomicBitmap::get_and_reset)
+    }
+
     /// Adds a DRAM region which only contains a single plugged slot
     pub(crate) fn dram_from_mmap_region(region: GuestRegionMmap, slot: u32) -> Self {
         let slot_size = u64_to_usize(region.len());
@@ -889,6 +896,22 @@ where
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError>;
 
+    /// Dumps a previously harvested dirty bitmap without clearing dirties that
+    /// may have accumulated while the dump was in progress.
+    fn dump_dirty_precopy<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        dirty_bitmap: &DirtyBitmap,
+    ) -> Result<(), MemoryError>;
+
+    /// Shared implementation for paused and running dirty-memory dumps.
+    fn dump_dirty_inner<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        dirty_bitmap: &DirtyBitmap,
+        reset_on_success: bool,
+    ) -> Result<(), MemoryError>;
+
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self);
 
@@ -990,6 +1013,23 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError> {
+        self.dump_dirty_inner(writer, dirty_bitmap, true)
+    }
+
+    fn dump_dirty_precopy<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        dirty_bitmap: &DirtyBitmap,
+    ) -> Result<(), MemoryError> {
+        self.dump_dirty_inner(writer, dirty_bitmap, false)
+    }
+
+    fn dump_dirty_inner<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        dirty_bitmap: &DirtyBitmap,
+        reset_on_success: bool,
+    ) -> Result<(), MemoryError> {
         let page_size = host_page_size();
 
         let write_result =
@@ -1013,7 +1053,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
 
         if write_result.is_err() {
             self.store_dirty_bitmap(dirty_bitmap, page_size);
-        } else {
+        } else if reset_on_success {
             self.reset_dirty();
         }
 

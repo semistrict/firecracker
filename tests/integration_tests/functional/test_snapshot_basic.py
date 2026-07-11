@@ -22,7 +22,7 @@ import host_tools.network as net_tools
 from framework import microvm as microvm_module
 from framework import utils
 from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel, pin_rootfs_mode
-from framework.microvm import hardlink_or_copy
+from framework.microvm import Serial, hardlink_or_copy
 from framework.properties import global_props
 from framework.utils import check_filesystem, check_output
 from framework.utils_cpu_templates import ALL_CPU_TEMPLATES, pin_cpu_template
@@ -620,6 +620,64 @@ def test_load_snapshot_with_overlays_balloon_reporting(uvm, microvm_factory):
 
     _, echo, _ = restored.ssh.check_output("echo still_alive")
     assert echo == "still_alive\n"
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_diff_snapshot_precopy(uvm, microvm_factory):
+    """A final diff preserves writes made after a running pre-copy round."""
+    vm = uvm
+    vm.help.enable_console()
+    vm.spawn(serial_out_path=None)
+    vm.basic_config(track_dirty_pages=True)
+    serial = Serial(vm)
+    serial.open()
+    vm.start()
+    serial.rx(vm.distro.shell_prompt)
+
+    base = vm.snapshot_diff(mem_path="base.mem", vmstate_path="base.vmstate")
+    vm.resume()
+
+    serial.tx("echo before > /tmp/precopy-state")
+    serial.rx(vm.distro.shell_prompt)
+    with pytest.raises(
+        RuntimeError, match="pre-copy is only available for differential snapshots"
+    ):
+        vm.api.snapshot_create.put(
+            mem_file_path="invalid.mem",
+            snapshot_path="invalid.vmstate",
+            snapshot_type="Full",
+            precopy=True,
+        )
+
+    vm.api.snapshot_create.put(
+        mem_file_path="diff.mem",
+        snapshot_path="unused.vmstate",
+        snapshot_type="Diff",
+        precopy=True,
+    )
+    serial.tx("echo after > /tmp/precopy-state")
+    serial.rx(vm.distro.shell_prompt)
+
+    diff = vm.snapshot_diff(mem_path="diff.mem", vmstate_path="diff.vmstate")
+    with pytest.raises(RuntimeError, match="pre-copy requires a running microVM"):
+        vm.api.snapshot_create.put(
+            mem_file_path="invalid.mem",
+            snapshot_path="invalid.vmstate",
+            snapshot_type="Diff",
+            precopy=True,
+        )
+
+    rebased = diff.rebase_snapshot(base, binary_dir=vm.fc_binary_path.parent)
+    restored = microvm_factory.build()
+    restored.help.enable_console()
+    restored.spawn(serial_out_path=None)
+    restored_serial = Serial(restored)
+    restored_serial.open()
+    restored.restore_from_snapshot(rebased, resume=True)
+    restored_serial.drain_until_idle()
+    restored_serial.tx("cat /tmp/precopy-state")
+    contents = restored_serial.rx(restored.distro.shell_prompt)
+    assert "after" in contents
 
 
 def test_snapshot_overwrite_self(uvm, microvm_factory):

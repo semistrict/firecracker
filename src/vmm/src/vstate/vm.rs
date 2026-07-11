@@ -29,6 +29,7 @@ use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
 use crate::logger::{debug, info};
 use crate::persist::CreateSnapshotError;
+use crate::utils::u64_to_usize;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
@@ -562,24 +563,42 @@ impl KvmVm {
             .collect()
     }
 
-    /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to
-    /// `mem_file_path`.
-    ///
-    /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
-    /// file of matching size, then the diff snapshot will be directly merged into the existing
-    /// snapshot. Otherwise, existing files are simply overwritten.
-    pub(crate) fn snapshot_memory_to_file(
+    /// Harvests both KVM and userspace dirty tracking for a running pre-copy
+    /// round. Userspace dirty words are atomically cleared before memory is
+    /// copied, so new device writes remain recorded for the next round.
+    pub fn get_precopy_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
+        let page_size = host_page_size();
+        let mut dirty_bitmap = self.get_dirty_bitmap()?;
+
+        for region in self.guest_memory().iter() {
+            let userspace_bitmap = region.take_dirty_bitmap();
+
+            for mem_slot in region.plugged_slots() {
+                if let Some(ref userspace_bitmap) = userspace_bitmap {
+                    let region_page_offset =
+                        u64_to_usize(mem_slot.guest_addr.0 - region.start_addr().0) / page_size;
+                    merge_bitmap_range(
+                        dirty_bitmap.get_mut(&mem_slot.slot).unwrap(),
+                        userspace_bitmap,
+                        region_page_offset,
+                        mem_slot.slice.len().div_ceil(page_size),
+                    );
+                }
+            }
+        }
+
+        Ok(dirty_bitmap)
+    }
+
+    fn open_snapshot_memory_file(
         &self,
         mem_file_path: &Path,
-        snapshot_type: SnapshotType,
         overlay_files: &[File],
-    ) -> Result<(), CreateSnapshotError> {
+    ) -> Result<File, CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
-        // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
-
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
@@ -594,32 +613,65 @@ impl KvmVm {
             return Err(TargetIsOverlay);
         }
 
-        // Determine what size our total memory area is.
-        let mem_size_mib = mem_size_mib(self.guest_memory());
-        let expected_size = mem_size_mib * 1024 * 1024;
-
+        let expected_size = mem_size_mib(self.guest_memory()) * 1024 * 1024;
         if file_existed {
             let file_size = file
                 .metadata()
-                .map_err(|e| MemoryBackingFile("get_metadata", e))?
+                .map_err(|err| MemoryBackingFile("get_metadata", err))?
                 .len();
-
-            // Here we only truncate the file if the size mismatches.
-            // - For full snapshots, the entire file's contents will be overwritten anyway. We have
-            //   to avoid truncating here to deal with the edge case where it represents the
-            //   snapshot file from which this very microVM was loaded (as modifying the memory file
-            //   would be reflected in the mmap of the file, meaning a truncate operation would zero
-            //   out guest memory, and thus corrupt the VM).
-            // - For diff snapshots, we want to merge the diff layer directly into the file.
             if file_size != expected_size {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
             }
         }
 
-        // Set the length of the file to the full size of the memory area.
         file.set_len(expected_size)
-            .map_err(|e| MemoryBackingFile("set_length", e))?;
+            .map_err(|err| MemoryBackingFile("set_length", err))?;
+        Ok(file)
+    }
+
+    /// Copies the current dirty memory batch while vCPUs continue running.
+    pub(crate) fn precopy_memory_to_file(
+        &self,
+        mem_file_path: &Path,
+        overlay_files: &[File],
+    ) -> Result<(), CreateSnapshotError> {
+        use self::CreateSnapshotError::*;
+
+        let mut file = self.open_snapshot_memory_file(mem_file_path, overlay_files)?;
+        let dirty_bitmap = self.get_precopy_dirty_bitmap()?;
+        self.guest_memory()
+            .dump_dirty_precopy(&mut file, &dirty_bitmap)?;
+
+        let sync_result = file
+            .flush()
+            .map_err(|err| MemoryBackingFile("flush", err))
+            .and_then(|()| {
+                file.sync_all()
+                    .map_err(|err| MemoryBackingFile("sync_all", err))
+            });
+        if sync_result.is_err() {
+            self.guest_memory()
+                .store_dirty_bitmap(&dirty_bitmap, host_page_size());
+        }
+        sync_result
+    }
+
+    /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to
+    /// `mem_file_path`.
+    ///
+    /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
+    /// file of matching size, then the diff snapshot will be directly merged into the existing
+    /// snapshot. Otherwise, existing files are simply overwritten.
+    pub(crate) fn snapshot_memory_to_file(
+        &self,
+        mem_file_path: &Path,
+        snapshot_type: SnapshotType,
+        overlay_files: &[File],
+    ) -> Result<(), CreateSnapshotError> {
+        use self::CreateSnapshotError::*;
+
+        let mut file = self.open_snapshot_memory_file(mem_file_path, overlay_files)?;
 
         match snapshot_type {
             SnapshotType::Diff => {
@@ -736,6 +788,20 @@ impl KvmVm {
 
 /// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
 /// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
+fn merge_bitmap_range(
+    destination: &mut [u64],
+    source: &[u64],
+    source_page_offset: usize,
+    page_count: usize,
+) {
+    for page in 0..page_count {
+        let source_page = source_page_offset + page;
+        if source[source_page / 64] & (1 << (source_page % 64)) != 0 {
+            destination[page / 64] |= 1 << (page % 64);
+        }
+    }
+}
+
 fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
     // TODO: Once Host 5.10 goes out of support, we can make this more robust and work on
     // swap-enabled systems, by doing mlock2(MLOCK_ONFAULT)/munlock() in this function (to
@@ -797,6 +863,16 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_dram_memory_regions(gm).unwrap();
         vm
+    }
+
+    #[test]
+    fn test_merge_bitmap_range_unaligned() {
+        let source = [1 << 63, 1 | (1 << 62), 1 << 1];
+        let mut destination = [0, 0];
+
+        merge_bitmap_range(&mut destination, &source, 63, 65);
+
+        assert_eq!(destination, [(1 << 63) | 0b11, 0]);
     }
 
     #[test]
