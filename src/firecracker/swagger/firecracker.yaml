@@ -788,6 +788,71 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /snapshot/precopy:
+    put:
+      summary: Runs one pre-copy round. Post-boot only.
+      description:
+        Copies the guest memory dirtied since the previous round into the given
+        memory file while the vCPUs keep executing, so that the memory output
+        does not happen inside a stop-the-world pause. Requires a booted microVM
+        configured with `track_dirty_pages`, and returns with it `Paused` so the
+        reported page counts are exact; the next round starts it again, so a
+        caller loops without issuing `PATCH /vm` itself. Repeat until
+        `remaining_dirty_pages` is small enough, then close the chain with
+        `PUT /snapshot/precopy/finalize` naming the same memory file. No microVM
+        state is written by a round.
+      operationId: precopySnapshot
+      parameters:
+        - name: body
+          in: body
+          description: The configuration used for a pre-copy round.
+          required: true
+          schema:
+            $ref: "#/definitions/SnapshotPrecopyParams"
+      responses:
+        200:
+          description: Pre-copy round completed
+          schema:
+            $ref: "#/definitions/SnapshotPrecopyStats"
+        400:
+          description: Pre-copy round cannot be run due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /snapshot/precopy/finalize:
+    put:
+      summary: Closes a pre-copy chain. Post-boot only.
+      description:
+        Pauses the microVM, writes its state, and copies the final dirty epoch
+        into the memory file the preceding rounds accumulated into. Leaves the
+        microVM `Paused`. The memory file must be the one those rounds wrote to,
+        otherwise the pages they already committed would be lost and the
+        resulting layer would be silently incomplete. Valid with no preceding
+        rounds, in which case it is an ordinary paused diff snapshot.
+      operationId: finalizePrecopySnapshot
+      parameters:
+        - name: body
+          in: body
+          description: The configuration used to close a pre-copy chain.
+          required: true
+          schema:
+            $ref: "#/definitions/SnapshotFinalizeParams"
+      responses:
+        204:
+          description: Snapshot created
+        400:
+          description: Snapshot cannot be created due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /snapshot/load:
     put:
       summary: Loads a snapshot. Pre-boot only.
@@ -1649,6 +1714,54 @@ definitions:
         description:
           Type of snapshot to create. It is optional and by default, a full
           snapshot is created.
+
+  SnapshotPrecopyParams:
+    type: object
+    required:
+      - mem_file_path
+    properties:
+      mem_file_path:
+        type: string
+        description:
+          Path to the file that accumulates the guest memory across rounds. Every
+          round of a chain, and the finalizing request, must name the same file.
+
+  SnapshotPrecopyStats:
+    type: object
+    required:
+      - copied_dirty_pages
+      - remaining_dirty_pages
+      - page_size_bytes
+    properties:
+      copied_dirty_pages:
+        type: integer
+        description: Guest pages this round wrote to the memory file.
+      remaining_dirty_pages:
+        type: integer
+        description:
+          Guest pages dirtied while this round was copying, which the next round
+          or the finalizing request will have to copy. Measured with the microVM
+          paused, so it is exact rather than an estimate. Use it to decide
+          whether another round is worthwhile.
+      page_size_bytes:
+        type: integer
+        description: Size in bytes of the pages counted by the other two fields.
+
+  SnapshotFinalizeParams:
+    type: object
+    required:
+      - mem_file_path
+      - snapshot_path
+    properties:
+      mem_file_path:
+        type: string
+        description:
+          Path to the file that the preceding pre-copy rounds accumulated into.
+          Naming a different file is rejected, since the pages those rounds
+          already committed would otherwise be lost.
+      snapshot_path:
+        type: string
+        description: Path to the file that will contain the microVM state.
 
   NetworkOverride:
     type: object

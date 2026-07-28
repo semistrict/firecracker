@@ -39,13 +39,28 @@ pub enum ApiServerError {
     SeccompFilter(vmm::seccomp::InstallationError),
 }
 
+/// Event-loop side of the API channel.
+///
+/// Deliberately holds only what [`MutEventSubscriber::process`] touches. The
+/// controller and the response sender live outside it, in [`ApiServerAdapter`], so
+/// that dispatching a request does not require holding this lock — a handler that
+/// pumps the event loop (see `RuntimeApiController::precopy_snapshot`) would
+/// otherwise deadlock against its own subscriber the moment another API request
+/// arrived.
 #[derive(Debug)]
-struct ApiServerAdapter {
+struct ApiRequestSlot {
     api_event_fd: EventFd,
     from_api: Receiver<ApiRequest>,
+    /// At most one request is ever outstanding: the API thread blocks on its
+    /// response before sending another.
+    request: Option<ApiRequest>,
+}
+
+#[derive(Debug)]
+struct ApiServerAdapter {
+    slot: Arc<Mutex<ApiRequestSlot>>,
     to_api: Sender<ApiResponse>,
     controller: RuntimeApiController,
-    request: Option<ApiRequest>,
 }
 
 impl ApiServerAdapter {
@@ -58,22 +73,24 @@ impl ApiServerAdapter {
         vmm: Arc<Mutex<Vmm>>,
         event_manager: &mut EventManager,
     ) -> Result<(), ApiServerError> {
-        let api_adapter = Arc::new(Mutex::new(Self {
+        let slot = Arc::new(Mutex::new(ApiRequestSlot {
             api_event_fd,
             from_api,
-            to_api,
-            controller: RuntimeApiController::new(vmm.clone()),
             request: None,
         }));
-        event_manager.add_subscriber(api_adapter.clone());
+        event_manager.add_subscriber(slot.clone());
+
+        let mut adapter = Self {
+            slot,
+            to_api,
+            controller: RuntimeApiController::new(vmm.clone()),
+        };
+
         loop {
             event_manager
                 .run()
                 .expect("EventManager events driver fatal error");
-            api_adapter
-                .lock()
-                .expect("Poisoned lock")
-                .handle_request(event_manager);
+            adapter.handle_request(event_manager);
 
             match vmm.lock().unwrap().shutdown_exit_code() {
                 Some(FcExitCode::Ok) => break,
@@ -94,31 +111,36 @@ impl ApiServerAdapter {
     }
 
     fn handle_request(&mut self, event_manager: &mut EventManager) {
-        if let Some(api_request) = self.request.take() {
-            let request_is_pause = *api_request == VmmAction::Pause;
-            self._handle_request(*api_request, event_manager);
+        let Some(api_request) = self.slot.lock().expect("Poisoned lock").request.take() else {
+            return;
+        };
 
-            // If the latest req is a pause request, temporarily switch to a mode where we
-            // do blocking `recv`s on the `from_api` receiver in a loop, until we get
-            // unpaused. The device emulation is implicitly paused since we do not
-            // relinquish control to the event manager because we're not returning from
-            // `process`.
-            if request_is_pause {
-                // This loop only attempts to process API requests, so things like the
-                // metric flush timerfd handling are frozen as well.
-                loop {
-                    let req = self.from_api.recv().expect("Error receiving API request.");
-                    let req_is_resume = *req == VmmAction::Resume;
-                    self._handle_request(*req, event_manager);
-                    if req_is_resume {
-                        break;
-                    }
+        let request_is_pause = *api_request == VmmAction::Pause;
+        self._handle_request(*api_request, event_manager);
+
+        // If the latest req is a pause request, temporarily switch to a mode where we
+        // do blocking `recv`s on the `from_api` receiver in a loop, until we get
+        // unpaused. The device emulation is implicitly paused since we do not
+        // relinquish control to the event manager because we're not returning from
+        // `process`.
+        if request_is_pause {
+            // This loop only attempts to process API requests, so things like the
+            // metric flush timerfd handling are frozen as well.
+            loop {
+                let req = {
+                    let slot = self.slot.lock().expect("Poisoned lock");
+                    slot.from_api.recv().expect("Error receiving API request.")
+                };
+                let req_is_resume = *req == VmmAction::Resume;
+                self._handle_request(*req, event_manager);
+                if req_is_resume {
+                    break;
                 }
             }
         }
     }
 }
-impl MutEventSubscriber for ApiServerAdapter {
+impl MutEventSubscriber for ApiRequestSlot {
     /// Handle a read event (EPOLLIN).
     fn process(&mut self, event: Events, _: &mut EventOps) {
         let source = event.fd();
@@ -138,7 +160,7 @@ impl MutEventSubscriber for ApiServerAdapter {
                 }
             };
         } else {
-            error_unrestricted!("Spurious EventManager event for handler: ApiServerAdapter");
+            error_unrestricted!("Spurious EventManager event for handler: ApiRequestSlot");
         }
     }
 

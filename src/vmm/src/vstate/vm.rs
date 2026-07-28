@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
@@ -29,6 +29,7 @@ use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
 use crate::logger::{debug, info};
 use crate::persist::CreateSnapshotError;
+use crate::utils::u64_to_usize;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
@@ -109,6 +110,8 @@ pub enum VmError {
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
     MemoryError(#[from] MemoryError),
+    /// No dirty bitmap was harvested for memory slot {0}
+    DirtyBitmapSlotMissing(u32),
 }
 
 /// VM abstraction: either a KVM-based VM or (in the future) a Nitro Enclave.
@@ -562,24 +565,89 @@ impl KvmVm {
             .collect()
     }
 
-    /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to
-    /// `mem_file_path`.
+    /// Whether dirty page tracking is active for all plugged memory.
     ///
-    /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
-    /// file of matching size, then the diff snapshot will be directly merged into the existing
-    /// snapshot. Otherwise, existing files are simply overwritten.
-    pub(crate) fn snapshot_memory_to_file(
+    /// Without it [`Self::get_dirty_bitmap`] falls back to `mincore(2)`, which
+    /// over-approximates to every resident page and never clears. That is a workable
+    /// basis for a one-shot paused diff, but useless as a pre-copy epoch: every round
+    /// would copy all of guest memory and the finalizing diff would copy it again.
+    pub(crate) fn dirty_page_tracking_enabled(&self) -> bool {
+        self.guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+            .all(|mem_slot| mem_slot.slice.bitmap().is_some())
+    }
+
+    /// Harvests *and clears* both KVM and userspace dirty tracking, returning the
+    /// union as a single bitmap.
+    ///
+    /// Both halves are cleared, so the caller takes ownership of the epoch: whatever
+    /// is returned must either be written out or handed back via
+    /// [`GuestMemoryExtension::store_dirty_bitmap`], or those pages are lost.
+    ///
+    /// Callers pre-copying with the vCPUs running rely on writes that race this
+    /// harvest still being recorded afterwards. That holds because both trackers mark
+    /// a page dirty only *after* its data lands: KVM re-marks on the next write fault,
+    /// and `vm-memory` calls `mark_dirty` after the write. A tracker that marked
+    /// before writing could have its bit taken here and its data land in the copy
+    /// window, losing the page.
+    pub(crate) fn get_precopy_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
+        let page_size = host_page_size();
+        let mut dirty_bitmap = self.get_dirty_bitmap()?;
+
+        for region in self.guest_memory().iter() {
+            let Some(userspace_bitmap) = region.take_dirty_bitmap() else {
+                continue;
+            };
+
+            for mem_slot in region.plugged_slots() {
+                let slot_bitmap = dirty_bitmap
+                    .get_mut(&mem_slot.slot)
+                    .ok_or(VmError::DirtyBitmapSlotMissing(mem_slot.slot))?;
+                let region_page_offset =
+                    u64_to_usize(mem_slot.guest_addr.0 - region.start_addr().0) / page_size;
+                merge_bitmap_range(
+                    slot_bitmap,
+                    &userspace_bitmap,
+                    region_page_offset,
+                    mem_slot.slice.len().div_ceil(page_size),
+                );
+            }
+        }
+
+        Ok(dirty_bitmap)
+    }
+
+    /// Number of guest pages currently dirty, measured without consuming them.
+    ///
+    /// Harvesting is inherently destructive — KVM's `GET_DIRTY_LOG` clears as it
+    /// reads — so this takes the epoch and immediately hands it back to the userspace
+    /// bitmap, where the next harvest (or the finalizing diff, which ORs the KVM and
+    /// userspace bitmaps) will pick it up again.
+    ///
+    /// Only meaningful with the vCPUs stopped; with them running the count is stale
+    /// the moment it is taken.
+    pub(crate) fn count_dirty_pages(&self) -> Result<u64, VmError> {
+        let dirty_bitmap = self.get_precopy_dirty_bitmap()?;
+        let count = count_dirty_bits(&dirty_bitmap);
+
+        self.guest_memory()
+            .store_dirty_bitmap(&dirty_bitmap, host_page_size());
+
+        Ok(count)
+    }
+
+    pub(crate) fn open_snapshot_memory_file(
         &self,
         mem_file_path: &Path,
-        snapshot_type: SnapshotType,
         overlay_files: &[File],
-    ) -> Result<(), CreateSnapshotError> {
+    ) -> Result<File, CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
@@ -595,13 +663,12 @@ impl KvmVm {
         }
 
         // Determine what size our total memory area is.
-        let mem_size_mib = mem_size_mib(self.guest_memory());
-        let expected_size = mem_size_mib * 1024 * 1024;
+        let expected_size = mem_size_mib(self.guest_memory()) * 1024 * 1024;
 
         if file_existed {
             let file_size = file
                 .metadata()
-                .map_err(|e| MemoryBackingFile("get_metadata", e))?
+                .map_err(|err| MemoryBackingFile("get_metadata", err))?
                 .len();
 
             // Here we only truncate the file if the size mismatches.
@@ -619,7 +686,25 @@ impl KvmVm {
 
         // Set the length of the file to the full size of the memory area.
         file.set_len(expected_size)
-            .map_err(|e| MemoryBackingFile("set_length", e))?;
+            .map_err(|err| MemoryBackingFile("set_length", err))?;
+        Ok(file)
+    }
+
+    /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to
+    /// `mem_file_path`.
+    ///
+    /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
+    /// file of matching size, then the diff snapshot will be directly merged into the existing
+    /// snapshot. Otherwise, existing files are simply overwritten.
+    pub(crate) fn snapshot_memory_to_file(
+        &self,
+        mem_file_path: &Path,
+        snapshot_type: SnapshotType,
+        overlay_files: &[File],
+    ) -> Result<(), CreateSnapshotError> {
+        use self::CreateSnapshotError::*;
+
+        let mut file = self.open_snapshot_memory_file(mem_file_path, overlay_files)?;
 
         match snapshot_type {
             SnapshotType::Diff => {
@@ -734,6 +819,135 @@ impl KvmVm {
     }
 }
 
+/// ORs `page_count` bits of `source`, starting at bit `source_page_offset`, into
+/// `destination` starting at bit 0.
+///
+/// The two bitmaps are indexed differently: userspace bitmaps cover a whole memory
+/// region, KVM bitmaps cover a single memslot within it, so the source needs a page
+/// offset the destination does not.
+fn merge_bitmap_range(
+    destination: &mut [u64],
+    source: &[u64],
+    source_page_offset: usize,
+    page_count: usize,
+) {
+    for page in 0..page_count {
+        let source_page = source_page_offset + page;
+        if source[source_page / 64] & (1 << (source_page % 64)) != 0 {
+            destination[page / 64] |= 1 << (page % 64);
+        }
+    }
+}
+
+/// Number of pages marked dirty in a harvested bitmap.
+///
+/// Whole words are counted: `dump_dirty` rejects a bitmap with bits set past the end
+/// of its slot, so trailing bits are always zero.
+pub(crate) fn count_dirty_bits(dirty_bitmap: &DirtyBitmap) -> u64 {
+    dirty_bitmap
+        .values()
+        .flatten()
+        .map(|word| u64::from(word.count_ones()))
+        .sum()
+}
+
+/// Splits a harvested pre-copy epoch into pieces of roughly `max_pages` dirty pages.
+///
+/// A pre-copy round cannot write its whole epoch in one go. The write happens on the
+/// event-manager thread — Firecracker's `vmm` seccomp filter has no `clone`, so a
+/// round genuinely cannot hand the work to a new thread — and an uninterrupted
+/// multi-GiB write there would stall every virtio queue and timer for its full
+/// duration, which is precisely the disruption pre-copy exists to avoid. Writing a
+/// piece at a time lets the caller return to the event loop in between, bounding
+/// device stalls by how long a single piece takes.
+///
+/// Every piece is a complete bitmap — all slots present, each with its original word
+/// count — so it can be handed straight to
+/// [`GuestMemoryExtension::dump_dirty_precopy`]. Pieces are cut on word boundaries,
+/// so one may carry up to 63 pages more than `max_pages`.
+pub(crate) struct DirtyEpochPieces<'a> {
+    epoch: &'a DirtyBitmap,
+    /// Slots in a stable order, so pieces partition the epoch deterministically.
+    slots: Vec<u32>,
+    slot_idx: usize,
+    word_idx: usize,
+    max_pages: u64,
+}
+
+impl<'a> DirtyEpochPieces<'a> {
+    pub(crate) fn new(epoch: &'a DirtyBitmap, max_pages: u64) -> Self {
+        let mut slots: Vec<u32> = epoch.keys().copied().collect();
+        slots.sort_unstable();
+        Self {
+            epoch,
+            slots,
+            slot_idx: 0,
+            word_idx: 0,
+            max_pages: max_pages.max(1),
+        }
+    }
+
+    /// An all-zero bitmap shaped like the epoch, ready to have a piece filled in.
+    fn empty_piece(&self) -> DirtyBitmap {
+        self.epoch
+            .iter()
+            .map(|(slot, words)| (*slot, vec![0u64; words.len()]))
+            .collect()
+    }
+}
+
+impl Iterator for DirtyEpochPieces<'_> {
+    type Item = DirtyBitmap;
+
+    fn next(&mut self) -> Option<DirtyBitmap> {
+        let mut piece = self.empty_piece();
+        let mut pages = 0u64;
+
+        while self.slot_idx < self.slots.len() {
+            let slot = self.slots[self.slot_idx];
+            let words = &self.epoch[&slot];
+
+            while self.word_idx < words.len() {
+                let word = words[self.word_idx];
+                if word != 0 {
+                    piece.get_mut(&slot).unwrap()[self.word_idx] = word;
+                    pages += u64::from(word.count_ones());
+                }
+                self.word_idx += 1;
+
+                if pages >= self.max_pages {
+                    return Some(piece);
+                }
+            }
+
+            self.slot_idx += 1;
+            self.word_idx = 0;
+        }
+
+        // Trailing partial piece, or nothing left to hand out.
+        (pages > 0).then_some(piece)
+    }
+}
+
+/// Writes one piece of a pre-copy epoch while the vCPUs keep running.
+///
+/// Does *not* restore dirty tracking on failure: a piece is only part of the epoch,
+/// so the caller — which alone knows the pieces still unwritten — is responsible for
+/// handing the whole epoch back via
+/// [`GuestMemoryExtension::store_dirty_bitmap`].
+pub(crate) fn precopy_piece_to_file(
+    guest_memory: &GuestMemoryMmap,
+    file: &mut File,
+    piece: &DirtyBitmap,
+) -> Result<(), CreateSnapshotError> {
+    // Each piece walks the file from the start, seeking over what it does not own.
+    file.rewind()
+        .map_err(|err| CreateSnapshotError::MemoryBackingFile("rewind", err))?;
+    guest_memory
+        .dump_dirty_precopy(file, piece)
+        .map_err(CreateSnapshotError::Memory)
+}
+
 /// Use `mincore(2)` to overapproximate the dirty bitmap for the given memslot. To be used
 /// if a diff snapshot is requested, but dirty page tracking wasn't enabled.
 fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
@@ -797,6 +1011,89 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_dram_memory_regions(gm).unwrap();
         vm
+    }
+
+    #[test]
+    fn test_merge_bitmap_range_unaligned() {
+        let source = [1 << 63, 1 | (1 << 62), 1 << 1];
+        let mut destination = [0, 0];
+
+        merge_bitmap_range(&mut destination, &source, 63, 65);
+
+        assert_eq!(destination, [(1 << 63) | 0b11, 0]);
+    }
+
+    #[test]
+    fn test_merge_bitmap_range_is_a_union() {
+        // Bits already set in the destination survive a merge that does not set them.
+        let source = [0b0100];
+        let mut destination = [0b0001];
+
+        merge_bitmap_range(&mut destination, &source, 0, 4);
+
+        assert_eq!(destination, [0b0101]);
+    }
+
+    /// Pieces must partition the epoch exactly: every dirty page delivered once,
+    /// none invented, and every piece shaped like a whole bitmap so it can be
+    /// dumped directly.
+    #[test]
+    fn test_dirty_epoch_pieces_partition_the_epoch() {
+        let epoch = DirtyBitmap::from([
+            (0, vec![u64::MAX, 0, 0b1011]),
+            (1, vec![0, 0b1]),
+            (2, vec![0, 0]),
+        ]);
+
+        let pieces: Vec<_> = DirtyEpochPieces::new(&epoch, 8).collect();
+        assert!(pieces.len() > 1, "epoch should have been split");
+
+        let mut union =
+            DirtyBitmap::from([(0, vec![0u64; 3]), (1, vec![0u64; 2]), (2, vec![0u64; 2])]);
+        for piece in &pieces {
+            // Shaped like the epoch, so `dump_dirty_precopy` accepts it.
+            assert_eq!(piece.len(), epoch.len());
+            for (slot, words) in piece {
+                assert_eq!(words.len(), epoch[slot].len());
+                for (i, word) in words.iter().enumerate() {
+                    // No page is handed out twice.
+                    assert_eq!(union[slot][i] & word, 0, "slot {slot} word {i} repeated");
+                    union.get_mut(slot).unwrap()[i] |= word;
+                }
+            }
+        }
+        assert_eq!(union, epoch);
+        assert_eq!(
+            pieces.iter().map(count_dirty_bits).sum::<u64>(),
+            count_dirty_bits(&epoch)
+        );
+    }
+
+    #[test]
+    fn test_dirty_epoch_pieces_edge_cases() {
+        // A clean epoch produces no work at all.
+        let clean = DirtyBitmap::from([(0, vec![0u64; 4])]);
+        assert_eq!(DirtyEpochPieces::new(&clean, 8).count(), 0);
+
+        // Everything fitting in the budget comes back as a single piece.
+        let small = DirtyBitmap::from([(0, vec![0b111])]);
+        let pieces: Vec<_> = DirtyEpochPieces::new(&small, 8).collect();
+        assert_eq!(pieces, vec![small.clone()]);
+
+        // Pieces are cut on word boundaries, so a budget below 64 still yields
+        // whole words rather than looping forever.
+        let dense = DirtyBitmap::from([(0, vec![u64::MAX, u64::MAX])]);
+        let pieces: Vec<_> = DirtyEpochPieces::new(&dense, 1).collect();
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(count_dirty_bits(&dense), 128);
+    }
+
+    #[test]
+    fn test_count_dirty_bits() {
+        let bitmap = DirtyBitmap::from([(0, vec![0b1011, 0]), (1, vec![u64::MAX]), (2, vec![0])]);
+
+        assert_eq!(count_dirty_bits(&bitmap), 3 + 64);
+        assert_eq!(count_dirty_bits(&DirtyBitmap::new()), 0);
     }
 
     #[test]

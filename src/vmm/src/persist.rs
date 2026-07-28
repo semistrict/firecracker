@@ -158,6 +158,8 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Cannot run the event loop during a pre-copy round: {0}
+    PrecopyEventLoop(event_manager::Error),
     /// The snapshot target file is currently mapped as a diff overlay of this VM's guest memory
     TargetIsOverlay,
 }
@@ -593,7 +595,8 @@ fn guest_memory_from_file(
 /// Error type for [`guest_memory_from_uffd`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum GuestMemoryFromUffdError {
-    /// Overlays are not supported with the Uffd backend; the page fault handler process is responsible for applying diff layers.
+    /// Overlays are not supported with the Uffd backend; the page fault handler process is
+    /// responsible for applying diff layers.
     OverlaysUnsupported,
     /// Failed to restore guest memory: {0}
     Restore(#[from] MemoryError),

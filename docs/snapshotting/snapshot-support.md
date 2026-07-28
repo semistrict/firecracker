@@ -17,6 +17,7 @@
   - [Creating snapshots](#creating-snapshots)
     - [Creating full snapshots](#creating-full-snapshots)
     - [Creating diff snapshots](#creating-diff-snapshots)
+    - [Creating diff snapshots with pre-copy](#creating-diff-snapshots-with-pre-copy)
   - [Resuming the microVM](#resuming-the-microvm)
   - [Loading snapshots](#loading-snapshots)
 - [Provisioning host disk space for snapshots](#provisioning-host-disk-space-for-snapshots)
@@ -377,6 +378,93 @@ Creating a snapshot has some minor effects on the currently running microVM:
   terminate connection on resumption.
 - On x86_64, a notification for KVM-clock is injected to notify the guest about
   being paused.
+
+#### Creating diff snapshots with pre-copy
+
+A paused diff snapshot writes the whole accumulated dirty set while the microVM
+is stopped, so the pause grows with the guest's dirty working set. Pre-copy
+splits that work into rounds that run while the vCPUs execute, leaving only the
+last round's leftovers to be copied under pause.
+
+**Prerequisites**: The microVM has booted and was configured with
+`track_dirty_pages`. A round accepts it either `Running` or `Paused`, since a
+round leaves it paused and the next one starts it again. Pre-copy is rejected without it: the `mincore(2)` fallback
+over-approximates to every resident page and never clears, so every round would
+copy all of guest memory and the finalizing request would copy it again.
+
+Each `PUT /snapshot/precopy` performs one round:
+
+```bash
+curl --unix-socket /tmp/firecracker.socket -i \
+    -X PUT 'http://localhost/snapshot/precopy' \
+    -H  'Accept: application/json' \
+    -H  'Content-Type: application/json' \
+    -d '{ "mem_file_path": "./mem_file" }'
+```
+
+```json
+{ "copied_dirty_pages": 262144, "remaining_dirty_pages": 4211, "page_size_bytes": 4096 }
+```
+
+A round takes the pages dirtied since the previous round, copies them to
+`mem_file_path` while the guest keeps running, then pauses the microVM and
+reports what accumulated during the copy. Because the count is taken under
+pause, it is exact rather than an estimate. **The request returns with the
+microVM `Paused`**; the next round resumes it, so a caller loops without issuing
+`PATCH /vm` itself.
+
+Close the chain with `PUT /snapshot/precopy/finalize`, which pauses the microVM
+(if the caller resumed it), writes its state, and copies the last dirty epoch:
+
+```bash
+curl --unix-socket /tmp/firecracker.socket -i \
+    -X PUT 'http://localhost/snapshot/precopy/finalize' \
+    -H  'Accept: application/json' \
+    -H  'Content-Type: application/json' \
+    -d '{
+            "snapshot_path": "./snapshot_file",
+            "mem_file_path": "./mem_file"
+    }'
+```
+
+So a full sequence is:
+
+```text
+loop { remaining = PUT /snapshot/precopy }   # until remaining is small enough
+PUT /snapshot/precopy/finalize
+```
+
+The result is an ordinary diff snapshot: rebase it onto its base with
+`snapshot-editor edit-memory rebase`, or pass it as an overlay to
+`PUT /snapshot/load`, exactly as with a paused diff snapshot.
+
+**Every round and the finalizing request must name the same `mem_file_path`.** A
+round commits pages to that file and clears the dirty tracking for them, so
+finalizing against a different file would leave those pages in neither file and
+produce a layer that looks valid but restores into a corrupt guest. Firecracker
+remembers the file the rounds wrote to and rejects a finalizing request naming a
+different one. Finalizing with no preceding rounds is allowed and is simply an
+ordinary paused diff snapshot.
+
+**Effects**:
+
+- _on success_: `mem_file_path` accumulates the copied pages across rounds; only
+  the finalizing request writes `snapshot_path`. The microVM is left `Paused` by
+  both requests.
+- _on failure_: no side-effects; pages a failed round had taken are returned to
+  the dirty set, so the next round or the finalizing request copies them.
+
+**What pre-copy does and does not buy you.** It shortens the stop-the-world
+window, which is what matters if the guest must not miss vCPU time. It does not
+reduce total work — the same pages are written, plus whatever is re-dirtied and
+copied twice — and the microVM stays `Paused` between rounds while the caller
+decides whether to continue, so a caller far from the API socket can spend more
+time stopped than it saved. Measure end to end, from the first round to the
+return of the finalizing request, not just the final pause.
+
+Convergence is the caller's decision. Firecracker performs exactly one round per
+request and reports; it does not decide when to stop, retry, or fall back to a
+plain paused diff.
 
 ### Resuming the microVM
 

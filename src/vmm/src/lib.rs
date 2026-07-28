@@ -119,7 +119,9 @@ pub mod initrd;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -311,9 +313,55 @@ pub struct Vmm {
     /// Diff overlay files mapped into guest memory; held open for the VM's lifetime and used to
     /// refuse snapshotting onto a live overlay.
     overlay_files: Vec<File>,
+    /// Identity (`st_dev`, `st_ino`) of the memory file that completed pre-copy rounds
+    /// have written into, if any.
+    ///
+    /// A round commits pages to that file and clears dirty tracking for them, so
+    /// finalizing against a *different* file would silently produce an incomplete
+    /// layer that restores into a corrupt guest. Recorded here so the finalizing
+    /// request can be checked. Compared by identity rather than path so that
+    /// different spellings of the same file still match.
+    precopy_target: Option<(u64, u64)>,
 }
 
 impl Vmm {
+    /// Returns the memory overlay files retained by this VMM.
+    pub(crate) fn overlay_files(&self) -> &[File] {
+        &self.overlay_files
+    }
+
+    /// Records `file` as the memory file that pre-copy rounds are accumulating into.
+    pub(crate) fn set_precopy_target(&mut self, file: &File) -> Result<(), io::Error> {
+        let meta = file.metadata()?;
+        self.precopy_target = Some((meta.dev(), meta.ino()));
+        Ok(())
+    }
+
+    /// Whether `path` names the memory file that pre-copy rounds accumulated into.
+    ///
+    /// `true` when no rounds have run, since finalizing without a preceding round is
+    /// allowed and simply degrades to a paused diff snapshot. Resolves the path rather
+    /// than an open handle because a standalone finalize may legitimately name a file
+    /// that does not exist yet.
+    pub(crate) fn is_precopy_target_path(&self, path: &Path) -> Result<bool, io::Error> {
+        let Some(target) = self.precopy_target else {
+            return Ok(true);
+        };
+        match std::fs::metadata(path) {
+            Ok(meta) => Ok(target == (meta.dev(), meta.ino())),
+            // A file that does not exist cannot be the one the rounds wrote to. Report
+            // it as a mismatch so the caller gets told what is actually wrong, rather
+            // than an opaque `ENOENT`.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Forgets the accumulated pre-copy chain, after it has been closed.
+    pub(crate) fn clear_precopy_target(&mut self) {
+        self.precopy_target = None;
+    }
+
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()

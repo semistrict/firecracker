@@ -110,7 +110,9 @@ class Resource:
             if self._api.error_callback:
                 self._api.error_callback(method, path, str(e))
             raise
-        if res.status_code != HTTPStatus.NO_CONTENT:
+        # Most endpoints answer 204; the ones that report something back answer 200
+        # with a body (e.g. PUT /snapshot/precopy).
+        if res.status_code not in (HTTPStatus.NO_CONTENT, HTTPStatus.OK):
             json = res.json()
             msg = res.content
             if "fault_message" in json:
@@ -194,6 +196,8 @@ class Api:
         self.balloon_hinting_stop = Resource(self, "/balloon/hinting/stop")
         self.vsock = Resource(self, "/vsock")
         self.snapshot_create = Resource(self, "/snapshot/create")
+        self.snapshot_precopy = Resource(self, "/snapshot/precopy")
+        self.snapshot_precopy_finalize = Resource(self, "/snapshot/precopy/finalize")
         self.snapshot_load = Resource(self, "/snapshot/load")
         self.cpu_config = Resource(self, "/cpu-config")
         self.entropy = Resource(self, "/entropy")

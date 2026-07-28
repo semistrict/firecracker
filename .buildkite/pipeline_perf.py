@@ -57,7 +57,7 @@ perf_test = {
     },
     "snapshot-latency": {
         "label": "snapshot-latency",
-        "tests": "integration_tests/performance/test_snapshot.py::test_restore_latency integration_tests/performance/test_snapshot.py::test_post_restore_latency integration_tests/performance/test_snapshot.py::test_snapshot_create_latency",
+        "tests": "integration_tests/performance/test_snapshot.py::test_restore_latency integration_tests/performance/test_snapshot.py::test_post_restore_latency integration_tests/performance/test_snapshot.py::test_snapshot_create_latency integration_tests/performance/test_snapshot.py::test_diff_snapshot_pause_time",
         "devtool_opts": "-c 1-12 -m 0",
     },
     "population-latency": {

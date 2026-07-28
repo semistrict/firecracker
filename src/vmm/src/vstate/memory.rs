@@ -79,7 +79,8 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
-    /// Overlay file size of {overlay_size} bytes does not match the guest memory size of {memory_size} bytes
+    /// Overlay file size of {overlay_size} bytes does not match the guest memory size of
+    /// {memory_size} bytes
     OverlaySizeMismatch {
         /// Logical size of the overlay file in bytes.
         overlay_size: u64,
@@ -93,7 +94,8 @@ pub enum MemoryError {
         /// End file offset of the offending extent.
         end: u64,
     },
-    /// Applying the overlays would create {mappings} memory mappings, too close to the vm.max_map_count limit of {max_map_count}
+    /// Applying the overlays would create {mappings} memory mappings, too close to the
+    /// vm.max_map_count limit of {max_map_count}
     OverlayTooFragmented {
         /// Number of memory mappings the overlays would create.
         mappings: usize,
@@ -273,6 +275,13 @@ impl<'a> GuestMemorySlot<'a> {
 }
 
 impl GuestRegionMmapExt {
+    /// Atomically harvest and clear the userspace dirty bitmap for this region.
+    pub(crate) fn take_dirty_bitmap(&self) -> Option<Vec<u64>> {
+        MmapRegion::bitmap(&self.inner)
+            .as_ref()
+            .map(AtomicBitmap::get_and_reset)
+    }
+
     /// Adds a DRAM region which only contains a single plugged slot
     pub(crate) fn dram_from_mmap_region(region: GuestRegionMmap, slot: u32) -> Self {
         let slot_size = u64_to_usize(region.len());
@@ -889,6 +898,18 @@ where
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError>;
 
+    /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer,
+    /// leaving the userspace bitmap alone.
+    ///
+    /// Unlike [`Self::dump_dirty`], this is safe to call with the vCPUs running:
+    /// pages dirtied while the dump is in progress stay recorded for the next
+    /// pre-copy round instead of being cleared along with the dumped epoch.
+    fn dump_dirty_precopy<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        dirty_bitmap: &DirtyBitmap,
+    ) -> Result<(), MemoryError>;
+
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self);
 
@@ -945,6 +966,62 @@ impl GuestMemoryState {
     }
 }
 
+/// What to do with the userspace dirty bitmap once a dirty-memory dump succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterDump {
+    /// The dump owns the whole dirty epoch, so the bitmap is cleared. Correct only
+    /// while the vCPUs are stopped, since anything dirtied concurrently would be
+    /// cleared without ever having been written out.
+    Reset,
+    /// Leave the bitmap alone. Used by running pre-copy rounds, where the epoch was
+    /// already harvested and cleared up front and any bit set since belongs to the
+    /// next round.
+    Keep,
+}
+
+/// Shared implementation behind [`GuestMemoryExtension::dump_dirty`] and
+/// [`GuestMemoryExtension::dump_dirty_precopy`].
+///
+/// A free function rather than a trait method: it is an implementation detail that
+/// should not appear in the trait's public surface, and `GuestMemoryMmap` is a
+/// foreign type, so it cannot carry an inherent `impl`.
+fn dump_dirty_pages<T: WriteVolatile + std::io::Seek>(
+    mem: &GuestMemoryMmap,
+    writer: &mut T,
+    dirty_bitmap: &DirtyBitmap,
+    after: AfterDump,
+) -> Result<(), MemoryError> {
+    let page_size = host_page_size();
+
+    let write_result =
+        mem.iter()
+            .flat_map(|region| region.slots())
+            .try_for_each(|(mem_slot, plugged)| {
+                if !plugged {
+                    let ilen = i64::try_from(mem_slot.slice.len())
+                        .map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                    writer
+                        .seek(SeekFrom::Current(ilen))
+                        .map_err(MemoryError::SeekError)?;
+                } else {
+                    let kvm_bitmap = dirty_bitmap
+                        .get(&mem_slot.slot)
+                        .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
+                    mem_slot.dump_dirty(writer, kvm_bitmap, page_size)?;
+                }
+                Ok(())
+            });
+
+    match (&write_result, after) {
+        // Put the epoch back so a failed dump does not lose dirty tracking.
+        (Err(_), _) => mem.store_dirty_bitmap(dirty_bitmap, page_size),
+        (Ok(()), AfterDump::Reset) => mem.reset_dirty(),
+        (Ok(()), AfterDump::Keep) => {}
+    }
+
+    write_result
+}
+
 impl GuestMemoryExtension for GuestMemoryMmap {
     /// Describes GuestMemoryMmap through a GuestMemoryState struct.
     fn describe(&self) -> GuestMemoryState {
@@ -990,34 +1067,15 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError> {
-        let page_size = host_page_size();
+        dump_dirty_pages(self, writer, dirty_bitmap, AfterDump::Reset)
+    }
 
-        let write_result =
-            self.iter()
-                .flat_map(|region| region.slots())
-                .try_for_each(|(mem_slot, plugged)| {
-                    if !plugged {
-                        let ilen = i64::try_from(mem_slot.slice.len())
-                            .map_err(|_| MemoryError::SlotSizeTooLarge)?;
-                        writer
-                            .seek(SeekFrom::Current(ilen))
-                            .map_err(MemoryError::SeekError)?;
-                    } else {
-                        let kvm_bitmap = dirty_bitmap
-                            .get(&mem_slot.slot)
-                            .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
-                        mem_slot.dump_dirty(writer, kvm_bitmap, page_size)?;
-                    }
-                    Ok(())
-                });
-
-        if write_result.is_err() {
-            self.store_dirty_bitmap(dirty_bitmap, page_size);
-        } else {
-            self.reset_dirty();
-        }
-
-        write_result
+    fn dump_dirty_precopy<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        dirty_bitmap: &DirtyBitmap,
+    ) -> Result<(), MemoryError> {
+        dump_dirty_pages(self, writer, dirty_bitmap, AfterDump::Keep)
     }
 
     /// Resets all the memory region bitmaps

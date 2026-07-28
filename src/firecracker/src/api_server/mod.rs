@@ -160,6 +160,14 @@ impl ApiServer {
                     "create diff snapshot",
                 )),
             },
+            VmmAction::PrecopySnapshot(_) => Some((
+                &METRICS.latencies_us.precopy_snapshot,
+                "pre-copy snapshot round",
+            )),
+            VmmAction::FinalizeSnapshot(_) => Some((
+                &METRICS.latencies_us.finalize_snapshot,
+                "finalize pre-copy snapshot",
+            )),
             VmmAction::LoadSnapshot(_) => {
                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))
             }

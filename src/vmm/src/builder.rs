@@ -330,6 +330,7 @@ pub fn build_microvm_for_boot(
         vm,
         device_manager,
         overlay_files: vec![],
+        precopy_target: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -522,6 +523,7 @@ pub fn build_microvm_from_snapshot(
         vm,
         device_manager,
         overlay_files,
+        precopy_target: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -854,6 +856,7 @@ pub(crate) mod tests {
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
             overlay_files: vec![],
+            precopy_target: None,
         }
     }
 
