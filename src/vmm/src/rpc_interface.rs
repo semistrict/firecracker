@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::{self, Debug};
+use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
@@ -12,6 +13,7 @@ use super::persist::{create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
+use crate::arch::host_page_size;
 use crate::builder::StartMicrovmError;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::device_manager::pci_mngr::PciManagerError;
@@ -23,7 +25,6 @@ use crate::mmds::data_store::{self, Mmds, MmdsDatastoreError};
 use crate::persist::{CreateSnapshotError, MicrovmStateError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
-use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -43,9 +44,14 @@ use crate::vmm_config::net::{
 };
 use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfig};
 use crate::vmm_config::serial::SerialConfig;
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, FinalizeSnapshotParams, LoadSnapshotParams, PrecopySnapshotParams,
+    PrecopyStats, SnapshotType,
+};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
-use crate::vmm_config::{self, RateLimiterUpdate};
+use crate::vmm_config::{self, HotplugDeviceConfig, RateLimiterUpdate};
+use crate::vstate::memory::GuestMemoryExtension;
+use crate::vstate::vm::{DirtyEpochPieces, count_dirty_bits, precopy_piece_to_file};
 
 /// This enum represents the public interface of the VMM. Each action contains various
 /// bits of information (ids, paths, etc.).
@@ -65,6 +71,13 @@ pub enum VmmAction {
     /// Create a snapshot using as input the `CreateSnapshotParams`. This action can only be called
     /// after the microVM has booted and only when the microVM is in `Paused` state.
     CreateSnapshot(CreateSnapshotParams),
+    /// Run one pre-copy round, copying the memory dirtied since the previous round
+    /// into the given file while the vCPUs keep executing. Post-boot only. Returns
+    /// with the microVM `Paused` so the reported dirty-page counts are exact.
+    PrecopySnapshot(PrecopySnapshotParams),
+    /// Close a pre-copy chain: pause the microVM, write its state, and copy the last
+    /// dirty epoch into the memory file the rounds accumulated into. Post-boot only.
+    FinalizeSnapshot(FinalizeSnapshotParams),
     /// Get the balloon device configuration.
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
@@ -245,6 +258,24 @@ pub enum VmmData {
     VirtioMemStatus(VirtioMemStatus),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
+    /// The outcome of one pre-copy round.
+    PrecopyStats(PrecopyStats),
+}
+
+/// Dirty pages a pre-copy round writes before returning to the event loop.
+///
+/// Bounds how long device emulation can be stalled by the copy: at 4 KiB pages this
+/// is 4 MiB of output per piece. The bound matters more than it might look — a guest
+/// I/O round-trip needs *several* trips through the event loop, so its latency ends
+/// up a multiple of this, not equal to it. An earlier 32 MiB piece size measured at
+/// ~38ms per piece and starved guest I/O completely for the length of a round.
+/// Smaller costs one extra walk over the memory slots per piece, which is cheap
+/// beside the writes.
+const PRECOPY_CHUNK_PAGES: u64 = 1024;
+
+/// A pre-copy request that the current VM state or configuration does not permit.
+fn precopy_not_allowed(reason: &str) -> VmmActionError {
+    CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(reason.into())).into()
 }
 
 fn mmds_patch_data(
@@ -501,6 +532,8 @@ impl<'a> PrebootApiController<'a> {
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
+            | PrecopySnapshot(_)
+            | FinalizeSnapshot(_)
             | FlushMetrics
             | Pause
             | Resume
@@ -703,6 +736,8 @@ impl RuntimeApiController {
         match request {
             // Supported operations allowed post-boot.
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
+            PrecopySnapshot(precopy_cfg) => self.precopy_snapshot(&precopy_cfg, event_manager),
+            FinalizeSnapshot(finalize_cfg) => self.finalize_snapshot(&finalize_cfg),
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
                 .vmm
@@ -926,45 +961,8 @@ impl RuntimeApiController {
         }
 
         let mut locked_vmm = self.vmm.lock().unwrap();
-        let create_start_us = get_time_us(ClockType::Monotonic);
-
-        if create_params.precopy {
-            if create_params.snapshot_type != SnapshotType::Diff {
-                return Err(
-                    CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-                        "pre-copy is only available for differential snapshots".into(),
-                    ))
-                    .into(),
-                );
-            }
-            if locked_vmm.instance_info.state != VmState::Running {
-                return Err(
-                    CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-                        "pre-copy requires a running microVM".into(),
-                    ))
-                    .into(),
-                );
-            }
-
-            let kvm_vm = locked_vmm.vm.as_kvm().ok_or_else(|| {
-                CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-                    "snapshot requires KVM".into(),
-                ))
-            })?;
-            kvm_vm
-                .precopy_memory_to_file(&create_params.mem_file_path, locked_vmm.overlay_files())?;
-            locked_vmm
-                .device_manager
-                .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
-
-            info!(
-                "'pre-copy diff snapshot' VMM action took {} us.",
-                get_time_us(ClockType::Monotonic) - create_start_us
-            );
-            return Ok(VmmData::Empty);
-        }
-
         let vm_info = VmInfo::from(&*locked_vmm);
+        let create_start_us = get_time_us(ClockType::Monotonic);
 
         create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
 
@@ -990,6 +988,186 @@ impl RuntimeApiController {
                 );
             }
         }
+        Ok(VmmData::Empty)
+    }
+
+    /// Runs one pre-copy round.
+    ///
+    /// The vCPUs are stopped only to take and to measure the dirty epoch; the actual
+    /// memory output happens with the guest running. Crucially, it also happens off
+    /// this thread: `handle_request` runs on the event-manager thread, so a copy
+    /// performed inline would stop every virtio queue, timer and API request for its
+    /// whole duration — exactly the disruption pre-copy exists to avoid. Instead the
+    /// copy is handed to a worker and this thread pumps the event loop until it
+    /// finishes.
+    ///
+    /// The VMM lock is deliberately released while pumping: [`Vmm`] is itself an
+    /// event subscriber, so holding it across `event_manager.run_with_timeout` would
+    /// deadlock the moment one of its events fired.
+    fn precopy_snapshot(
+        &mut self,
+        params: &PrecopySnapshotParams,
+        event_manager: &mut EventManager,
+    ) -> Result<VmmData, VmmActionError> {
+        log_dev_preview_warning("Virtual machine diff snapshots", None);
+        let start_us = get_time_us(ClockType::Monotonic);
+
+        // Phase 1: stop the guest, take the epoch, start it again. Harvesting under
+        // pause makes the epoch exact and removes any race between clearing a dirty
+        // bit and the write that set it.
+        let (kvm_vm, guest_memory, mut file, dirty_bitmap, copied_dirty_pages) = {
+            let mut vmm = self.vmm.lock().expect("Poisoned lock");
+
+            // Either state is fine post-boot: a round leaves the microVM paused so
+            // that its page counts are exact, and the next round starts it again. A
+            // caller therefore loops without having to issue `PATCH /vm` itself.
+            if vmm.instance_info.state == VmState::NotStarted {
+                return Err(precopy_not_allowed("pre-copy requires a booted microVM"));
+            }
+
+            let kvm_vm = vmm
+                .vm
+                .as_kvm()
+                .ok_or_else(|| precopy_not_allowed("snapshot requires KVM"))?
+                .clone();
+
+            if !kvm_vm.dirty_page_tracking_enabled() {
+                return Err(precopy_not_allowed(
+                    "pre-copy requires dirty page tracking; set track_dirty_pages when \
+                     configuring the machine",
+                ));
+            }
+
+            let file =
+                kvm_vm.open_snapshot_memory_file(&params.mem_file_path, vmm.overlay_files())?;
+            // Record the target before copying anything: once the epoch below is
+            // harvested those pages exist only in this file, so the finalizing request
+            // has to be held to it even if this round then fails.
+            vmm.set_precopy_target(&file)
+                .map_err(|err| CreateSnapshotError::MemoryBackingFile("metadata", err))?;
+
+            if vmm.instance_info.state == VmState::Running {
+                vmm.pause_vm().map_err(VmmActionError::InternalVmm)?;
+            }
+            let epoch = kvm_vm.get_precopy_dirty_bitmap();
+            // Resume regardless of how the harvest went, so a failure here cannot leave
+            // the guest silently stopped. The copy below needs it running anyway: that
+            // is what makes this a pre-copy rather than another stop-the-world dump.
+            let resume = vmm.resume_vm().map_err(VmmActionError::InternalVmm);
+            let dirty_bitmap = epoch.map_err(CreateSnapshotError::DirtyBitmap)?;
+            resume?;
+
+            let copied_dirty_pages = count_dirty_bits(&dirty_bitmap);
+            let guest_memory = kvm_vm.guest_memory().clone();
+            (kvm_vm, guest_memory, file, dirty_bitmap, copied_dirty_pages)
+        };
+
+        // Phase 2: write the epoch a piece at a time, returning to the event loop
+        // between pieces so virtio queues and timers keep being serviced. No VMM lock
+        // is held here — `Vmm` is itself an event subscriber, so holding it across
+        // `run_with_timeout` would deadlock on its first event.
+        let copy = (|| -> Result<(), CreateSnapshotError> {
+            for piece in DirtyEpochPieces::new(&dirty_bitmap, PRECOPY_CHUNK_PAGES) {
+                precopy_piece_to_file(&guest_memory, &mut file, &piece)?;
+                // Non-blocking: service whatever is ready, do not wait for more.
+                event_manager
+                    .run_with_timeout(0)
+                    .map_err(CreateSnapshotError::PrecopyEventLoop)?;
+            }
+            file.flush()
+                .map_err(|err| CreateSnapshotError::MemoryBackingFile("flush", err))?;
+            file.sync_all()
+                .map_err(|err| CreateSnapshotError::MemoryBackingFile("sync_all", err))
+        })();
+
+        if let Err(err) = copy {
+            // Hand the whole epoch back, not just the piece that failed: the pieces
+            // after it were never written either, and those pages now exist nowhere
+            // else. The next round re-copies all of them.
+            guest_memory.store_dirty_bitmap(&dirty_bitmap, host_page_size());
+            // Leave the guest as the caller expects a failed round to leave it.
+            let mut vmm = self.vmm.lock().expect("Poisoned lock");
+            if vmm.instance_info.state == VmState::Running {
+                vmm.pause_vm().map_err(VmmActionError::InternalVmm)?;
+            }
+            return Err(err.into());
+        }
+
+        // Phase 3: stop the guest and measure what the round left behind. The caller
+        // uses this to decide whether another round is worth it.
+        let remaining_dirty_pages = {
+            let mut vmm = self.vmm.lock().expect("Poisoned lock");
+
+            vmm.pause_vm().map_err(VmmActionError::InternalVmm)?;
+
+            // Queue rings are written by Firecracker without being marked dirty at
+            // runtime, and the harvest above cleared whatever marked them last time.
+            // Re-mark before counting, so the next round (or the finalizing request)
+            // copies them and the count the caller sees includes them.
+            vmm.device_manager
+                .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+
+            kvm_vm
+                .count_dirty_pages()
+                .map_err(CreateSnapshotError::DirtyBitmap)?
+        };
+
+        let elapsed_time_us =
+            update_metric_with_elapsed_time(&METRICS.latencies_us.vmm_precopy_snapshot, start_us);
+        info!("'pre-copy snapshot round' VMM action took {elapsed_time_us} us.");
+
+        Ok(VmmData::PrecopyStats(PrecopyStats {
+            copied_dirty_pages,
+            remaining_dirty_pages,
+            page_size_bytes: host_page_size(),
+        }))
+    }
+
+    /// Closes a pre-copy chain.
+    ///
+    /// Pauses the microVM, writes its state, and copies the final dirty epoch into the
+    /// memory file the rounds accumulated into. Leaves the microVM paused. Valid with
+    /// no preceding rounds, in which case it is an ordinary paused diff snapshot.
+    fn finalize_snapshot(
+        &mut self,
+        params: &FinalizeSnapshotParams,
+    ) -> Result<VmmData, VmmActionError> {
+        log_dev_preview_warning("Virtual machine diff snapshots", None);
+        let start_us = get_time_us(ClockType::Monotonic);
+
+        let mut vmm = self.vmm.lock().expect("Poisoned lock");
+
+        // Completed rounds already committed pages to their memory file and cleared the
+        // dirty tracking for them. Finalizing onto a different file would leave those
+        // pages in neither file, producing a layer that looks valid and restores into a
+        // corrupt guest, so refuse rather than let it through.
+        if !vmm
+            .is_precopy_target_path(&params.mem_file_path)
+            .map_err(|err| CreateSnapshotError::MemoryBackingFile("metadata", err))?
+        {
+            return Err(precopy_not_allowed(
+                "the finalizing memory file differs from the one the pre-copy rounds wrote to; \
+                 the accumulated rounds would be lost",
+            ));
+        }
+
+        if vmm.instance_info.state != VmState::Paused {
+            vmm.pause_vm().map_err(VmmActionError::InternalVmm)?;
+        }
+
+        let vm_info = VmInfo::from(&*vmm);
+        let create_params = CreateSnapshotParams {
+            snapshot_type: SnapshotType::Diff,
+            snapshot_path: params.snapshot_path.clone(),
+            mem_file_path: params.mem_file_path.clone(),
+        };
+        create_snapshot(&mut vmm, &vm_info, &create_params)?;
+        vmm.clear_precopy_target();
+
+        let elapsed_time_us =
+            update_metric_with_elapsed_time(&METRICS.latencies_us.vmm_finalize_snapshot, start_us);
+        info!("'finalize pre-copy snapshot' VMM action took {elapsed_time_us} us.");
+
         Ok(VmmData::Empty)
     }
 
@@ -1277,7 +1455,6 @@ mod tests {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
-                precopy: false,
             },
         )));
         #[cfg(target_arch = "x86_64")]

@@ -26,6 +26,17 @@ and this project adheres to
   a network filesystem. The base and every overlay file back live guest memory
   and must remain immutable while the microVM runs. See the
   [snapshotting documentation](docs/snapshotting/snapshot-support.md).
+- Added `PUT /snapshot/precopy` and `PUT /snapshot/precopy/finalize`, which build a
+  diff snapshot across several rounds instead of one stop-the-world pause. Each
+  `precopy` round copies the memory dirtied since the previous round while the
+  vCPUs keep executing — and off the event loop, so virtio queues keep being
+  serviced — then pauses the microVM and reports the exact number of pages
+  dirtied during the copy. Callers repeat until that number is small enough, then
+  `precopy/finalize` pauses, writes the microVM state, and copies the last epoch.
+  This moves the bulk of memory output out of the pause: the final stop-the-world
+  window is bounded by the last round's leftovers rather than the whole dirty
+  working set. Requires `track_dirty_pages`. `PUT /snapshot/create` is unchanged.
+  See the [snapshotting documentation](docs/snapshotting/snapshot-support.md).
 
 ### Changed
 

@@ -1147,6 +1147,12 @@ class Microvm:
             snapshot_path=str(vmstate_path),
             snapshot_type=snapshot_type.api_type,
         )
+        return self._snapshot_object(snapshot_type, mem_path, vmstate_path)
+
+    def _snapshot_object(
+        self, snapshot_type: SnapshotType, mem_path: str, vmstate_path: str
+    ):
+        """Describe snapshot files the microVM has just written."""
         root = Path(self.chroot())
         return Snapshot(
             vmstate=root / vmstate_path,
@@ -1173,6 +1179,28 @@ class Microvm:
         return self.make_snapshot(
             SnapshotType.FULL, mem_path=mem_path, vmstate_path=vmstate_path
         )
+
+    def precopy_round(self, *, mem_path: str = "mem") -> dict:
+        """Run one pre-copy round, returning its page counts.
+
+        The microVM runs during the copy and is left paused, as the API does; the
+        next round resumes it.
+        """
+        return self.api.snapshot_precopy.put(mem_file_path=str(mem_path)).json()
+
+    def snapshot_precopy_finalize(
+        self, *, mem_path: str = "mem", vmstate_path="vmstate"
+    ):
+        """Close a pre-copy chain, producing a Diff snapshot.
+
+        Pauses the microVM itself and leaves it paused.
+        """
+        if self.memory_monitor:
+            self.memory_monitor.set_threshold_for_snapshot()
+        self.api.snapshot_precopy_finalize.put(
+            mem_file_path=str(mem_path), snapshot_path=str(vmstate_path)
+        )
+        return self._snapshot_object(SnapshotType.DIFF, mem_path, vmstate_path)
 
     def restore_from_snapshot(
         self,

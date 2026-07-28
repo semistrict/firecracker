@@ -108,7 +108,9 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "network-interfaces", Some(body)) => {
                 parse_put_net(body, path_tokens.next())
             }
-            (Method::Put, "snapshot", Some(body)) => parse_put_snapshot(body, path_tokens.next()),
+            (Method::Put, "snapshot", Some(body)) => {
+                parse_put_snapshot(body, path_tokens.next(), path_tokens.next())
+            }
             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
             (Method::Put, "entropy", Some(body)) => parse_put_entropy(body),
             (Method::Put, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {
@@ -211,6 +213,7 @@ impl ParsedRequest {
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+                VmmData::PrecopyStats(stats) => Self::success_response_with_data(stats),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -629,6 +632,9 @@ pub mod tests {
                     &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
                     200,
                 ),
+                VmmData::PrecopyStats(stats) => {
+                    http_response(&serde_json::to_string(stats).unwrap(), 200)
+                }
             };
             let response = ParsedRequest::convert_to_response(&data);
             response.write_all(&mut buf).unwrap();

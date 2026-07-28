@@ -660,6 +660,10 @@ pub struct PerformanceMetrics {
     pub full_create_snapshot: SharedStoreMetric,
     /// Measures the snapshot diff create time, at the API (user) level, in microseconds.
     pub diff_create_snapshot: SharedStoreMetric,
+    /// Measures one pre-copy round, at the API (user) level, in microseconds.
+    pub precopy_snapshot: SharedStoreMetric,
+    /// Measures the pre-copy finalizing request, at the API (user) level, in microseconds.
+    pub finalize_snapshot: SharedStoreMetric,
     /// Measures the snapshot load time, at the API (user) level, in microseconds.
     pub load_snapshot: SharedStoreMetric,
     /// Measures the microVM pausing duration, at the API (user) level, in microseconds.
@@ -670,6 +674,10 @@ pub struct PerformanceMetrics {
     pub vmm_full_create_snapshot: SharedStoreMetric,
     /// Measures the snapshot diff create time, at the VMM level, in microseconds.
     pub vmm_diff_create_snapshot: SharedStoreMetric,
+    /// Measures one pre-copy round, at the VMM level, in microseconds.
+    pub vmm_precopy_snapshot: SharedStoreMetric,
+    /// Measures the pre-copy finalizing request, at the VMM level, in microseconds.
+    pub vmm_finalize_snapshot: SharedStoreMetric,
     /// Measures the snapshot load time, at the VMM level, in microseconds.
     pub vmm_load_snapshot: SharedStoreMetric,
     /// Measures the microVM pausing duration, at the VMM level, in microseconds.
@@ -683,11 +691,15 @@ impl PerformanceMetrics {
         Self {
             full_create_snapshot: SharedStoreMetric::new(),
             diff_create_snapshot: SharedStoreMetric::new(),
+            precopy_snapshot: SharedStoreMetric::new(),
+            finalize_snapshot: SharedStoreMetric::new(),
             load_snapshot: SharedStoreMetric::new(),
             pause_vm: SharedStoreMetric::new(),
             resume_vm: SharedStoreMetric::new(),
             vmm_full_create_snapshot: SharedStoreMetric::new(),
             vmm_diff_create_snapshot: SharedStoreMetric::new(),
+            vmm_precopy_snapshot: SharedStoreMetric::new(),
+            vmm_finalize_snapshot: SharedStoreMetric::new(),
             vmm_load_snapshot: SharedStoreMetric::new(),
             vmm_pause_vm: SharedStoreMetric::new(),
             vmm_resume_vm: SharedStoreMetric::new(),

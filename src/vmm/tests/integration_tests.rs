@@ -246,7 +246,6 @@ fn verify_create_snapshot(
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_file_path: memory_file.as_path().to_path_buf(),
-        precopy: false,
     };
 
     controller

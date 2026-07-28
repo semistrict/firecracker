@@ -45,11 +45,42 @@ pub struct CreateSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
     pub mem_file_path: PathBuf,
-    /// Copy one differential-memory batch while the microVM is running.
-    /// No VM state file is produced; a normal paused differential snapshot
-    /// must finalize the same memory file.
-    #[serde(default)]
-    pub precopy: bool,
+}
+
+/// Stores the configuration used for a single running pre-copy round.
+///
+/// A round copies the memory dirtied since the previous round into `mem_file_path`
+/// while the vCPUs keep executing. The chain is closed by a finalizing request
+/// naming the same memory file.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrecopySnapshotParams {
+    /// Path to the file that accumulates the guest memory across rounds.
+    pub mem_file_path: PathBuf,
+}
+
+/// Stores the configuration used to close a pre-copy chain.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeSnapshotParams {
+    /// Path to the file that will contain the microVM state.
+    pub snapshot_path: PathBuf,
+    /// Path to the file that accumulates the guest memory. Must be the same file
+    /// the preceding pre-copy rounds wrote to.
+    pub mem_file_path: PathBuf,
+}
+
+/// Outcome of a single pre-copy round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PrecopyStats {
+    /// Guest pages copied by this round.
+    pub copied_dirty_pages: u64,
+    /// Guest pages still dirty now that the round has finished, i.e. the work the
+    /// next round (or the finalizing request) will have to copy. Measured with the
+    /// microVM paused, so it is exact rather than a moving estimate.
+    pub remaining_dirty_pages: u64,
+    /// Size in bytes of the pages counted by the two fields above.
+    pub page_size_bytes: usize,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

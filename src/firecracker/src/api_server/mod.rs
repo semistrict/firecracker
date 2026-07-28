@@ -150,7 +150,6 @@ impl ApiServer {
         request_processing_start_us: u64,
     ) -> Response {
         let metric_with_action = match *vmm_action {
-            VmmAction::CreateSnapshot(ref params) if params.precopy => None,
             VmmAction::CreateSnapshot(ref params) => match params.snapshot_type {
                 SnapshotType::Full => Some((
                     &METRICS.latencies_us.full_create_snapshot,
@@ -161,6 +160,14 @@ impl ApiServer {
                     "create diff snapshot",
                 )),
             },
+            VmmAction::PrecopySnapshot(_) => Some((
+                &METRICS.latencies_us.precopy_snapshot,
+                "pre-copy snapshot round",
+            )),
+            VmmAction::FinalizeSnapshot(_) => Some((
+                &METRICS.latencies_us.finalize_snapshot,
+                "finalize pre-copy snapshot",
+            )),
             VmmAction::LoadSnapshot(_) => {
                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))
             }
@@ -278,7 +285,6 @@ mod tests {
                 snapshot_type: SnapshotType::Diff,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
-                precopy: false,
             })),
             start_time_us,
         );
@@ -292,7 +298,6 @@ mod tests {
                 snapshot_type: SnapshotType::Diff,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
-                precopy: false,
             })),
             start_time_us,
         );

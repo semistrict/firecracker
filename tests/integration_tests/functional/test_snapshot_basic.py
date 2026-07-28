@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -622,10 +623,11 @@ def test_load_snapshot_with_overlays_balloon_reporting(uvm, microvm_factory):
     assert echo == "still_alive\n"
 
 
-@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
-def test_diff_snapshot_precopy(uvm, microvm_factory):
-    """A final diff preserves writes made after a running pre-copy round."""
-    vm = uvm
+def _precopy_uvm(vm):
+    """Boot `vm` with a console and dirty page tracking, ready for pre-copy."""
+    # A round deliberately spends far longer in the API call than an ordinary
+    # request: that is where the memory output now happens.
+    vm.time_api_requests = False
     vm.help.enable_console()
     vm.spawn(serial_out_path=None)
     vm.basic_config(track_dirty_pages=True)
@@ -633,39 +635,47 @@ def test_diff_snapshot_precopy(uvm, microvm_factory):
     serial.open()
     vm.start()
     serial.rx(vm.distro.shell_prompt)
+    return serial
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_diff_snapshot_precopy(uvm, microvm_factory):
+    """Pre-copy rounds plus a finalize reproduce the guest exactly.
+
+    Covers both halves of the chain: data written *before* a round must survive
+    in the pages that round copied, and data written *during* a round must
+    survive in the epoch the finalize picks up.
+    """
+    vm = uvm
+    serial = _precopy_uvm(vm)
 
     base = vm.snapshot_diff(mem_path="base.mem", vmstate_path="base.vmstate")
     vm.resume()
 
-    serial.tx("echo before > /tmp/precopy-state")
+    # Written before any round: only reaches the snapshot via a round's copy.
+    serial.tx("echo copied-by-round > /tmp/precopy-before")
     serial.rx(vm.distro.shell_prompt)
-    with pytest.raises(
-        RuntimeError, match="pre-copy is only available for differential snapshots"
-    ):
-        vm.api.snapshot_create.put(
-            mem_file_path="invalid.mem",
-            snapshot_path="invalid.vmstate",
-            snapshot_type="Full",
-            precopy=True,
-        )
 
-    vm.api.snapshot_create.put(
-        mem_file_path="diff.mem",
-        snapshot_path="unused.vmstate",
-        snapshot_type="Diff",
-        precopy=True,
+    first = vm.precopy_round(mem_path="diff.mem")
+    assert first["page_size_bytes"] > 0
+    assert first["copied_dirty_pages"] > 0, first
+    # The round wrote the pages it claimed to.
+    assert (Path(vm.chroot()) / "diff.mem").stat().st_blocks > 0
+
+    # A round leaves the microVM paused; the next one resumes it.
+    assert vm.state == "Paused"
+
+    # Written after the first round: only reaches the snapshot via the finalize.
+    second = vm.precopy_round(mem_path="diff.mem")
+    assert second["copied_dirty_pages"] > 0, second
+    vm.resume()
+    serial.tx("echo copied-by-finalize > /tmp/precopy-after")
+    serial.rx(vm.distro.shell_prompt)
+
+    diff = vm.snapshot_precopy_finalize(
+        mem_path="diff.mem", vmstate_path="diff.vmstate"
     )
-    serial.tx("echo after > /tmp/precopy-state")
-    serial.rx(vm.distro.shell_prompt)
-
-    diff = vm.snapshot_diff(mem_path="diff.mem", vmstate_path="diff.vmstate")
-    with pytest.raises(RuntimeError, match="pre-copy requires a running microVM"):
-        vm.api.snapshot_create.put(
-            mem_file_path="invalid.mem",
-            snapshot_path="invalid.vmstate",
-            snapshot_type="Diff",
-            precopy=True,
-        )
+    assert vm.state == "Paused"
 
     rebased = diff.rebase_snapshot(base, binary_dir=vm.fc_binary_path.parent)
     restored = microvm_factory.build()
@@ -675,9 +685,133 @@ def test_diff_snapshot_precopy(uvm, microvm_factory):
     restored_serial.open()
     restored.restore_from_snapshot(rebased, resume=True)
     restored_serial.drain_until_idle()
-    restored_serial.tx("cat /tmp/precopy-state")
+    restored_serial.tx("cat /tmp/precopy-before /tmp/precopy-after")
     contents = restored_serial.rx(restored.distro.shell_prompt)
-    assert "after" in contents
+    assert "copied-by-round" in contents
+    assert "copied-by-finalize" in contents
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_diff_snapshot_precopy_rejects_bad_requests(uvm):
+    """Pre-copy refuses the states and inputs that would corrupt a chain."""
+    vm = uvm
+    _precopy_uvm(vm)
+
+    vm.precopy_round(mem_path="diff.mem")
+    # A round leaves the microVM paused and the next one starts it again, so a
+    # paused microVM is not by itself an error.
+    assert vm.state == "Paused"
+    vm.precopy_round(mem_path="diff.mem")
+
+    # Finalizing onto a different memory file would orphan everything the rounds
+    # already committed, leaving a layer that restores into a corrupt guest.
+    with pytest.raises(RuntimeError, match="differs from the one the pre-copy rounds"):
+        vm.api.snapshot_precopy_finalize.put(
+            mem_file_path="other.mem", snapshot_path="diff.vmstate"
+        )
+
+    # The rejection must not have consumed the chain: the correct file still works.
+    vm.snapshot_precopy_finalize(mem_path="diff.mem", vmstate_path="diff.vmstate")
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_diff_snapshot_precopy_requires_dirty_page_tracking(uvm):
+    """Without dirty tracking a round would copy all of guest memory, twice."""
+    vm = uvm
+    vm.time_api_requests = False
+    vm.spawn()
+    vm.basic_config(track_dirty_pages=False)
+    vm.start()
+
+    with pytest.raises(RuntimeError, match="requires dirty page tracking"):
+        vm.api.snapshot_precopy.put(mem_file_path="diff.mem")
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_diff_snapshot_precopy_serves_io_during_copy(uvm):
+    """Guest I/O keeps flowing while a round copies memory.
+
+    This is the property the whole design exists for, and the one a pause-time
+    measurement cannot see. `handle_request` runs on the event-manager thread, so
+    a round that wrote its epoch in one go would freeze every virtio queue for the
+    length of a multi-GiB write while still reporting a short pause — strictly
+    worse, for a guest doing I/O, than the stop-the-world diff it replaces.
+
+    Measured from inside the guest, as a gap: a loop fsyncs to a virtio-blk device
+    as fast as it can and timestamps every iteration, so a stalled queue shows up
+    directly as a hole in the timestamps. Comparing the largest hole against the
+    round's duration needs no host/guest clock correlation, and no assumption
+    about how fast the loop runs on a given host.
+    """
+    vm = uvm
+    vm.time_api_requests = False
+    vm.spawn()
+    # /dev/shm below is half of guest RAM and has to hold the dirtying workload;
+    # the round must last long enough for a stall to be distinguishable from the
+    # loop's own jitter.
+    vm.basic_config(vcpu_count=2, mem_size_mib=4096, track_dirty_pages=True)
+    vm.add_net_iface()
+    scratch = drive_tools.FilesystemFile(str(Path(vm.path) / "scratch"), size=128)
+    vm.add_drive("scratch", scratch.path)
+    vm.start()
+
+    # The rootfs is a read-only squashfs, so the mount point has to live on tmpfs.
+    vm.ssh.check_output("mkdir -p /tmp/scratch && mount /dev/vdb /tmp/scratch")
+
+    # Clear the dirty log first, so the measured round copies what the guest
+    # dirties below rather than all of boot.
+    vm.snapshot_diff(mem_path="base.mem", vmstate_path="base.vmstate")
+    vm.resume()
+    vm.ssh.check_output("dd if=/dev/urandom of=/dev/shm/dirty bs=1M count=1900")
+
+    # Each iteration is a real virtio-blk round-trip: append, then flush to the
+    # device. `sync` is what makes the timestamp depend on the queue being served.
+    vm.ssh.check_output(
+        "nohup sh -c 'while true; do date +%s%N >> /tmp/scratch/beats; sync; done' "
+        ">/dev/null 2>&1 </dev/null & sleep 2"
+    )
+
+    round_start = time.monotonic()
+    stats = vm.precopy_round(mem_path="diff.mem")
+    round_s = time.monotonic() - round_start
+
+    vm.resume()
+    time.sleep(2)
+    # No need to stop the loop; reading a prefix while it appends is fine, and a
+    # torn final line is dropped by the digit filter below. Killing it by pattern
+    # would match this very ssh command line.
+    _, beats_raw, _ = vm.ssh.check_output("cat /tmp/scratch/beats")
+
+    beats = [int(line) for line in beats_raw.split() if line.isdigit()]
+    gaps_s = sorted(
+        (b - a) / 1e9 for a, b in zip(beats, beats[1:]) if b > a
+    )
+    copied_mib = stats["copied_dirty_pages"] * stats["page_size_bytes"] / (1024 * 1024)
+
+    assert len(gaps_s) > 50, f"guest I/O loop barely ran ({len(gaps_s)} samples)"
+    assert round_s > 0.5, (
+        f"round finished in {round_s:.2f}s after writing {copied_mib:.0f} MiB — too "
+        "quick to tell a stall from jitter"
+    )
+
+    # The whole question: was there ever a hole as long as the copy? If the copy
+    # had run uninterrupted on the event-manager thread there would be exactly one,
+    # spanning the round. Half the round is well clear of normal jitter, which is
+    # milliseconds.
+    worst_gap_s = gaps_s[-1]
+    logging.info(
+        "pre-copy round: %.2fs, %.0f MiB, worst guest I/O gap %.0fms, median %.1fms",
+        round_s,
+        copied_mib,
+        worst_gap_s * 1000,
+        gaps_s[len(gaps_s) // 2] * 1000,
+    )
+    assert worst_gap_s < round_s / 2, (
+        f"guest I/O stalled for {worst_gap_s:.2f}s during a {round_s:.2f}s pre-copy "
+        f"round that wrote {copied_mib:.0f} MiB — virtio was starved while the copy "
+        f"ran (median gap {gaps_s[len(gaps_s) // 2] * 1000:.1f}ms over "
+        f"{len(gaps_s)} samples)"
+    )
 
 
 def test_snapshot_overwrite_self(uvm, microvm_factory):

@@ -24,6 +24,10 @@ ITERATIONS = 30
 DIFF_SNAPSHOT_ITERATIONS = 10
 DIFF_SNAPSHOT_DIRTY_MIB = [1024, 2048, 4096]
 DIFF_SNAPSHOT_MAX_OVERHEAD_MIB = 128
+# Rounds run before finalizing. One round moves the bulk of the dirty set; a
+# second shows whether the leftovers converge or the guest simply out-dirties
+# the copy.
+DIFF_SNAPSHOT_PRECOPY_ROUNDS = 2
 
 pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 
@@ -318,7 +322,18 @@ def test_snapshot_create_latency(
 )
 @pytest.mark.parametrize("precopy", [False, True], ids=["stop_copy", "precopy"])
 def test_diff_snapshot_pause_time(uvm, metrics, dirty_mib, precopy, pci_enabled):
-    """Measure total and longest VM pauses during incremental snapshots."""
+    """Measure how long the guest is stopped while taking incremental snapshots.
+
+    Reports two different things, because pre-copy trades one for the other:
+
+    - `longest_pause` is the worst single stop-the-world window, which is what
+      pre-copy is meant to shrink.
+    - `total_stopped_time` is every interval the guest was not executing across
+      the whole snapshot, including the gaps between pre-copy rounds where the
+      microVM sits paused while the caller decides whether to run another. Those
+      gaps are real downtime and can outweigh what pre-copy saved, so measuring
+      only the final window would flatter it.
+    """
 
     if pci_enabled:
         pytest.skip("Incremental snapshot pause baseline uses MMIO")
@@ -355,7 +370,7 @@ def test_diff_snapshot_pause_time(uvm, metrics, dirty_mib, precopy, pci_enabled)
     (root / "base.mem").unlink()
     (root / "base.vmstate").unlink()
 
-    total_paused_ns = 0
+    total_stopped_ns = 0
     longest_pause_ns = 0
     for iteration in range(DIFF_SNAPSHOT_ITERATIONS):
         serial.tx(f"/usr/local/bin/fillmem {dirty_mib}; cat /tmp/fillmem_output.txt")
@@ -366,27 +381,35 @@ def test_diff_snapshot_pause_time(uvm, metrics, dirty_mib, precopy, pci_enabled)
         vmstate_path = f"diff-{iteration}.vmstate"
 
         if precopy:
+            # Each round returns with the microVM paused, so the guest is stopped
+            # from that return until the next round (or the finalize) resumes it.
+            # Charge that gap to the snapshot: it is downtime the caller causes by
+            # being in the loop, and it is exactly what a naive "time the final
+            # pause" measurement would miss.
+            for _ in range(DIFF_SNAPSHOT_PRECOPY_ROUNDS):
+                vm.precopy_round(mem_path=mem_path)
+                stopped_start = time.monotonic_ns()
+                vm.resume()
+                gap_ns = time.monotonic_ns() - stopped_start
+                total_stopped_ns += gap_ns
+                longest_pause_ns = max(longest_pause_ns, gap_ns)
+
+            stopped_start = time.monotonic_ns()
+            vm.snapshot_precopy_finalize(mem_path=mem_path, vmstate_path=vmstate_path)
+            vm.resume()
+        else:
+            stopped_start = time.monotonic_ns()
+            vm.pause()
             vm.api.snapshot_create.put(
                 mem_file_path=mem_path,
                 snapshot_path=vmstate_path,
                 snapshot_type="Diff",
-                precopy=True,
             )
+            vm.resume()
 
-        pause_start = time.monotonic_ns()
-        vm.pause()
-
-        vm.api.snapshot_create.put(
-            mem_file_path=mem_path,
-            snapshot_path=vmstate_path,
-            snapshot_type="Diff",
-        )
-
-        vm.resume()
-        paused_ns = time.monotonic_ns() - pause_start
-
-        total_paused_ns += paused_ns
-        longest_pause_ns = max(longest_pause_ns, paused_ns)
+        stopped_ns = time.monotonic_ns() - stopped_start
+        total_stopped_ns += stopped_ns
+        longest_pause_ns = max(longest_pause_ns, stopped_ns)
 
         allocated_bytes = (root / mem_path).stat().st_blocks * BYTES_PER_DISK_BLOCK
         expected_bytes = dirty_mib * BYTES_PER_MIB
@@ -400,12 +423,19 @@ def test_diff_snapshot_pause_time(uvm, metrics, dirty_mib, precopy, pci_enabled)
         (root / mem_path).unlink()
         (root / vmstate_path).unlink()
 
-        assert expected_bytes <= allocated_bytes <= max_expected_bytes, (
+        # Pre-copy re-copies whatever the guest re-dirties between rounds, so it
+        # only has a lower bound in common with stop-copy.
+        assert allocated_bytes >= expected_bytes, (
             f"Incremental memory layer allocated {allocated_bytes} bytes; expected "
-            f"{expected_bytes}..{max_expected_bytes} bytes"
+            f"at least {expected_bytes} bytes"
         )
+        if not precopy:
+            assert allocated_bytes <= max_expected_bytes, (
+                f"Incremental memory layer allocated {allocated_bytes} bytes; "
+                f"expected at most {max_expected_bytes} bytes"
+            )
 
     metrics.put_metric(
-        "total_paused_time", total_paused_ns / NS_IN_MSEC, "Milliseconds"
+        "total_stopped_time", total_stopped_ns / NS_IN_MSEC, "Milliseconds"
     )
     metrics.put_metric("longest_pause", longest_pause_ns / NS_IN_MSEC, "Milliseconds")

@@ -5,8 +5,8 @@ use serde::de::Error as DeserializeError;
 use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotConfig, LoadSnapshotParams, MemBackendConfig, MemBackendType,
-    Vm, VmState,
+    CreateSnapshotParams, FinalizeSnapshotParams, LoadSnapshotConfig, LoadSnapshotParams,
+    MemBackendConfig, MemBackendType, PrecopySnapshotParams, Vm, VmState,
 };
 
 use super::super::parsed_request::{ParsedRequest, RequestError};
@@ -29,17 +29,23 @@ pub const UFFD_WITH_OVERLAYS: &str =
 pub(crate) fn parse_put_snapshot(
     body: &Body,
     request_type_from_path: Option<&str>,
+    sub_request_type_from_path: Option<&str>,
 ) -> Result<ParsedRequest, RequestError> {
-    match request_type_from_path {
-        Some(request_type) => match request_type {
-            "create" => parse_put_snapshot_create(body),
-            "load" => parse_put_snapshot_load(body),
-            _ => Err(RequestError::InvalidPathMethod(
-                format!("/snapshot/{}", request_type),
-                Method::Put,
-            )),
-        },
-        None => Err(RequestError::Generic(
+    let unknown = |suffix: &str| {
+        Err(RequestError::InvalidPathMethod(
+            format!("/snapshot{suffix}"),
+            Method::Put,
+        ))
+    };
+
+    match (request_type_from_path, sub_request_type_from_path) {
+        (Some("create"), None) => parse_put_snapshot_create(body),
+        (Some("load"), None) => parse_put_snapshot_load(body),
+        (Some("precopy"), None) => parse_put_snapshot_precopy(body),
+        (Some("precopy"), Some("finalize")) => parse_put_snapshot_finalize(body),
+        (Some(request_type), None) => unknown(&format!("/{request_type}")),
+        (Some(request_type), Some(sub_type)) => unknown(&format!("/{request_type}/{sub_type}")),
+        (None, _) => Err(RequestError::Generic(
             StatusCode::BadRequest,
             "Missing snapshot operation type.".to_string(),
         )),
@@ -59,6 +65,20 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
+    )))
+}
+
+fn parse_put_snapshot_precopy(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let precopy_config = serde_json::from_slice::<PrecopySnapshotParams>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::PrecopySnapshot(
+        precopy_config,
+    )))
+}
+
+fn parse_put_snapshot_finalize(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let finalize_config = serde_json::from_slice::<FinalizeSnapshotParams>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::FinalizeSnapshot(
+        finalize_config,
     )))
 }
 
@@ -152,17 +172,17 @@ mod tests {
         let body = r#"{
             "snapshot_type": "Diff",
             "snapshot_path": "foo",
-            "mem_file_path": "bar",
-            "precopy": true
+            "mem_file_path": "bar"
         }"#;
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
-            precopy: true,
         };
         assert_eq!(
-            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            vmm_action_from_request(
+                parse_put_snapshot(&Body::new(body), Some("create"), None).unwrap()
+            ),
             VmmAction::CreateSnapshot(expected_config)
         );
 
@@ -174,10 +194,11 @@ mod tests {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
-            precopy: false,
         };
         assert_eq!(
-            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            vmm_action_from_request(
+                parse_put_snapshot(&Body::new(body), Some("create"), None).unwrap()
+            ),
             VmmAction::CreateSnapshot(expected_config)
         );
 
@@ -185,7 +206,7 @@ mod tests {
             "invalid_field": "foo",
             "mem_file_path": "bar"
         }"#;
-        parse_put_snapshot(&Body::new(invalid_body), Some("create")).unwrap_err();
+        parse_put_snapshot(&Body::new(invalid_body), Some("create"), None).unwrap_err();
 
         let body = r#"{
             "snapshot_path": "foo",
@@ -207,7 +228,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
         };
-        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load"), None).unwrap();
         assert!(
             parsed_request
                 .parsing_info()
@@ -240,7 +261,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
         };
-        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load"), None).unwrap();
         assert!(
             parsed_request
                 .parsing_info()
@@ -273,7 +294,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
         };
-        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load"), None).unwrap();
         assert!(
             parsed_request
                 .parsing_info()
@@ -315,7 +336,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
         };
-        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load"), None).unwrap();
         assert!(
             parsed_request
                 .parsing_info()
@@ -345,7 +366,7 @@ mod tests {
             vsock_override: None,
             clock_realtime: false,
         };
-        let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        let parsed_request = parse_put_snapshot(&Body::new(body), Some("load"), None).unwrap();
         assert_eq!(
             depr_action_from_req(parsed_request, Some(LOAD_DEPRECATION_MESSAGE.to_string())),
             VmmAction::LoadSnapshot(expected_config)
@@ -358,7 +379,7 @@ mod tests {
             }
         }"#;
         assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("load"))
+            parse_put_snapshot(&Body::new(body), Some("load"), None)
                 .err()
                 .unwrap()
                 .to_string(),
@@ -373,7 +394,7 @@ mod tests {
             }
         }"#;
         assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("load"))
+            parse_put_snapshot(&Body::new(body), Some("load"), None)
                 .err()
                 .unwrap()
                 .to_string(),
@@ -390,7 +411,7 @@ mod tests {
             }
         }"#;
         assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("load"))
+            parse_put_snapshot(&Body::new(body), Some("load"), None)
                 .err()
                 .unwrap()
                 .to_string(),
@@ -402,7 +423,7 @@ mod tests {
             "snapshot_path": "foo"
         }"#;
         assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("load"))
+            parse_put_snapshot(&Body::new(body), Some("load"), None)
                 .err()
                 .unwrap()
                 .to_string(),
@@ -417,15 +438,65 @@ mod tests {
             }
         }"#;
         assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("load"))
+            parse_put_snapshot(&Body::new(body), Some("load"), None)
                 .err()
                 .unwrap()
                 .to_string(),
             "An error occurred when deserializing the json body of a request: missing field \
              `snapshot_path` at line 6 column 9."
         );
-        parse_put_snapshot(&Body::new(body), Some("invalid")).unwrap_err();
-        parse_put_snapshot(&Body::new(body), None).unwrap_err();
+        parse_put_snapshot(&Body::new(body), Some("invalid"), None).unwrap_err();
+        parse_put_snapshot(&Body::new(body), None, None).unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_precopy() {
+        use std::path::PathBuf;
+
+        let body = r#"{ "mem_file_path": "bar" }"#;
+        assert_eq!(
+            vmm_action_from_request(
+                parse_put_snapshot(&Body::new(body), Some("precopy"), None).unwrap()
+            ),
+            VmmAction::PrecopySnapshot(PrecopySnapshotParams {
+                mem_file_path: PathBuf::from("bar"),
+            })
+        );
+
+        // A round writes no VM state, so `snapshot_path` is not part of the request.
+        let with_snapshot_path = r#"{ "mem_file_path": "bar", "snapshot_path": "foo" }"#;
+        parse_put_snapshot(&Body::new(with_snapshot_path), Some("precopy"), None).unwrap_err();
+
+        parse_put_snapshot(&Body::new(r#"{}"#), Some("precopy"), None).unwrap_err();
+        parse_put_snapshot(&Body::new(body), Some("precopy"), Some("bogus")).unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_finalize() {
+        use std::path::PathBuf;
+
+        let body = r#"{ "mem_file_path": "bar", "snapshot_path": "foo" }"#;
+        assert_eq!(
+            vmm_action_from_request(
+                parse_put_snapshot(&Body::new(body), Some("precopy"), Some("finalize")).unwrap()
+            ),
+            VmmAction::FinalizeSnapshot(FinalizeSnapshotParams {
+                snapshot_path: PathBuf::from("foo"),
+                mem_file_path: PathBuf::from("bar"),
+            })
+        );
+
+        // Finalizing writes the VM state, so both paths are required.
+        parse_put_snapshot(
+            &Body::new(r#"{ "mem_file_path": "bar" }"#),
+            Some("precopy"),
+            Some("finalize"),
+        )
+        .unwrap_err();
+
+        // `finalize` only exists underneath `precopy`.
+        parse_put_snapshot(&Body::new(body), Some("finalize"), None).unwrap_err();
+        parse_put_snapshot(&Body::new(body), Some("create"), Some("finalize")).unwrap_err();
     }
 
     #[test]
@@ -454,7 +525,9 @@ mod tests {
             clock_realtime: false,
         };
         assert_eq!(
-            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("load")).unwrap()),
+            vmm_action_from_request(
+                parse_put_snapshot(&Body::new(body), Some("load"), None).unwrap()
+            ),
             VmmAction::LoadSnapshot(expected_config)
         );
     }
@@ -470,7 +543,7 @@ mod tests {
             }
         }"#;
         assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("load"))
+            parse_put_snapshot(&Body::new(body), Some("load"), None)
                 .err()
                 .unwrap()
                 .to_string(),
