@@ -96,6 +96,7 @@ mod tests {
         let r = vmm_action_from_request(parse_put_pmem(&Body::new(body), Some("1000")).unwrap());
 
         let expected_config = PmemConfig {
+            managed: None,
             id: "1000".to_string(),
             path_on_host: "dummy".to_string(),
             root_device: true,

@@ -247,6 +247,7 @@ fn verify_create_snapshot(
         false => SnapshotType::Full,
     };
     let snapshot_params = CreateSnapshotParams {
+        managed: false,
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_file_path: memory_file.as_path().to_path_buf(),
@@ -308,6 +309,7 @@ fn verify_load_snapshot(
 
     preboot_api_controller
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            pmem_overrides: Vec::new(),
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
@@ -380,6 +382,7 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
 
     let error = preboot_api_controller
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            pmem_overrides: Vec::new(),
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
@@ -453,6 +456,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
 
     // Load snapshot should no longer be allowed.
     let req = VmmAction::LoadSnapshot(LoadSnapshotParams {
+        pmem_overrides: Vec::new(),
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_backend: MemBackendConfig {
             backend_path: memory_file.as_path().to_path_buf(),

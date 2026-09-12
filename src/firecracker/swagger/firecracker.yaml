@@ -1304,7 +1304,6 @@ definitions:
     type: object
     required:
       - id
-      - path_on_host
     properties:
       id:
         type: string
@@ -1314,6 +1313,9 @@ definitions:
         type: string
         description:
           Host level path for the virtio-pmem device to use as a backing file.
+          Required unless managed is specified. Must be empty for managed backing.
+      managed:
+        $ref: "#/definitions/ManagedPmem"
       root_device:
         type: boolean
         description:
@@ -1326,6 +1328,30 @@ definitions:
       rate_limiter:
         $ref: "#/definitions/RateLimiter"
 
+  ManagedMemory:
+    type: object
+    required:
+      - socket_path
+    properties:
+      socket_path:
+        type: string
+        description: Local pager socket. Requires the sproutfs-memory build feature.
+
+  ManagedPmem:
+    type: object
+    required:
+      - socket_path
+      - length
+    properties:
+      socket_path:
+        type: string
+        description: Local pager socket. Requires the sproutfs-memory build feature.
+      length:
+        type: integer
+        format: int64
+        minimum: 2097152
+        description: Exposed volume bytes. Must be a multiple of 2 MiB.
+
   Error:
     type: object
     properties:
@@ -1337,6 +1363,8 @@ definitions:
   FullVmConfiguration:
     type: object
     properties:
+      managed-memory:
+        $ref: "#/definitions/ManagedMemory"
       balloon:
         $ref: "#/definitions/Balloon"
       drives:
@@ -1500,6 +1528,7 @@ definitions:
         enum:
           - File
           - Uffd
+          - Sproutfs
       backend_path:
         type: string
         description: Based on 'backend_type' it is either
@@ -1507,6 +1536,7 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults
+          3) A Sproutfs pager socket serving the managed RAM layout from this snapshot.
 
   Metrics:
     type: object
@@ -1664,12 +1694,20 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description: Path to the guest memory file. Required for ordinary snapshots and forbidden for managed captures.
+      managed:
+        type: boolean
+        default: false
+        description:
+          Prepare a coordinated managed capture. Requires Full, managed RAM and
+          managed PMEM devices. Paused vCPUs and sealed volumes remain stopped
+          after this request; the host must publish matching volume cuts and
+          VMM state before unsealing and resuming. This request alone does not
+          publish a durable VM snapshot.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
@@ -1724,6 +1762,19 @@ definitions:
         description:
           The new path for the backing Unix Domain Socket.
 
+  PmemOverride:
+    type: object
+    required:
+      - id
+      - socket_path
+    properties:
+      id:
+        type: string
+        description: Managed PMEM device ID from the captured configuration.
+      socket_path:
+        type: string
+        description: Destination pager socket. Its exposed length must match the snapshot.
+
   SnapshotLoadParams:
     type: object
     description:
@@ -1764,6 +1815,11 @@ definitions:
         description: Network host device names to override
         items:
           $ref: "#/definitions/NetworkOverride"
+      pmem_overrides:
+        type: array
+        description: Exactly one explicit destination for every managed PMEM device in the snapshot.
+        items:
+          $ref: "#/definitions/PmemOverride"
       vsock_override:
         $ref: "#/definitions/VsockOverride"
         description:

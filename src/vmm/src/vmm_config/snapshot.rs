@@ -29,6 +29,8 @@ pub enum SnapshotType {
 ///    Firecracker to handle its guest memory page faults.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub enum MemBackendType {
+    /// Guest memory mappings are owned by the volume pager.
+    Sproutfs,
     /// Guest memory contents will be loaded from a file.
     File,
     /// Guest memory will be served through UFFD by a separate process.
@@ -39,6 +41,10 @@ pub enum MemBackendType {
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSnapshotParams {
+    /// Prepare a host-coordinated volume capture without exporting a RAM file.
+    /// The host publishes the durable group descriptor after this stage.
+    #[serde(default)]
+    pub managed: bool,
     /// This marks the type of snapshot we want to create.
     /// The default value is `Full`, which means a full snapshot.
     #[serde(default = "SnapshotType::default")]
@@ -46,6 +52,7 @@ pub struct CreateSnapshotParams {
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
+    #[serde(default)]
     pub mem_file_path: PathBuf,
     /// Whether to fsync the snapshot state and guest memory files.
     /// Activated virtio-block devices are always fsync'd, independently of this.
@@ -105,6 +112,8 @@ impl SnapshotLoadHugePageConfig {
 /// Stores the configuration that will be used for loading a snapshot.
 #[derive(Debug, PartialEq, Eq)]
 pub struct LoadSnapshotParams {
+    /// New local sockets for every managed PMEM volume in the saved state.
+    pub pmem_overrides: Vec<PmemOverride>,
     /// Path to the file that contains the microVM state to be loaded.
     pub snapshot_path: PathBuf,
     /// Specifies guest memory backend configuration.
@@ -131,6 +140,9 @@ pub struct LoadSnapshotParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadSnapshotConfig {
+    /// New local sockets for every managed PMEM volume in the saved state.
+    #[serde(default)]
+    pub pmem_overrides: Vec<PmemOverride>,
     /// Path to the file that contains the microVM state to be loaded.
     pub snapshot_path: PathBuf,
     /// Path to the file that contains the guest memory to be loaded. To be used only if
@@ -173,6 +185,16 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+}
+
+/// Reattaches a managed PMEM device to a host-authorized volume endpoint.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PmemOverride {
+    /// Existing device ID in the saved VM state.
+    pub id: String,
+    /// Destination pager socket; size and device semantics remain unchanged.
+    pub socket_path: PathBuf,
 }
 
 /// The microVM state options.

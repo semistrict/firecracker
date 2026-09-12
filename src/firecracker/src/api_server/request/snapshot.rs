@@ -54,6 +54,11 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
+    if !snapshot_config.managed && snapshot_config.mem_file_path.as_os_str().is_empty() {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            "mem_file_path is required for a file snapshot",
+        )));
+    }
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
@@ -103,6 +108,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
     };
 
     let snapshot_params = LoadSnapshotParams {
+        pmem_overrides: snapshot_config.pmem_overrides,
         snapshot_path: snapshot_config.snapshot_path,
         mem_backend,
         #[allow(deprecated)]
@@ -147,6 +153,7 @@ mod tests {
             "mem_file_path": "bar"
         }"#;
         let expected_config = CreateSnapshotParams {
+            managed: false,
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
@@ -164,6 +171,7 @@ mod tests {
             "sync_snapshot_files": false
         }"#;
         let expected_config = CreateSnapshotParams {
+            managed: false,
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
@@ -179,6 +187,7 @@ mod tests {
             "mem_file_path": "bar"
         }"#;
         let expected_config = CreateSnapshotParams {
+            managed: false,
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
@@ -204,6 +213,7 @@ mod tests {
             "huge_pages": "2M"
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_overrides: Vec::new(),
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
@@ -237,6 +247,7 @@ mod tests {
             "track_dirty_pages": true
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_overrides: Vec::new(),
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
@@ -271,6 +282,7 @@ mod tests {
             "huge_pages": "Snapshot"
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_overrides: Vec::new(),
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
@@ -310,6 +322,7 @@ mod tests {
             ]
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_overrides: Vec::new(),
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
@@ -343,6 +356,7 @@ mod tests {
             "resume_vm": true
         }"#;
         let expected_config = LoadSnapshotParams {
+            pmem_overrides: Vec::new(),
             snapshot_path: PathBuf::from("foo"),
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),

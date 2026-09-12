@@ -19,6 +19,7 @@ bench = false
 tracing = ["log-instrument", "utils/tracing", "vmm/tracing"]
 fuzzing = ["vmm/fuzzing"]
 gdb = ["vmm/gdb"]
+sproutfs-memory = ["vmm/sproutfs-memory"]
 
 [dependencies]
 displaydoc = "0.2.6"

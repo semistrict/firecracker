@@ -46,6 +46,9 @@ const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HU
 /// Errors associated with dumping guest memory to file.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MemoryError {
+    /// Managed memory: {0}
+    #[cfg(feature = "sproutfs-memory")]
+    Managed(std::io::Error),
     /// Cannot dump memory: {0}
     WriteMemory(GuestMemoryError),
     /// Cannot create mmap region: {0}
@@ -327,7 +330,9 @@ unsafe impl Sync for RawGuestRegionMmap {}
 #[derive(Debug)]
 pub struct GuestRegionMmap {
     /// Held for its `Drop` impl which unmaps the guest memory region.
-    _region: RawGuestRegionMmap,
+    _region: Option<RawGuestRegionMmap>,
+    #[cfg(feature = "sproutfs-memory")]
+    _managed: Option<Arc<crate::managed_memory::Owner>>,
     proxy: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>,
 }
 
@@ -340,6 +345,12 @@ impl Deref for GuestRegionMmap {
 }
 
 impl GuestRegionMmap {
+    /// Pager owner, when this mapping is externally managed.
+    #[cfg(feature = "sproutfs-memory")]
+    pub fn managed_owner(&self) -> Option<&Arc<crate::managed_memory::Owner>> {
+        self._managed.as_ref()
+    }
+
     /// Creates a new [GuestRegionMmap], by actually allocating the guest memory with the given properties.
     fn allocate(
         guest_base: GuestAddress,
@@ -386,8 +397,36 @@ impl GuestRegionMmap {
         assert!(region.mmap_size >= mmap_region.size());
 
         Ok(GuestRegionMmap {
-            _region: region,
+            _region: Some(region),
+            #[cfg(feature = "sproutfs-memory")]
+            _managed: None,
             proxy: vm_memory::GuestRegionMmap::new(mmap_region, guest_base)
+                .ok_or(MemoryError::VmMemoryError)?,
+        })
+    }
+
+    /// Wraps a pager-owned range. The proxy never unmaps the owner's memory.
+    #[cfg(feature = "sproutfs-memory")]
+    pub(crate) fn managed(
+        guest_base: GuestAddress,
+        region: sproutfs_vm_memory::Region,
+        owner: Arc<crate::managed_memory::Owner>,
+        track_dirty_pages: bool,
+    ) -> Result<Self, MemoryError> {
+        let builder = MmapRegionBuilder::new_with_bitmap(
+            region.len,
+            track_dirty_pages.then(|| AtomicBitmap::with_len(region.len)),
+        )
+        .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
+        // SAFETY: Owner retains this valid mapping for the entire proxy lifetime.
+        // KVM invalidation and synchronous UFFD protect mapping replacements.
+        let builder = unsafe { builder.with_raw_mmap_pointer(region.address as *mut u8) };
+        let mapping = builder.build().map_err(MemoryError::MmapRegionError)?;
+        assert!(!mapping.owned());
+        Ok(Self {
+            _region: None,
+            _managed: Some(owner),
+            proxy: vm_memory::GuestRegionMmap::new(mapping, guest_base)
                 .ok_or(MemoryError::VmMemoryError)?,
         })
     }

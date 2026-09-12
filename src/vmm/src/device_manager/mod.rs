@@ -401,6 +401,48 @@ impl DeviceManager {
         });
     }
 
+    /// Finish PMEM completions before saving device and vCPU state. Workers
+    /// for different volumes have already issued their requests independently.
+    #[cfg(feature = "sproutfs-memory")]
+    pub fn drain_managed_pmem(
+        &self,
+    ) -> Result<(), crate::devices::virtio::pmem::device::PmemError> {
+        let mut result = Ok(());
+        self.for_each_virtio_device_mut(|_, device| {
+            if let Some(pmem) = device.as_mut_any().downcast_mut::<Pmem>()
+                && let Err(err) = pmem.drain_managed_flush(true)
+            {
+                result = Err(err);
+            }
+        });
+        result
+    }
+
+    /// Returns disk owners, requiring every disk to participate in the cut.
+    #[cfg(feature = "sproutfs-memory")]
+    pub fn managed_disk_owners(&self) -> Result<Vec<Arc<crate::managed_memory::Owner>>, String> {
+        let mut owners = Vec::new();
+        let mut error = None;
+        self.for_each_virtio_device(|kind, device| {
+            if kind == VirtioDeviceType::Block {
+                error = Some("managed captures require volume-backed PMEM disks".into());
+            }
+            if let Some(pmem) = device.as_any().downcast_ref::<Pmem>() {
+                if let Some(owner) = pmem.mmap.managed_owner() {
+                    owners.push(owner.clone());
+                } else {
+                    error =
+                        Some("ordinary PMEM files cannot participate in a managed capture".into());
+                }
+            }
+        });
+        if let Some(error) = error {
+            Err(error)
+        } else {
+            Ok(owners)
+        }
+    }
+
     /// Get a VirtIO device of type `virtio_type` with ID `device_id`
     pub fn get_virtio_device(
         &self,
@@ -501,6 +543,13 @@ impl DeviceManager {
         vm: Arc<KvmVm>,
         config: PmemConfig,
     ) -> Result<Arc<Mutex<dyn VirtioDevice>>, VmmActionError> {
+        if config.managed.is_some() {
+            return Err(PmemConfigError::File(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "managed PMEM must be attached before VM start",
+            ))
+            .into());
+        }
         if config.root_device {
             return Err(PmemConfigError::AddingSecondRootDevice.into());
         }

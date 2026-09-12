@@ -146,6 +146,18 @@ pub fn build_microvm_for_boot(
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    #[cfg(feature = "sproutfs-memory")]
+    if vm_resources.managed_memory.is_some()
+        || vm_resources
+            .pmem
+            .configs
+            .iter()
+            .any(|config| config.managed.is_some())
+    {
+        crate::managed_memory::configure_worker_policy(seccomp_filters).map_err(|err| {
+            StartMicrovmError::GuestMemory(crate::vstate::memory::MemoryError::Managed(err))
+        })?;
+    }
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
 

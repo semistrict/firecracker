@@ -38,6 +38,8 @@ use crate::vstate::memory::{GuestRegionMmap, MemoryError};
 /// Errors encountered when configuring microVM resources.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ResourcesError {
+    /// Invalid managed memory configuration: {0}
+    ManagedMemory(String),
     /// Balloon device error: {0}
     BalloonDevice(#[from] BalloonConfigError),
     /// Block device error: {0}
@@ -83,6 +85,7 @@ pub enum CustomCpuTemplateOrPath {
 #[serde(rename_all = "kebab-case")]
 #[allow(missing_docs)]
 pub struct VmmConfig {
+    pub managed_memory: Option<ManagedMemoryConfig>,
     pub balloon: Option<BalloonDeviceConfig>,
     pub drives: Vec<BlockDeviceConfig>,
     pub boot_source: BootSourceConfig,
@@ -102,10 +105,20 @@ pub struct VmmConfig {
     pub memory_hotplug: Option<MemoryHotplugConfig>,
 }
 
+/// Local pager socket for cold-boot RAM. Layout comes from the architecture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedMemoryConfig {
+    /// Socket accessible inside the VM's jail.
+    pub socket_path: PathBuf,
+}
+
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 #[derive(Debug, Default)]
 pub struct VmResources {
+    /// Optional host-managed RAM backing.
+    pub managed_memory: Option<ManagedMemoryConfig>,
     /// The vCpu and memory configuration for this microVM.
     pub machine_config: MachineConfig,
     /// The boot source spec (contains both config and builder) for this microVM.
@@ -173,6 +186,13 @@ impl VmResources {
             mmds_size_limit,
             ..Default::default()
         };
+        #[cfg(not(feature = "sproutfs-memory"))]
+        if vmm_config.managed_memory.is_some() {
+            return Err(ResourcesError::ManagedMemory(
+                "binary lacks managed-memory support".into(),
+            ));
+        }
+        resources.managed_memory = vmm_config.managed_memory;
         if let Some(machine_config) = vmm_config.machine_config {
             let machine_config = MachineConfigUpdate::from(machine_config);
             resources.update_machine_config(&machine_config)?;
@@ -485,6 +505,28 @@ impl VmResources {
         &self,
         regions: &[(GuestAddress, usize)],
     ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+        #[cfg(feature = "sproutfs-memory")]
+        if let Some(config) = &self.managed_memory {
+            use crate::vmm_config::drive::FileEngineType;
+            if self.balloon.get().is_some()
+                || self.memory_hotplug.is_some()
+                || self.machine_config.huge_pages
+                    != crate::vmm_config::machine_config::HugePageConfig::Hugetlbfs2M
+                || self.block.configs().iter().any(|drive| {
+                    drive.socket.is_some() || drive.file_engine_type == Some(FileEngineType::Async)
+                })
+            {
+                return Err(MemoryError::Managed(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "managed RAM requires 2 MiB HugeTLB pages and does not support ballooning, hotplug, vhost-user or asynchronous block I/O",
+                )));
+            }
+            return crate::managed_memory::ram(
+                config,
+                regions,
+                self.machine_config.track_dirty_pages,
+            );
+        }
         let vhost_user_device_used = self
             .block
             .devices
@@ -538,6 +580,7 @@ impl VmResources {
 impl From<&VmResources> for VmmConfig {
     fn from(resources: &VmResources) -> Self {
         VmmConfig {
+            managed_memory: resources.managed_memory.clone(),
             balloon: resources.balloon.get_config().ok(),
             drives: resources.block.configs(),
             boot_source: resources.boot_source.config.clone(),
@@ -654,6 +697,7 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
+            managed_memory: None,
             machine_config: MachineConfig::default(),
             boot_source: default_boot_cfg(),
             block: default_blocks(),
