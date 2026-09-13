@@ -226,8 +226,11 @@ impl PmemMmap {
 
     fn flush(&self) -> std::io::Result<()> {
         #[cfg(feature = "sproutfs-memory")]
-        if let Some(owner) = &self.managed {
-            return owner.flush(0);
+        if self.managed.is_some() {
+            // A managed volume's durability is the host's interval cut, taken
+            // under a vCPU pause, so a guest flush neither fences nor triggers
+            // anything. It succeeds here and costs nothing.
+            return Ok(());
         }
         // SAFETY: The mmap remains live for self's lifetime.
         if unsafe {
@@ -341,11 +344,6 @@ impl Drop for PmemMmap {
 
 #[derive(Debug)]
 pub struct Pmem {
-    // Join the worker before dropping the slot/mapping it keeps alive.
-    #[cfg(feature = "sproutfs-memory")]
-    pub(super) managed_flush: Option<super::managed::FlushWorker>,
-    #[cfg(feature = "sproutfs-memory")]
-    pending_flush: Vec<(u16, GuestAddress)>,
     // VirtIO fields
     pub avail_features: u64,
     pub acked_features: u64,
@@ -388,14 +386,6 @@ impl Pmem {
         config_space: Option<ConfigSpace>,
     ) -> Result<Self, PmemError> {
         let mmap = PmemMmap::from_config(&config)?;
-        #[cfg(feature = "sproutfs-memory")]
-        let managed_flush = mmap
-            .managed
-            .as_ref()
-            .map(|owner| super::managed::FlushWorker::new(owner.clone()))
-            .transpose()
-            .map_err(PmemError::BackingFile)?;
-
         let guest_region = match config_space {
             Some(cs) => {
                 if cs.size != mmap.mmap_len {
@@ -420,10 +410,6 @@ impl Pmem {
             .unwrap_or_default();
 
         Ok(Self {
-            #[cfg(feature = "sproutfs-memory")]
-            managed_flush,
-            #[cfg(feature = "sproutfs-memory")]
-            pending_flush: Vec::new(),
             avail_features: 1u64 << VIRTIO_F_VERSION_1,
             acked_features,
             activate_event: EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?,
@@ -440,10 +426,6 @@ impl Pmem {
     }
 
     pub fn handle_queue(&mut self) -> Result<(), PmemError> {
-        #[cfg(feature = "sproutfs-memory")]
-        if !self.pending_flush.is_empty() {
-            return Ok(());
-        }
         // This is safe since we checked in the event handler that the device is activated.
         let active_state = self.device_state.active_state().unwrap();
 
@@ -468,11 +450,6 @@ impl Pmem {
             self.rate_limiter.manual_replenish(1, TokenType::Ops);
             self.metrics.rate_limiter_throttled_events.inc();
             return Ok(());
-        }
-
-        #[cfg(feature = "sproutfs-memory")]
-        if self.managed_flush.is_some() {
-            return self.start_managed_flush();
         }
 
         let mut cached_result = None;
@@ -557,86 +534,6 @@ impl Pmem {
         }
 
         Ok(status_descriptor.addr)
-    }
-
-    #[cfg(feature = "sproutfs-memory")]
-    fn start_managed_flush(&mut self) -> Result<(), PmemError> {
-        // Freeze a bounded batch before issuing its durability request. New
-        // descriptors submitted during that request belong to the next cut.
-        for _ in 0..PMEM_QUEUE_SIZE {
-            let Some(head) = self.queues[0].pop()? else {
-                break;
-            };
-            match self.status_address(head) {
-                Ok(address) => self.pending_flush.push((head.index, address)),
-                Err(err) => {
-                    error!("pmem: {err}");
-                    self.metrics.event_fails.inc();
-                    self.queues[0].add_used(head.index, 0)?;
-                }
-            }
-        }
-        self.publish_managed_completions();
-        if !self.pending_flush.is_empty()
-            && let Err(err) = self.managed_flush.as_ref().unwrap().submit()
-        {
-            self.complete_managed_batch(FAILURE)?;
-            return Err(PmemError::BackingFile(err));
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "sproutfs-memory")]
-    fn publish_managed_completions(&mut self) {
-        self.queues[0].advance_used_ring_idx();
-        if self.queues[0].prepare_kick()
-            && let Err(err) = self
-                .device_state
-                .active_state()
-                .unwrap()
-                .interrupt
-                .trigger(VirtioInterruptType::Queue(0))
-        {
-            error!("pmem: {err}");
-            self.metrics.event_fails.inc();
-        }
-    }
-
-    /// Completes in-flight durability before capturing device or vCPU state.
-    #[cfg(feature = "sproutfs-memory")]
-    pub fn drain_managed_flush(&mut self, wait: bool) -> Result<(), PmemError> {
-        if self.pending_flush.is_empty() {
-            return Ok(());
-        }
-        let worker = self.managed_flush.as_ref().unwrap();
-        let Some(status) = worker.complete(wait).map_err(PmemError::BackingFile)? else {
-            return Ok(());
-        };
-        let _ = worker.event.read();
-        self.complete_managed_batch(status)
-    }
-
-    #[cfg(feature = "sproutfs-memory")]
-    fn complete_managed_batch(&mut self, status: i32) -> Result<(), PmemError> {
-        for (index, address) in std::mem::take(&mut self.pending_flush) {
-            let length = match self
-                .device_state
-                .active_state()
-                .unwrap()
-                .mem
-                .write_obj(status, address)
-            {
-                Ok(()) => 4,
-                Err(err) => {
-                    error!("pmem: {err}");
-                    self.metrics.event_fails.inc();
-                    0
-                }
-            };
-            self.queues[0].add_used(index, length)?;
-        }
-        self.publish_managed_completions();
-        Ok(())
     }
 
     /// Updates the parameters for the rate limiter.
@@ -822,64 +719,6 @@ mod tests {
             ..Default::default()
         };
         Pmem::new(vm.clone(), config).unwrap();
-    }
-
-    #[cfg(feature = "sproutfs-memory")]
-    #[test]
-    fn test_managed_batch_waits_for_its_cut_and_handles_malformed_requests() {
-        let vm = Arc::new(KvmVm::new(Kvm::new(vec![]).unwrap()).unwrap());
-        let file = TempFile::new().unwrap();
-        file.as_file().set_len(0x20_0000).unwrap();
-        let mut pmem = Pmem::new(
-            vm,
-            PmemConfig {
-                id: "batch".into(),
-                path_on_host: file.as_path().to_str().unwrap().into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let (worker, requests, results) =
-            crate::devices::virtio::pmem::managed::FlushWorker::controlled();
-        pmem.managed_flush = Some(worker);
-        let mem = default_mem();
-        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
-        pmem.queues[0] = vq.create_queue();
-        pmem.activate(mem.clone(), default_interrupt()).unwrap();
-        // Malformed request is returned without interpreting a status pointer.
-        vq.dtable[0].set(0x1000, 4, 0, 0);
-        mem.write_obj::<u32>(99, GuestAddress(0x1000)).unwrap();
-        vq.avail.ring[0].set(0);
-        // A valid request must remain untouched until its durability result.
-        vq.dtable[1].set(0x1100, 4, VIRTQ_DESC_F_NEXT, 2);
-        vq.dtable[2].set(0x2000, 4, VIRTQ_DESC_F_WRITE, 0);
-        mem.write_obj::<u32>(0, GuestAddress(0x1100)).unwrap();
-        mem.write_obj::<i32>(69, GuestAddress(0x2000)).unwrap();
-        vq.avail.ring[1].set(1);
-        vq.avail.idx.set(2);
-        pmem.start_managed_flush().unwrap();
-        requests.try_recv().unwrap();
-        assert_eq!(vq.used.idx.get(), 1);
-        pmem.drain_managed_flush(false).unwrap();
-        assert_eq!(mem.read_obj::<i32>(GuestAddress(0x2000)).unwrap(), 69);
-        // A later request is outside the already submitted cut.
-        vq.dtable[3].set(0x1100, 4, VIRTQ_DESC_F_NEXT, 4);
-        vq.dtable[4].set(0x2100, 4, VIRTQ_DESC_F_WRITE, 0);
-        mem.write_obj::<i32>(70, GuestAddress(0x2100)).unwrap();
-        vq.avail.ring[2].set(3);
-        vq.avail.idx.set(3);
-        results.send(FAILURE).unwrap();
-        pmem.drain_managed_flush(false).unwrap();
-        assert_eq!(mem.read_obj::<i32>(GuestAddress(0x2000)).unwrap(), FAILURE);
-        assert_eq!(mem.read_obj::<i32>(GuestAddress(0x2100)).unwrap(), 70);
-        assert_eq!(vq.used.idx.get(), 2);
-        pmem.start_managed_flush().unwrap();
-        requests.try_recv().unwrap();
-        results.send(0).unwrap();
-        pmem.drain_managed_flush(false).unwrap();
-        assert_eq!(mem.read_obj::<i32>(GuestAddress(0x2100)).unwrap(), 0);
-        assert_eq!(vq.used.idx.get(), 3);
-        assert!(pmem.pending_flush.is_empty());
     }
 
     #[test]

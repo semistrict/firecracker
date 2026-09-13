@@ -3,8 +3,6 @@
 
 pub mod device;
 pub mod event_handler;
-#[cfg(feature = "sproutfs-memory")]
-mod managed;
 pub mod metrics;
 pub mod persist;
 

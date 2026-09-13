@@ -33,7 +33,6 @@ pub fn configure_worker_policy(filters: &BpfThreadMap) -> io::Result<()> {
 /// The last owner can drop only after memory users have stopped. Guest RAM
 /// owns this through its mapping wrappers; PMEM owns it after its KVM slot.
 pub struct Owner {
-    worker_policy: Arc<BpfProgram>,
     socket_path: std::path::PathBuf,
     control: Control,
     regions: Vec<Region>,
@@ -52,11 +51,10 @@ impl std::fmt::Debug for Owner {
 impl Owner {
     /// Connects before exposing any mapping and starts a dedicated service.
     pub fn connect(path: &std::path::Path, specs: &[RegionSpec]) -> io::Result<Arc<Self>> {
-        let worker_policy = WORKER_POLICY
+        let service_policy = WORKER_POLICY
             .get()
             .ok_or_else(|| io::Error::other("memory-worker policy not configured"))?
             .clone();
-        let service_policy = worker_policy.clone();
         let mut session = Session::connect(path, specs)?;
         let regions = session.regions();
         let control = session.control();
@@ -81,7 +79,6 @@ impl Owner {
                 session
             })?;
         Ok(Arc::new(Self {
-            worker_policy,
             socket_path: path.to_owned(),
             control,
             regions,
@@ -99,20 +96,12 @@ impl Owner {
     pub fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
     }
-
-    /// Installs the same bounded syscall policy on a device durability worker.
-    pub fn apply_worker_policy(&self) -> io::Result<()> {
-        crate::seccomp::apply_filter(&self.worker_policy).map_err(io::Error::other)
-    }
-
-    /// Waits for ingestion of a region's stores and its volume quorum.
-    pub fn flush(&self, region: u64) -> io::Result<()> {
-        self.control.flush(region, Duration::from_secs(30))
-    }
 }
 
-/// Flush independently owned volume regions concurrently after guest CPUs and
-/// device mutations have stopped for a coordinated capture.
+/// Seal independently owned volume regions concurrently after guest CPUs and
+/// device mutations have stopped for a coordinated capture. Sealing moves no
+/// bytes: the host write-protects each region's dirty set and answers, and its
+/// checkpoint uploads those frames once the guest has resumed.
 pub fn seal_regions(regions: Vec<(Arc<Owner>, u64)>) -> io::Result<()> {
     let requests: Vec<_> = regions
         .iter()

@@ -401,23 +401,6 @@ impl DeviceManager {
         });
     }
 
-    /// Finish PMEM completions before saving device and vCPU state. Workers
-    /// for different volumes have already issued their requests independently.
-    #[cfg(feature = "sproutfs-memory")]
-    pub fn drain_managed_pmem(
-        &self,
-    ) -> Result<(), crate::devices::virtio::pmem::device::PmemError> {
-        let mut result = Ok(());
-        self.for_each_virtio_device_mut(|_, device| {
-            if let Some(pmem) = device.as_mut_any().downcast_mut::<Pmem>()
-                && let Err(err) = pmem.drain_managed_flush(true)
-            {
-                result = Err(err);
-            }
-        });
-        result
-    }
-
     /// Returns disk owners, requiring every disk to participate in the cut.
     #[cfg(feature = "sproutfs-memory")]
     pub fn managed_disk_owners(&self) -> Result<Vec<Arc<crate::managed_memory::Owner>>, String> {

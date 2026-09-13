@@ -194,24 +194,24 @@ pub fn create_snapshot(
                 "managed capture requires KVM".into(),
             ))
         })?;
-        let mut captures = Vec::new();
-        for (index, region) in vm.guest_memory().iter().enumerate() {
-            let owner = region.inner.managed_owner().ok_or_else(|| {
-                CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-                    "managed capture requires managed RAM".into(),
-                ))
-            })?;
-            captures.push((owner.clone(), index as u64));
+        if params.seal {
+            let mut captures = Vec::new();
+            for (index, region) in vm.guest_memory().iter().enumerate() {
+                let owner = region.inner.managed_owner().ok_or_else(|| {
+                    CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                        "managed capture requires managed RAM".into(),
+                    ))
+                })?;
+                captures.push((owner.clone(), index as u64));
+            }
+            for owner in vmm.device_manager.managed_disk_owners().map_err(|err| {
+                CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(err))
+            })? {
+                captures.push((owner, 0));
+            }
+            crate::managed_memory::seal_regions(captures)
+                .map_err(|err| CreateSnapshotError::Memory(MemoryError::Managed(err)))?;
         }
-        for owner in vmm
-            .device_manager
-            .managed_disk_owners()
-            .map_err(|err| CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(err)))?
-        {
-            captures.push((owner, 0));
-        }
-        crate::managed_memory::seal_regions(captures)
-            .map_err(|err| CreateSnapshotError::Memory(MemoryError::Managed(err)))?;
         return snapshot_state_to_file(
             &microvm_state,
             &params.snapshot_path,

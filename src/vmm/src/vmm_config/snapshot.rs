@@ -45,6 +45,12 @@ pub struct CreateSnapshotParams {
     /// The host publishes the durable group descriptor after this stage.
     #[serde(default)]
     pub managed: bool,
+    /// Whether a managed capture also seals every region's dirty set, which is
+    /// what its host then publishes. A capture the same VM resumes from seals; a
+    /// migration's stop does not, because the pages it would seal are the ones
+    /// the destination is about to fault out of this host's frames.
+    #[serde(default = "default_managed_seal")]
+    pub seal: bool,
     /// This marks the type of snapshot we want to create.
     /// The default value is `Full`, which means a full snapshot.
     #[serde(default = "SnapshotType::default")]
@@ -62,6 +68,12 @@ pub struct CreateSnapshotParams {
 
 /// Default value for [CreateSnapshotParams::sync_snapshot_files].
 fn default_sync_snapshot_files() -> bool {
+    true
+}
+
+/// Default value for [CreateSnapshotParams::seal]: a managed capture seals
+/// unless the caller says it is a migration's stop.
+fn default_managed_seal() -> bool {
     true
 }
 
