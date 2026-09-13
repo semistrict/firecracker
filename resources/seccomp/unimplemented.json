@@ -13,5 +13,10 @@
         "default_action": "allow",
         "filter_action": "trap",
         "filter": []
+    },
+    "memory": {
+        "default_action": "allow",
+        "filter_action": "trap",
+        "filter": []
     }
 }

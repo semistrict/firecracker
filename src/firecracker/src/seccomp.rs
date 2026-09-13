@@ -80,7 +80,7 @@ fn get_custom_filters<R: Read + Debug>(reader: R) -> Result<BpfThreadMap, Filter
 fn filter_thread_categories(map: BpfThreadMap) -> Result<BpfThreadMap, FilterError> {
     let (filters, invalid_filters): (BpfThreadMap, BpfThreadMap) = map
         .into_iter()
-        .partition(|(k, _)| THREAD_CATEGORIES.contains(&k.as_str()));
+        .partition(|(k, _)| THREAD_CATEGORIES.contains(&k.as_str()) || k == "memory");
     if !invalid_filters.is_empty() {
         // build the error message
         let mut thread_categories_string =
@@ -117,16 +117,18 @@ mod tests {
     #[test]
     fn test_get_filters() {
         let mut filters = get_empty_filters();
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 4);
         assert!(filters.remove("vmm").is_some());
         assert!(filters.remove("api").is_some());
         assert!(filters.remove("vcpu").is_some());
+        assert!(filters.remove("memory").is_some());
 
         let mut filters = get_empty_filters();
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 4);
         assert_eq!(filters.remove("vmm").unwrap().len(), 0);
         assert_eq!(filters.remove("api").unwrap().len(), 0);
         assert_eq!(filters.remove("vcpu").unwrap().len(), 0);
+        assert_eq!(filters.remove("memory").unwrap().len(), 0);
 
         let file = TempFile::new().unwrap().into_file();
 
@@ -142,6 +144,14 @@ mod tests {
         map.insert("api".to_string(), Arc::new(vec![]));
 
         assert_eq!(filter_thread_categories(map).unwrap().len(), 3);
+
+        // Ordinary custom policies may omit the optional worker category;
+        // managed attachment separately requires it before exposing memory.
+        assert!(
+            filter_thread_categories(get_empty_filters())
+                .unwrap()
+                .contains_key("memory")
+        );
 
         // invalid categories
         let mut map = BpfThreadMap::new();

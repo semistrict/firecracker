@@ -36,9 +36,12 @@ pub struct PmemDeviceUpdateConfig {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PmemConfig {
+    /// Host-managed backing, in place of an ordinary file.
+    pub managed: Option<ManagedPmemConfig>,
     /// Unique identifier of the device.
     pub id: String,
     /// Path of the drive.
+    #[serde(default)]
     pub path_on_host: String,
     /// Use this pmem device for rootfs
     #[serde(default)]
@@ -48,6 +51,16 @@ pub struct PmemConfig {
     pub read_only: bool,
     /// Rate Limiter for flush operations.
     pub rate_limiter: Option<RateLimiterConfig>,
+}
+
+/// Pager attachment and exact exposed PMEM length, including aligned padding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPmemConfig {
+    /// Pager socket accessible inside the jail.
+    pub socket_path: std::path::PathBuf,
+    /// Exposed bytes; must be a nonzero multiple of the PMEM alignment.
+    pub length: u64,
 }
 
 /// Wrapper for the collection that holds all the Pmem device configs.

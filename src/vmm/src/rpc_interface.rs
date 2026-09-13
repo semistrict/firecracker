@@ -1239,6 +1239,7 @@ mod tests {
         )));
         check_unsupported(preboot_request(VmmAction::CreateSnapshot(
             CreateSnapshotParams {
+                managed: false,
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
@@ -1326,6 +1327,7 @@ mod tests {
         )));
         check_unsupported(runtime_request(VmmAction::LoadSnapshot(
             LoadSnapshotParams {
+                pmem_overrides: Vec::new(),
                 snapshot_path: PathBuf::new(),
                 mem_backend: MemBackendConfig {
                     backend_type: MemBackendType::File,

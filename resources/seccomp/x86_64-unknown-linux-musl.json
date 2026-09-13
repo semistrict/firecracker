@@ -259,7 +259,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -279,7 +281,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -299,7 +303,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -319,7 +325,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -339,7 +347,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -359,7 +369,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -379,7 +391,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -797,11 +811,51 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
+            },
+            {
+                "syscall": "shutdown",
+                "comment": "Managed-memory control requests and orderly service shutdown"
+            },
+            {
+                "syscall": "getpid",
+                "comment": "GNU libc obtains the process ID when kicking a vCPU."
+            },
+            {
+                "syscall": "tgkill",
+                "comment": "GNU libc kicks vCPUs with tgkill instead of musl tkill.",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 34,
+                        "comment": "sigrtmin() + vcpu::VCPU_RTSIG_OFFSET"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Rust checks descriptor validity when closing snapshot files in debug builds.",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "F_GETFD"
+                    }
+                ]
+            },
+            {
+                "syscall": "fstatfs",
+                "comment": "Validate the managed arena is a 2 MiB HugeTLB memfd during restore."
             }
         ]
     },
@@ -878,8 +932,8 @@
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
             },
             {
-              "syscall": "getrandom",
-              "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
+                "syscall": "getrandom",
+                "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
             },
             {
                 "syscall": "accept4",
@@ -999,7 +1053,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -1019,7 +1075,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -1101,6 +1159,19 @@
             {
                 "syscall": "restart_syscall",
                 "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Rust checks API socket descriptor validity in debug builds.",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "F_GETFD"
+                    }
+                ]
             }
         ]
     },
@@ -1263,7 +1334,9 @@
                     {
                         "index": 2,
                         "type": "dword",
-                        "op": {"masked_eq": 4},
+                        "op": {
+                            "masked_eq": 4
+                        },
                         "val": 0,
                         "comment": "Ensure PROT_EXEC is not set"
                     }
@@ -1572,6 +1645,103 @@
                         "op": "eq",
                         "val": 1075883638,
                         "comment": "KVM_IRQFD"
+                    }
+                ]
+            }
+        ]
+    },
+    "memory": {
+        "default_action": "trap",
+        "filter_action": "allow",
+        "filter": [
+            {
+                "syscall": "read"
+            },
+            {
+                "syscall": "lseek"
+            },
+            {
+                "syscall": "write"
+            },
+            {
+                "syscall": "close"
+            },
+            {
+                "syscall": "recvfrom"
+            },
+            {
+                "syscall": "sendto"
+            },
+            {
+                "syscall": "shutdown"
+            },
+            {
+                "syscall": "mmap"
+            },
+            {
+                "syscall": "munmap"
+            },
+            {
+                "syscall": "mremap"
+            },
+            {
+                "syscall": "mprotect"
+            },
+            {
+                "syscall": "madvise"
+            },
+            {
+                "syscall": "brk"
+            },
+            {
+                "syscall": "futex"
+            },
+            {
+                "syscall": "sched_yield"
+            },
+            {
+                "syscall": "clock_gettime"
+            },
+            {
+                "syscall": "rt_sigreturn"
+            },
+            {
+                "syscall": "rt_sigprocmask"
+            },
+            {
+                "syscall": "sigaltstack"
+            },
+            {
+                "syscall": "exit"
+            },
+            {
+                "syscall": "exit_group"
+            },
+            {
+                "syscall": "restart_syscall"
+            },
+            {
+                "syscall": "gettid"
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3223366144
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3222841862
                     }
                 ]
             }

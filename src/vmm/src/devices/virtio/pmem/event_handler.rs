@@ -11,8 +11,24 @@ impl Pmem {
     const PROCESS_ACTIVATE: u32 = 0;
     const PROCESS_PMEM_QUEUE: u32 = 1;
     const PROCESS_RATE_LIMITER: u32 = 2;
+    #[cfg(feature = "sproutfs-memory")]
+    const PROCESS_MANAGED_FLUSH: u32 = 3;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
+        #[cfg(feature = "sproutfs-memory")]
+        if let Some(worker) = &self.managed_flush
+            && let Err(err) = ops.add(Events::with_data(
+                &worker.event,
+                Self::PROCESS_MANAGED_FLUSH,
+                EventSet::IN,
+            ))
+        {
+            error!("pmem: Failed to register durability completion: {err}");
+            // Losing this notification could leave an unbounded guest
+            // flush pending with no path to report its uncertain result.
+            #[allow(clippy::exit)]
+            std::process::exit(1);
+        }
         if let Err(err) = ops.add(Events::with_data(
             &self.queue_events[0],
             Self::PROCESS_PMEM_QUEUE,
@@ -92,6 +108,15 @@ impl MutEventSubscriber for Pmem {
         }
 
         match source {
+            #[cfg(feature = "sproutfs-memory")]
+            Self::PROCESS_MANAGED_FLUSH => {
+                if let Err(err) = self
+                    .drain_managed_flush(false)
+                    .and_then(|()| self.handle_queue())
+                {
+                    error!("pmem: Durability completion failed: {err}");
+                }
+            }
             Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
             Self::PROCESS_PMEM_QUEUE => self.process_queue(),
             Self::PROCESS_RATE_LIMITER => self.process_rate_limiter_event(),

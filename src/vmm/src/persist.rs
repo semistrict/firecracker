@@ -11,6 +11,8 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "sproutfs-memory")]
+use vm_memory::GuestMemoryBackend;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,8 @@ use crate::{EventManager, Vmm, vstate};
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct VmInfo {
+    /// RAM belongs to a coordinated volume capture, rather than a memory file.
+    pub managed_memory: bool,
     /// Guest memory size.
     pub mem_size_mib: u64,
     /// smt information
@@ -64,6 +68,7 @@ pub struct VmInfo {
 impl From<&VmResources> for VmInfo {
     fn from(value: &VmResources) -> Self {
         Self {
+            managed_memory: value.managed_memory.is_some(),
             mem_size_mib: value.machine_config.mem_size_mib as u64,
             smt: value.machine_config.smt,
             cpu_template: StaticCpuTemplate::from(&value.machine_config.cpu_template),
@@ -77,6 +82,7 @@ impl From<&Vmm> for VmInfo {
     fn from(value: &Vmm) -> Self {
         let machine_config = &value.machine_config;
         Self {
+            managed_memory: value.full_config().managed_memory.is_some(),
             mem_size_mib: machine_config.mem_size_mib as u64,
             smt: machine_config.smt,
             cpu_template: StaticCpuTemplate::from(&machine_config.cpu_template),
@@ -163,7 +169,7 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -171,6 +177,64 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    #[cfg(feature = "sproutfs-memory")]
+    if params.managed {
+        if !params.mem_file_path.as_os_str().is_empty()
+            || params.snapshot_type != crate::vmm_config::snapshot::SnapshotType::Full
+        {
+            return Err(CreateSnapshotError::MicrovmState(
+                MicrovmStateError::NotAllowed("managed captures do not take a memory file".into()),
+            ));
+        }
+        let microvm_state = vmm
+            .save_state(vm_info)
+            .map_err(CreateSnapshotError::MicrovmState)?;
+        let vm = vmm.vm.as_kvm().ok_or_else(|| {
+            CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                "managed capture requires KVM".into(),
+            ))
+        })?;
+        let mut captures = Vec::new();
+        for (index, region) in vm.guest_memory().iter().enumerate() {
+            let owner = region.inner.managed_owner().ok_or_else(|| {
+                CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                    "managed capture requires managed RAM".into(),
+                ))
+            })?;
+            captures.push((owner.clone(), index as u64));
+        }
+        for owner in vmm
+            .device_manager
+            .managed_disk_owners()
+            .map_err(|err| CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(err)))?
+        {
+            captures.push((owner, 0));
+        }
+        crate::managed_memory::seal_regions(captures)
+            .map_err(|err| CreateSnapshotError::Memory(MemoryError::Managed(err)))?;
+        return snapshot_state_to_file(
+            &microvm_state,
+            &params.snapshot_path,
+            params.sync_snapshot_files,
+        );
+    }
+    #[cfg(not(feature = "sproutfs-memory"))]
+    if params.managed {
+        return Err(CreateSnapshotError::MicrovmState(
+            MicrovmStateError::NotAllowed("binary lacks managed-memory support".into()),
+        ));
+    }
+    if vmm.full_config().managed_memory.is_some()
+        || vmm
+            .full_config()
+            .pmem_devices
+            .iter()
+            .any(|device| device.managed.is_some())
+    {
+        return Err(CreateSnapshotError::MicrovmState(
+            MicrovmStateError::NotAllowed("managed volumes require a coordinated capture".into()),
+        ));
+    }
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -367,6 +431,8 @@ pub enum RestoreFromSnapshotError {
 /// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum RestoreFromSnapshotGuestMemoryError {
+    /// Error creating managed guest memory: {0}
+    Managed(std::io::Error),
     /// Error creating guest memory from file: {0}
     File(#[from] GuestMemoryFromFileError),
     /// Error creating guest memory from uffd: {0}
@@ -382,6 +448,89 @@ pub fn restore_from_snapshot(
     vm_resources: &mut VmResources,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
     let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
+    if microvm_state.vm_info.managed_memory
+        != (params.mem_backend.backend_type == MemBackendType::Sproutfs)
+    {
+        return Err(
+            RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "snapshot memory ownership does not match restore backend",
+            ))
+            .into(),
+        );
+    }
+    #[cfg(feature = "sproutfs-memory")]
+    if params.mem_backend.backend_type == MemBackendType::Sproutfs {
+        crate::managed_memory::configure_worker_policy(seccomp_filters)
+            .map_err(RestoreFromSnapshotGuestMemoryError::Managed)?;
+        let unsupported = match &microvm_state.device_states.virtio_state {
+            VirtioDevicesState::Mmio(state) => {
+                !state.block_devices.is_empty()
+                    || state.balloon_device.is_some()
+                    || state.memory_device.is_some()
+            }
+            VirtioDevicesState::Pci(state) => {
+                !state.block_devices.is_empty()
+                    || state.balloon_device.is_some()
+                    || state.memory_device.is_some()
+            }
+        };
+        if unsupported {
+            return Err(
+                RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "managed restore cannot attach block, balloon, or hotplug devices",
+                ))
+                .into(),
+            );
+        }
+    }
+    let pmem_configs: Vec<_> = match &mut microvm_state.device_states.virtio_state {
+        VirtioDevicesState::Mmio(state) => state
+            .pmem_devices
+            .iter_mut()
+            .map(|device| &mut device.device_state.config)
+            .collect(),
+        VirtioDevicesState::Pci(state) => state
+            .pmem_devices
+            .iter_mut()
+            .map(|device| &mut device.device_state.config)
+            .collect(),
+    };
+    let mut remaining: std::collections::HashMap<_, _> = params
+        .pmem_overrides
+        .iter()
+        .map(|entry| (entry.id.as_str(), &entry.socket_path))
+        .collect();
+    if remaining.len() != params.pmem_overrides.len() {
+        return Err(
+            RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "duplicate PMEM override",
+            ))
+            .into(),
+        );
+    }
+    for config in pmem_configs {
+        if let Some(managed) = &mut config.managed {
+            let path = remaining.remove(config.id.as_str()).ok_or_else(|| {
+                RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "managed PMEM restore requires an explicit destination socket",
+                ))
+            })?;
+            managed.socket_path.clone_from(path);
+        }
+    }
+    if !remaining.is_empty() {
+        return Err(
+            RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "override does not identify a managed PMEM device",
+            ))
+            .into(),
+        );
+    }
     for entry in &params.network_overrides {
         // Only the active transport carries virtio device state, so we look at whichever
         // variant this snapshot was saved with. The MMIO and PCI transports wrap their net
@@ -453,6 +602,46 @@ pub fn restore_from_snapshot(
     let mem_state = &microvm_state.vm_state.memory;
 
     let (guest_memory, uffd) = match params.mem_backend.backend_type {
+        MemBackendType::Sproutfs => {
+            #[cfg(feature = "sproutfs-memory")]
+            {
+                if vm_resources.machine_config.huge_pages != HugePageConfig::Hugetlbfs2M
+                    || mem_state
+                        .regions
+                        .iter()
+                        .any(|r| r.region_type != GuestRegionType::Dram)
+                {
+                    return Err(
+                        RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "managed restore requires fixed RAM with 2 MiB HugeTLB backing",
+                        ))
+                        .into(),
+                    );
+                }
+                let config = crate::resources::ManagedMemoryConfig {
+                    socket_path: mem_backend_path.clone(),
+                };
+                let memory = crate::managed_memory::ram(
+                    &config,
+                    &mem_state.regions().collect::<Vec<_>>(),
+                    track_dirty_pages,
+                )
+                .map_err(|err| {
+                    RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::other(err))
+                })?;
+                vm_resources.managed_memory = Some(config);
+                (memory, None)
+            }
+            #[cfg(not(feature = "sproutfs-memory"))]
+            return Err(
+                RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "binary lacks managed-memory support",
+                ))
+                .into(),
+            );
+        }
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
                 return Err(RestoreFromSnapshotGuestMemoryError::File(

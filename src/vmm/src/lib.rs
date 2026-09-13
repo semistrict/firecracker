@@ -88,6 +88,9 @@ pub mod dumbo;
 pub mod gdb;
 /// Logger
 pub mod logger;
+/// Externally paged memory ownership and durable flush integration.
+#[cfg(feature = "sproutfs-memory")]
+pub mod managed_memory;
 /// microVM Metadata Service MMDS
 pub mod mmds;
 /// PCI specific emulation code.
@@ -414,7 +417,20 @@ impl Vmm {
         // This must match the From<&VmResources> for VmmConfig implementation
         // in resources.rs which is used to retrieve the config before the VM
         // is started.
+        #[cfg(feature = "sproutfs-memory")]
+        let managed_memory = self.vm.as_kvm().and_then(|vm| {
+            vm.guest_memory().iter().find_map(|r| {
+                r.inner
+                    .managed_owner()
+                    .map(|owner| crate::resources::ManagedMemoryConfig {
+                        socket_path: owner.socket_path().to_owned(),
+                    })
+            })
+        });
+        #[cfg(not(feature = "sproutfs-memory"))]
+        let managed_memory = None;
         VmmConfig {
+            managed_memory,
             balloon,
             drives: block,
             boot_source: self.boot_source_config.clone(),
@@ -499,6 +515,10 @@ impl Vmm {
     /// Saves the state of a paused Microvm.
     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
         self.check_unsnapshottable_devices()?;
+        #[cfg(feature = "sproutfs-memory")]
+        self.device_manager.drain_managed_pmem().map_err(|err| {
+            MicrovmStateError::NotAllowed(format!("PMEM durability drain failed: {err}"))
+        })?;
 
         // We need to save device state before saving KVM state.
         // Some devices, (at the time of writing this comment block device with async engine)

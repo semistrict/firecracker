@@ -13,8 +13,10 @@ default = []
 tracing = ["log-instrument"]
 gdb = ["arrayvec", "gdbstub", "gdbstub_arch"]
 fuzzing = []
+sproutfs-memory = ["dep:sproutfs-vm-memory"]
 
 [dependencies]
+sproutfs-vm-memory = { path = "../../../../rust/sproutfs-vm-memory", optional = true }
 
 acpi_tables = { path = "../acpi-tables" }
 arrayvec = { version = "0.7.6", optional = true }
