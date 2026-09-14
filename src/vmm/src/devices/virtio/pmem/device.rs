@@ -227,7 +227,7 @@ impl PmemMmap {
     fn flush(&self) -> std::io::Result<()> {
         #[cfg(feature = "sproutfs-memory")]
         if self.managed.is_some() {
-            // A managed volume's durability is the host's interval cut, taken
+            // A managed volume's durability is the host's interval checkpoint, taken
             // under a vCPU pause, so a guest flush neither fences nor triggers
             // anything. It succeeds here and costs nothing.
             return Ok(());

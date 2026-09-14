@@ -1705,7 +1705,7 @@ definitions:
         description:
           Prepare a coordinated managed capture. Requires Full, managed RAM and
           managed PMEM devices. Paused vCPUs and sealed volumes remain stopped
-          after this request; the host must publish matching volume cuts and
+          after this request; the host must publish matching volume checkpoints and
           VMM state before unsealing and resuming. This request alone does not
           publish a durable VM snapshot.
       snapshot_path:

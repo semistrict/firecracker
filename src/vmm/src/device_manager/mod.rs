@@ -401,7 +401,7 @@ impl DeviceManager {
         });
     }
 
-    /// Returns disk owners, requiring every disk to participate in the cut.
+    /// Returns disk owners, requiring every disk to participate in the checkpoint.
     #[cfg(feature = "sproutfs-memory")]
     pub fn managed_disk_owners(&self) -> Result<Vec<Arc<crate::managed_memory::Owner>>, String> {
         let mut owners = Vec::new();
