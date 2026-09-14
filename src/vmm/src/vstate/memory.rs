@@ -405,22 +405,25 @@ impl GuestRegionMmap {
         })
     }
 
-    /// Wraps a pager-owned range. The proxy never unmaps the owner's memory.
+    /// Wraps a range of a pager-owned mapping. The proxy never unmaps the
+    /// owner's memory, and several proxies may share one owner when the guest's
+    /// address space splits that mapping across an architectural hole.
     #[cfg(feature = "sproutfs-memory")]
     pub(crate) fn managed(
         guest_base: GuestAddress,
-        region: sproutfs_vm_memory::Region,
+        address: usize,
+        len: usize,
         owner: Arc<crate::managed_memory::Owner>,
         track_dirty_pages: bool,
     ) -> Result<Self, MemoryError> {
         let builder = MmapRegionBuilder::new_with_bitmap(
-            region.len,
-            track_dirty_pages.then(|| AtomicBitmap::with_len(region.len)),
+            len,
+            track_dirty_pages.then(|| AtomicBitmap::with_len(len)),
         )
         .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
         // SAFETY: Owner retains this valid mapping for the entire proxy lifetime.
         // KVM invalidation and synchronous UFFD protect mapping replacements.
-        let builder = unsafe { builder.with_raw_mmap_pointer(region.address as *mut u8) };
+        let builder = unsafe { builder.with_raw_mmap_pointer(address as *mut u8) };
         let mapping = builder.build().map_err(MemoryError::MmapRegionError)?;
         assert!(!mapping.owned());
         Ok(Self {

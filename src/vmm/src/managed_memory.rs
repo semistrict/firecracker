@@ -30,10 +30,11 @@ pub fn configure_worker_policy(filters: &BpfThreadMap) -> io::Result<()> {
 
 /// Retains the Session, including after its service thread returns.
 ///
-/// A session maps one region, so an owner is one region: guest RAM is one, and
-/// so is each PMEM device. The last owner can drop only after memory users have
-/// stopped. Guest RAM owns this through its mapping wrappers; PMEM owns it after
-/// its KVM slot.
+/// A session maps one volume, so an owner is one volume: guest RAM is one, and
+/// so is each PMEM device. Guest RAM's mapping wrappers may be several, one per
+/// guest region, and they share this owner. The last owner can drop only after
+/// memory users have stopped. Guest RAM owns this through its mapping wrappers;
+/// PMEM owns it after its KVM slot.
 pub struct Owner {
     socket_path: std::path::PathBuf,
     control: Control,
@@ -100,12 +101,21 @@ impl Owner {
     }
 }
 
-/// Seal independently owned volume regions concurrently after guest CPUs and
-/// device mutations have stopped for a coordinated capture. Sealing moves no
-/// bytes: the host write-protects each region's dirty set and answers, and its
+/// Seal independently owned volumes concurrently after guest CPUs and device
+/// mutations have stopped for a coordinated capture. Sealing moves no bytes:
+/// the host write-protects each volume's dirty set and answers, and its
 /// checkpoint uploads those frames once the guest has resumed.
+///
+/// Callers name owners per guest region, and guest RAM's regions share one
+/// owner, so a volume named more than once is sealed once.
 pub fn seal_regions(owners: Vec<Arc<Owner>>) -> io::Result<()> {
-    let requests: Vec<_> = owners
+    let mut sealing: Vec<Arc<Owner>> = Vec::with_capacity(owners.len());
+    for owner in owners {
+        if !sealing.iter().any(|held| Arc::ptr_eq(held, &owner)) {
+            sealing.push(owner);
+        }
+    }
+    let requests: Vec<_> = sealing
         .iter()
         .map(|owner| owner.control.start_seal())
         .collect::<io::Result<_>>()?;
@@ -129,36 +139,236 @@ impl Drop for Owner {
     }
 }
 
+/// One guest region's bytes inside the RAM volume: where the guest sees them
+/// and the volume offset they start at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VolumeRange {
+    guest: GuestAddress,
+    offset: usize,
+    len: usize,
+}
+
+/// Places a memory size's guest regions in the one RAM volume, in ascending
+/// guest order.
+///
+/// A managed VM has one RAM volume, which is one contiguous byte range; the
+/// guest's physical address space is not contiguous, because the architecture
+/// reserves holes in it for MMIO. On x86_64 the largest is 3 GiB to 4 GiB, so
+/// any VM with more than 3 GiB of RAM sees two regions. The volume does not
+/// carry those holes: it is the guest's RAM concatenated, so volume offset
+/// 3 GiB is guest address 4 GiB, on every path the volume takes -- fault, seal,
+/// checkpoint, restore, fork and migration. On aarch64 RAM below 256 GiB is one
+/// region and the volume is that region.
+///
+/// The layout must be exactly the one this architecture gives that size. A
+/// snapshot restored onto a different split would otherwise read every byte
+/// past the first hole from the wrong volume offset.
+fn volume_ranges(layout: &[(GuestAddress, usize)]) -> io::Result<Vec<VolumeRange>> {
+    let refuse = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason.to_owned());
+    let total = layout
+        .iter()
+        .try_fold(0usize, |total, (_, len)| total.checked_add(*len))
+        .filter(|total| *total > 0)
+        .ok_or_else(|| refuse("managed RAM is an empty or overlong memory size"))?;
+    if layout != crate::arch::arch_memory_regions(total).as_slice() {
+        return Err(refuse(
+            "managed RAM layout is not this architecture's layout for its size",
+        ));
+    }
+    let mut offset = 0;
+    let mut ranges = Vec::with_capacity(layout.len());
+    for &(guest, len) in layout {
+        if len % sproutfs_vm_memory::PAGE_SIZE != 0
+            || guest.0 % sproutfs_vm_memory::PAGE_SIZE as u64 != 0
+        {
+            return Err(refuse(
+                "managed RAM regions must be whole pager pages at page-aligned guest addresses",
+            ));
+        }
+        ranges.push(VolumeRange { guest, offset, len });
+        offset += len;
+    }
+    Ok(ranges)
+}
+
 /// Allocates the guest's RAM through the pager, without copying a whole backing
 /// image or creating anonymous guest data pages.
 ///
-/// A managed VM has one RAM region, which is one volume on the host. A memory
-/// size the architecture splits across an MMIO gap would need more than one, so
-/// it is refused rather than silently mapped as several volumes.
+/// One volume and one session serve every guest region: the session maps the
+/// volume once, and each guest region wraps the part of that mapping
+/// [`volume_ranges`] gives it.
 pub fn ram(
     config: &ManagedMemoryConfig,
     layout: &[(GuestAddress, usize)],
     track_dirty: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-    let [(address, len)] = layout else {
-        return Err(MemoryError::Managed(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "managed RAM is one region: this memory size spans an architectural MMIO gap",
-        )));
-    };
+    let ranges = volume_ranges(layout).map_err(MemoryError::Managed)?;
+    let len = ranges.iter().map(|range| range.len).sum();
     let owner = Owner::connect(
         &config.socket_path,
         RegionSpec {
             kind: RegionKind::Ram,
-            len: *len,
+            len,
         },
     )
     .map_err(MemoryError::Managed)?;
     let region = owner.region();
-    Ok(vec![GuestRegionMmap::managed(
-        *address,
-        region,
-        owner,
-        track_dirty,
-    )?])
+    ranges
+        .into_iter()
+        .map(|range| {
+            GuestRegionMmap::managed(
+                range.guest,
+                region.address + range.offset,
+                range.len,
+                owner.clone(),
+                track_dirty,
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::{MMIO64_MEM_SIZE, MMIO64_MEM_START, arch_memory_regions};
+
+    const GIB: usize = 1 << 30;
+
+    /// The guest address the volume's byte at `offset` is read and written at.
+    fn guest_of(ranges: &[VolumeRange], offset: usize) -> GuestAddress {
+        let range = ranges
+            .iter()
+            .find(|range| offset >= range.offset && offset - range.offset < range.len)
+            .expect("offset is outside the volume");
+        GuestAddress(range.guest.0 + (offset - range.offset) as u64)
+    }
+
+    /// Every range is whole pages of the volume, they cover it once in
+    /// ascending guest order, and they total the memory size.
+    fn check_covers(ranges: &[VolumeRange], size: usize) {
+        let mut offset = 0;
+        let mut guest_end = 0;
+        for range in ranges {
+            assert_eq!(range.offset, offset);
+            assert!(range.len > 0 && range.len % sproutfs_vm_memory::PAGE_SIZE == 0);
+            assert!(range.guest.0 >= guest_end);
+            offset += range.len;
+            guest_end = range.guest.0 + range.len as u64;
+        }
+        assert_eq!(offset, size);
+    }
+
+    #[test]
+    fn a_size_below_the_first_hole_is_one_range() {
+        let size = GIB;
+        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].offset, 0);
+        assert_eq!(ranges[0].len, size);
+        check_covers(&ranges, size);
+    }
+
+    #[test]
+    fn a_size_spanning_the_64_bit_hole_skips_it() {
+        let size = usize::try_from(MMIO64_MEM_START).unwrap() + GIB;
+        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        check_covers(&ranges, size);
+        assert!(ranges.len() > 1, "the hole splits this size");
+        let past = *ranges.last().unwrap();
+        assert_eq!(past.guest.0, MMIO64_MEM_START + MMIO64_MEM_SIZE);
+        assert_eq!(guest_of(&ranges, past.offset).0, past.guest.0);
+        assert_eq!(guest_of(&ranges, past.offset + 4096).0, past.guest.0 + 4096);
+        assert_eq!(
+            guest_of(&ranges, past.offset - 1).0,
+            MMIO64_MEM_START - 1,
+            "the volume ends the region below the hole where the hole begins"
+        );
+    }
+
+    #[test]
+    fn a_layout_this_architecture_would_not_produce_is_refused() {
+        let size = 4 * GIB;
+        let mut layout = arch_memory_regions(size);
+        let (first, len) = layout[0];
+        layout[0] = (first, len - sproutfs_vm_memory::PAGE_SIZE);
+        layout.push((
+            GuestAddress(first.0 + len as u64 - sproutfs_vm_memory::PAGE_SIZE as u64),
+            sproutfs_vm_memory::PAGE_SIZE,
+        ));
+        assert_eq!(
+            volume_ranges(&layout).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn an_empty_layout_is_refused() {
+        assert_eq!(
+            volume_ranges(&[]).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    /// More than 3 GiB of RAM is two guest regions, and the volume is the two
+    /// of them joined: volume offset 3 GiB is guest address 4 GiB.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ram_past_the_32_bit_hole_continues_the_volume() {
+        use crate::arch::{FIRST_ADDR_PAST_32BITS, MMIO32_MEM_START};
+
+        let size = 4 * GIB;
+        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        check_covers(&ranges, size);
+        let below = usize::try_from(MMIO32_MEM_START).unwrap();
+        assert_eq!(
+            ranges,
+            vec![
+                VolumeRange {
+                    guest: GuestAddress(0),
+                    offset: 0,
+                    len: below,
+                },
+                VolumeRange {
+                    guest: GuestAddress(FIRST_ADDR_PAST_32BITS),
+                    offset: below,
+                    len: size - below,
+                },
+            ]
+        );
+        assert_eq!(guest_of(&ranges, below).0, FIRST_ADDR_PAST_32BITS);
+        assert_eq!(
+            guest_of(&ranges, below + 12345).0,
+            FIRST_ADDR_PAST_32BITS + 12345
+        );
+        assert_eq!(guest_of(&ranges, below - 1).0, MMIO32_MEM_START - 1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ram_up_to_the_32_bit_hole_is_one_range() {
+        let size = usize::try_from(crate::arch::MMIO32_MEM_START).unwrap();
+        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        assert_eq!(ranges.len(), 1);
+        check_covers(&ranges, size);
+    }
+
+    /// aarch64 has no hole below 256 GiB, so RAM is one region beginning at the
+    /// start of DRAM and the volume is exactly that region.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ram_past_4_gib_is_still_one_range() {
+        use crate::arch::DRAM_MEM_START;
+
+        let size = 8 * GIB;
+        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        assert_eq!(
+            ranges,
+            vec![VolumeRange {
+                guest: GuestAddress(DRAM_MEM_START),
+                offset: 0,
+                len: size,
+            }]
+        );
+        assert_eq!(guest_of(&ranges, 12345).0, DRAM_MEM_START + 12345);
+    }
 }
