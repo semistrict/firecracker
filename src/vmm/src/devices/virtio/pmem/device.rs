@@ -202,14 +202,14 @@ impl PmemMmap {
                     usize::try_from(managed.length).map_err(|_| PmemError::AllocationFailed)?;
                 let owner = crate::managed_memory::Owner::connect(
                     &managed.socket_path,
-                    &[sproutfs_vm_memory::RegionSpec {
+                    sproutfs_vm_memory::RegionSpec {
                         kind: sproutfs_vm_memory::RegionKind::Pmem,
                         len,
-                    }],
+                    },
                 )
                 .map_err(PmemError::BackingFile)?;
                 return Ok(Self {
-                    mmap_ptr: owner.regions()[0].address as u64,
+                    mmap_ptr: owner.region().address as u64,
                     file_len: managed.length,
                     mmap_len: managed.length,
                     managed: Some(owner),

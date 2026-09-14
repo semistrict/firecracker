@@ -30,12 +30,14 @@ pub fn configure_worker_policy(filters: &BpfThreadMap) -> io::Result<()> {
 
 /// Retains the Session, including after its service thread returns.
 ///
-/// The last owner can drop only after memory users have stopped. Guest RAM
-/// owns this through its mapping wrappers; PMEM owns it after its KVM slot.
+/// A session maps one region, so an owner is one region: guest RAM is one, and
+/// so is each PMEM device. The last owner can drop only after memory users have
+/// stopped. Guest RAM owns this through its mapping wrappers; PMEM owns it after
+/// its KVM slot.
 pub struct Owner {
     socket_path: std::path::PathBuf,
     control: Control,
-    regions: Vec<Region>,
+    region: Region,
     stopping: Arc<AtomicBool>,
     service: Mutex<Option<JoinHandle<Session>>>,
 }
@@ -43,20 +45,20 @@ pub struct Owner {
 impl std::fmt::Debug for Owner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManagedMemoryOwner")
-            .field("regions", &self.regions)
+            .field("region", &self.region)
             .finish_non_exhaustive()
     }
 }
 
 impl Owner {
     /// Connects before exposing any mapping and starts a dedicated service.
-    pub fn connect(path: &std::path::Path, specs: &[RegionSpec]) -> io::Result<Arc<Self>> {
+    pub fn connect(path: &std::path::Path, spec: RegionSpec) -> io::Result<Arc<Self>> {
         let service_policy = WORKER_POLICY
             .get()
             .ok_or_else(|| io::Error::other("memory-worker policy not configured"))?
             .clone();
-        let mut session = Session::connect(path, specs)?;
-        let regions = session.regions();
+        let mut session = Session::connect(path, spec)?;
+        let region = session.region();
         let control = session.control();
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
@@ -81,15 +83,15 @@ impl Owner {
         Ok(Arc::new(Self {
             socket_path: path.to_owned(),
             control,
-            regions,
+            region,
             stopping,
             service: Mutex::new(Some(service)),
         }))
     }
 
-    /// Stable addresses retained by this owner.
-    pub fn regions(&self) -> &[Region] {
-        &self.regions
+    /// The stable address retained by this owner.
+    pub fn region(&self) -> Region {
+        self.region
     }
 
     /// Socket identity used to construct this attachment.
@@ -102,10 +104,10 @@ impl Owner {
 /// device mutations have stopped for a coordinated capture. Sealing moves no
 /// bytes: the host write-protects each region's dirty set and answers, and its
 /// checkpoint uploads those frames once the guest has resumed.
-pub fn seal_regions(regions: Vec<(Arc<Owner>, u64)>) -> io::Result<()> {
-    let requests: Vec<_> = regions
+pub fn seal_regions(owners: Vec<Arc<Owner>>) -> io::Result<()> {
+    let requests: Vec<_> = owners
         .iter()
-        .map(|(owner, region)| owner.control.start_seal(*region))
+        .map(|owner| owner.control.start_seal())
         .collect::<io::Result<_>>()?;
     let mut result = Ok(());
     for request in requests {
@@ -127,26 +129,36 @@ impl Drop for Owner {
     }
 }
 
-/// Allocates architecture RAM regions through the pager, without copying a
-/// whole backing image or creating anonymous guest data pages.
+/// Allocates the guest's RAM through the pager, without copying a whole backing
+/// image or creating anonymous guest data pages.
+///
+/// A managed VM has one RAM region, which is one volume on the host. A memory
+/// size the architecture splits across an MMIO gap would need more than one, so
+/// it is refused rather than silently mapped as several volumes.
 pub fn ram(
     config: &ManagedMemoryConfig,
     layout: &[(GuestAddress, usize)],
     track_dirty: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-    let specs: Vec<_> = layout
-        .iter()
-        .map(|(_, len)| RegionSpec {
+    let [(address, len)] = layout else {
+        return Err(MemoryError::Managed(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed RAM is one region: this memory size spans an architectural MMIO gap",
+        )));
+    };
+    let owner = Owner::connect(
+        &config.socket_path,
+        RegionSpec {
             kind: RegionKind::Ram,
             len: *len,
-        })
-        .collect();
-    let owner = Owner::connect(&config.socket_path, &specs).map_err(MemoryError::Managed)?;
-    layout
-        .iter()
-        .zip(owner.regions())
-        .map(|((address, _), region)| {
-            GuestRegionMmap::managed(*address, *region, owner.clone(), track_dirty)
-        })
-        .collect()
+        },
+    )
+    .map_err(MemoryError::Managed)?;
+    let region = owner.region();
+    Ok(vec![GuestRegionMmap::managed(
+        *address,
+        region,
+        owner,
+        track_dirty,
+    )?])
 }
