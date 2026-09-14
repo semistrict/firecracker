@@ -101,6 +101,14 @@ impl Owner {
     }
 }
 
+/// How long a seal request waits here. The host's own deadline is the one that
+/// decides a seal: it answers one it could not finish with a failure, which
+/// fails the checkpoint, unseals and lets the guest resume. This is far longer,
+/// so a slow seal is never answered by a timer here — expiring closes the
+/// control session and kills the guest — and it remains only the backstop for a
+/// host that has stopped answering at all.
+const SEAL_BACKSTOP: Duration = Duration::from_secs(300);
+
 /// Seal independently owned volumes concurrently after guest CPUs and device
 /// mutations have stopped for a coordinated capture. Sealing moves no bytes:
 /// the host write-protects each volume's dirty set and answers, and its
@@ -108,6 +116,8 @@ impl Owner {
 ///
 /// Callers name owners per guest region, and guest RAM's regions share one
 /// owner, so a volume named more than once is sealed once.
+///
+/// The host's deadline is the only one that decides a seal; see SEAL_BACKSTOP.
 pub fn seal_regions(owners: Vec<Arc<Owner>>) -> io::Result<()> {
     let mut sealing: Vec<Arc<Owner>> = Vec::with_capacity(owners.len());
     for owner in owners {
@@ -121,7 +131,7 @@ pub fn seal_regions(owners: Vec<Arc<Owner>>) -> io::Result<()> {
         .collect::<io::Result<_>>()?;
     let mut result = Ok(());
     for request in requests {
-        if let Err(err) = request.wait(Duration::from_secs(30)) {
+        if let Err(err) = request.wait(SEAL_BACKSTOP) {
             result = Err(err);
         }
     }
