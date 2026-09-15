@@ -125,13 +125,41 @@ pub fn seal_regions(owners: Vec<Arc<Owner>>) -> io::Result<()> {
             sealing.push(owner);
         }
     }
-    let requests: Vec<_> = sealing
-        .iter()
-        .map(|owner| owner.control.start_seal())
-        .collect::<io::Result<_>>()?;
+    seal_all(
+        sealing.iter().map(|owner| owner.control.start_seal()),
+        |request| request.wait(SEAL_BACKSTOP),
+    )
+}
+
+/// Starts every seal before waiting on any, so independently owned volumes seal
+/// concurrently rather than one after another, and waits out every request it
+/// did start even when a later one will not start at all.
+///
+/// A seal that will not start is one region's failure and the capture fails with
+/// it, but the requests already in flight belong to sessions of their own:
+/// dropping a PendingSeal without observing its completion closes its control
+/// session, which ends that session's service thread and with it this whole
+/// process. Returning early would kill the guest over a checkpoint that merely
+/// could not be taken.
+fn seal_all<H>(
+    starts: impl Iterator<Item = io::Result<H>>,
+    wait: impl Fn(H) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut started = Vec::new();
     let mut result = Ok(());
-    for request in requests {
-        if let Err(err) = request.wait(SEAL_BACKSTOP) {
+    for start in starts {
+        match start {
+            Ok(handle) => started.push(handle),
+            Err(err) => {
+                result = Err(err);
+                break;
+            }
+        }
+    }
+    for handle in started {
+        if let Err(err) = wait(handle)
+            && result.is_ok()
+        {
             result = Err(err);
         }
     }
@@ -243,6 +271,84 @@ mod tests {
     use crate::arch::{MMIO64_MEM_SIZE, MMIO64_MEM_START, arch_memory_regions};
 
     const GIB: usize = 1 << 30;
+
+    /// A seal handle that records whether it was waited on. Dropping a real
+    /// PendingSeal without observing its completion closes the control session,
+    /// which ends its service thread and with it the whole VMM process.
+    struct Handle<'a> {
+        id: usize,
+        waited: &'a std::cell::RefCell<Vec<usize>>,
+        abandoned: &'a std::cell::Cell<usize>,
+        finished: bool,
+    }
+
+    impl Drop for Handle<'_> {
+        fn drop(&mut self) {
+            if !self.finished {
+                self.abandoned.set(self.abandoned.get() + 1);
+            }
+        }
+    }
+
+    /// A seal that will not start is one region's failure, and the capture
+    /// fails with it. The seals already started are requests in flight on their
+    /// own sessions: abandoning them closes those sessions and kills the guest
+    /// over a checkpoint that merely could not be taken, so every one of them is
+    /// waited out first.
+    #[test]
+    fn a_seal_that_cannot_start_still_waits_out_the_ones_that_did() {
+        let waited = std::cell::RefCell::new(Vec::new());
+        let abandoned = std::cell::Cell::new(0);
+        let refused = || io::Error::other("this session will not start a seal");
+        let starts = (0..3).map(|id| {
+            if id == 2 {
+                Err(refused())
+            } else {
+                Ok(Handle {
+                    id,
+                    waited: &waited,
+                    abandoned: &abandoned,
+                    finished: false,
+                })
+            }
+        });
+        let result = seal_all(starts, |mut handle| {
+            handle.finished = true;
+            handle.waited.borrow_mut().push(handle.id);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().to_string(), refused().to_string());
+        assert_eq!(*waited.borrow(), vec![0, 1]);
+        assert_eq!(abandoned.get(), 0, "an unfinished seal was dropped");
+    }
+
+    /// The whole point of starting every seal before waiting on any is that
+    /// independently owned volumes seal at the same time.
+    #[test]
+    fn every_seal_starts_before_any_is_waited_on() {
+        let waited = std::cell::RefCell::new(Vec::new());
+        let abandoned = std::cell::Cell::new(0);
+        let started = std::cell::Cell::new(0);
+        let starts = (0..3).map(|id| {
+            started.set(started.get() + 1);
+            assert!(waited.borrow().is_empty(), "a seal was waited on mid-start");
+            Ok(Handle {
+                id,
+                waited: &waited,
+                abandoned: &abandoned,
+                finished: false,
+            })
+        });
+        seal_all(starts, |mut handle| {
+            handle.finished = true;
+            handle.waited.borrow_mut().push(handle.id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(started.get(), 3);
+        assert_eq!(*waited.borrow(), vec![0, 1, 2]);
+        assert_eq!(abandoned.get(), 0);
+    }
 
     /// The guest address the volume's byte at `offset` is read and written at.
     fn guest_of(ranges: &[VolumeRange], offset: usize) -> GuestAddress {
