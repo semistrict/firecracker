@@ -187,6 +187,16 @@ pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
     /// Activate the backend, adding its listeners to the poll set.
     fn activate(&mut self) -> Result<(), VsockError>;
 
+    /// Drop every active connection, closing the host-side socket of each one, and
+    /// leave the backend listening for new ones.
+    ///
+    /// This is what the driver losing its connections looks like from the host's side.
+    /// A driver that is told to reset its transport, or a guest that is stopped for
+    /// good, silently abandons its end of every connection: nothing arrives on the
+    /// virtio queues to say so. Unless the backend drops its end too, the process on
+    /// the other side of that Unix socket is left reading a reply that is never coming.
+    fn drop_connections(&mut self);
+
     /// Reset the backend, dropping all active connections and removing its listeners
     /// from the poll set.
     fn reset(&mut self);

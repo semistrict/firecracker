@@ -31,6 +31,8 @@ pub struct TestBackend {
     pub rx_ok_cnt: usize,
     pub tx_ok_cnt: usize,
     pub evset: Option<EventSet>,
+    /// How many times the backend was told to drop its connections.
+    pub dropped_connections: usize,
 }
 
 impl TestBackend {
@@ -42,6 +44,7 @@ impl TestBackend {
             rx_ok_cnt: 0,
             tx_ok_cnt: 0,
             evset: None,
+            dropped_connections: 0,
         }
     }
 
@@ -107,7 +110,13 @@ impl VsockBackend for TestBackend {
         Ok(())
     }
 
-    fn reset(&mut self) {}
+    fn drop_connections(&mut self) {
+        self.dropped_connections += 1;
+    }
+
+    fn reset(&mut self) {
+        self.drop_connections();
+    }
 }
 
 #[derive(Debug)]

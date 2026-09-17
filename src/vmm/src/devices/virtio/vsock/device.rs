@@ -79,6 +79,17 @@ pub struct Vsock<B> {
 
     /// Gates RX delivery while a TRANSPORT_RESET is awaiting guest ack.
     pub(crate) pending_event_ack: bool,
+
+    /// Whether this device owes its driver a TRANSPORT_RESET before the guest runs
+    /// again. Set by `restore`, and by nothing else: the connections a restored
+    /// driver believes it has were made on the host the snapshot was taken on, and
+    /// this host holds no socket for any of them. A device the same VM is resuming
+    /// owes its driver nothing, which is what makes a checkpoint transparent to a
+    /// command running over the vsock.
+    ///
+    /// It is deliberately not part of the persisted state: what a restored device
+    /// owes is decided by the restore, not by what the source was doing.
+    pub(crate) reset_on_resume: bool,
 }
 
 impl<B> Vsock<B>
@@ -109,6 +120,7 @@ where
             rx_packet: VsockPacketRx::new()?,
             tx_packet: VsockPacketTx::default(),
             pending_event_ack: false,
+            reset_on_resume: false,
         })
     }
 
@@ -405,27 +417,43 @@ where
         self.rx_packet.clear();
         self.tx_packet.clear();
         self.pending_event_ack = false;
+        self.reset_on_resume = false;
         true
     }
 
     fn kick(&mut self) {
         if self.is_activated() {
             // Vsock has a complicated protocol that isn't resilient to any packet loss,
-            // so for Vsock we don't support connection persistence through snapshot. Any
-            // in-flight packets or events are simply lost and Vsock is restored 'empty'.
-            //
+            // so a restored device comes back 'empty': the connections its driver
+            // believes it has were made on the host the snapshot was taken on, and any
+            // in-flight packet or event is gone. That is what `reset_on_resume` says,
+            // and publishing the TRANSPORT_RESET here rather than when the snapshot was
+            // taken is what keeps the two cases apart: the VM that resumes from its own
+            // checkpoint never sees one, so a command running over the vsock while the
+            // host checkpoints it is not killed.
+            if self.reset_on_resume {
+                self.reset_on_resume = false;
+                // One outstanding reset is enough: publishing a second while the guest
+                // has not acked the first would consume an event-queue descriptor the
+                // driver has not refilled.
+                if !self.pending_event_ack {
+                    self.send_transport_reset_event().unwrap_or_else(|err| {
+                        error!("Failed to send reset transport event: {:?}", err);
+                    });
+                }
+            }
+
             // A set `pending_event_ack` means a `TRANSPORT_RESET_EVENT` sits in the
-            // event queue's used ring, not yet acknowledged by the guest: we are
-            // resuming either the VM a snapshot was just taken from, or a VM restored
-            // from a snapshot (the flag is part of the persisted device state). Signal
-            // the event queue so the guest processes the event. (We signal it
-            // host->guest rather than writing its eventfd, which would invoke the
-            // guest's reset-ack path and clear `pending_event_ack` prematurely.)
+            // event queue's used ring, not yet acknowledged by the guest: either the one
+            // published just above, or one the source of this snapshot had outstanding
+            // (the flag is part of the persisted device state). Signal the event queue so
+            // the guest processes the event. (We signal it host->guest rather than
+            // writing its eventfd, which would invoke the guest's reset-ack path and
+            // clear `pending_event_ack` prematurely.)
             //
-            // On a bare pause/resume no reset event was published, so there is nothing
-            // to signal and the flag must stay clear: arming it here would gate
-            // `process_rx` on an acknowledgment the guest can never send, hanging all
-            // subsequent host-initiated connections.
+            // On a resume that owes no reset the flag must stay clear: arming it here
+            // would gate `process_rx` on an acknowledgment the guest can never send,
+            // hanging all subsequent host-initiated connections.
             if self.pending_event_ack {
                 info!(
                     "[{:?}:{}] signaling event queue",
@@ -464,14 +492,18 @@ where
         }
     }
 
-    fn prepare_save(&mut self) {
-        // Send Transport event to reset connections if device
-        // is activated.
-        if self.is_activated() {
-            self.send_transport_reset_event().unwrap_or_else(|err| {
-                error!("Failed to send reset transport event: {:?}", err);
-            });
-        }
+    // `prepare_save` is deliberately not implemented. Taking a snapshot used to tell
+    // the driver to reset its transport, which killed every connection the guest had
+    // the moment the VM resumed -- including the one a host was running a command
+    // over. A snapshot is not what invalidates those connections; restoring one
+    // somewhere else is, so the reset belongs to `restore` and to `kick`.
+
+    fn prepare_handoff(&mut self) {
+        // The guest is not coming back, so no packet will ever arrive to say that its
+        // connections are over. Drop them here, which closes the host-side socket of
+        // each one: a host waiting on a command in the guest it has just stopped is
+        // told at once rather than waiting out its own timeout.
+        self.backend.drop_connections();
     }
 }
 
@@ -481,7 +513,12 @@ mod tests {
 
     use super::*;
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
-    use crate::devices::virtio::vsock::test_utils::{EventHandlerContext, TestContext};
+    use crate::devices::virtio::test_utils::VirtQueue as GuestQ;
+    use crate::devices::virtio::vsock::persist::VsockConstructorArgs;
+    use crate::devices::virtio::vsock::test_utils::{
+        EventHandlerContext, TestBackend, TestContext,
+    };
+    use crate::snapshot::Persist;
     use crate::utils::byte_order;
     use crate::vstate::memory::GuestAddress;
 
@@ -492,10 +529,19 @@ mod tests {
     /// device-side queue so it sees the new avail index. Required by any test that exercises
     /// `send_transport_reset_event` directly.
     fn publish_evq_descriptor(ctx: &mut EventHandlerContext<'_>) {
-        ctx.guest_evvq.dtable[0].set(EVQ_PAYLOAD_GUEST_ADDR, 4, VIRTQ_DESC_F_WRITE, 0);
-        ctx.guest_evvq.avail.ring[0].set(0);
-        ctx.guest_evvq.avail.idx.set(1);
-        ctx.device.queues[EVQ_INDEX] = ctx.guest_evvq.create_queue();
+        let EventHandlerContext {
+            device, guest_evvq, ..
+        } = ctx;
+        publish_evq_descriptor_for(guest_evvq, device);
+    }
+
+    /// The same publication, for a device that is not the context's own: a restored
+    /// device, whose queues the restore rebuilt over these very guest rings.
+    fn publish_evq_descriptor_for(evq: &GuestQ<'_>, device: &mut Vsock<TestBackend>) {
+        evq.dtable[0].set(EVQ_PAYLOAD_GUEST_ADDR, 4, VIRTQ_DESC_F_WRITE, 0);
+        evq.avail.ring[0].set(0);
+        evq.avail.idx.set(1);
+        device.queues[EVQ_INDEX] = evq.create_queue();
     }
 
     #[test]
@@ -688,9 +734,12 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_save_emits_transport_reset_when_active() {
-        // The snapshot path goes through prepare_save -> send_transport_reset_event.
-        // Both the evq publication and the RX gate must be observable afterwards.
+    fn test_prepare_save_leaves_the_guests_connections_alone() {
+        // A checkpoint is a snapshot the same VM resumes from. Taking one used to
+        // publish a TRANSPORT_RESET, which killed every connection the guest had the
+        // moment it resumed -- including the one a host was running a command over,
+        // leaving that host waiting out its own timeout for a reply nobody would
+        // send. Saving state must publish nothing and gate nothing.
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_event_handler_context();
         ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
@@ -698,8 +747,28 @@ mod tests {
 
         ctx.device.prepare_save();
 
-        assert!(ctx.device.pending_event_ack);
-        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        assert!(
+            !ctx.device.pending_event_ack,
+            "a checkpoint must not arm the RX gate on the VM it resumes"
+        );
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            0,
+            "a checkpoint must publish no event to the guest"
+        );
+        assert_eq!(
+            ctx.device.backend.dropped_connections, 0,
+            "a checkpoint must not drop the connections the guest is using"
+        );
+
+        // And the guest goes on being served: RX still flows on the resume.
+        ctx.device.kick();
+        ctx.device.backend.set_pending_rx(true);
+        assert!(
+            ctx.device.process_rx().unwrap(),
+            "RX must flow after the VM resumes from its own checkpoint"
+        );
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
     }
 
     #[test]
@@ -711,6 +780,80 @@ mod tests {
         ctx.device.prepare_save();
 
         assert!(!ctx.device.pending_event_ack);
+    }
+
+    #[test]
+    fn test_restored_device_resumes_with_a_transport_reset() {
+        // The reset the checkpoint path no longer sends belongs here: a device coming
+        // out of a snapshot has a driver holding connections that were made on another
+        // host, so it owes that driver a TRANSPORT_RESET before the guest runs again.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        let state = ctx.device.save();
+        assert!(!state.pending_event_ack);
+
+        let mut restored = Vsock::restore(
+            VsockConstructorArgs {
+                mem: test_ctx.mem.clone(),
+                backend: TestBackend::new(),
+            },
+            &state,
+        )
+        .unwrap();
+        restored
+            .activate(test_ctx.mem.clone(), test_ctx.interrupt.clone())
+            .unwrap();
+        publish_evq_descriptor_for(&ctx.guest_evvq, &mut restored);
+
+        restored.kick();
+
+        assert!(
+            restored.pending_event_ack,
+            "a restored device must gate RX until the guest acks the reset"
+        );
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            1,
+            "a restored device must publish the reset event to the guest"
+        );
+        let mut buf = [0xffu8; 4];
+        test_ctx
+            .mem
+            .read_slice(&mut buf, GuestAddress(EVQ_PAYLOAD_GUEST_ADDR))
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(buf), VIRTIO_VSOCK_EVENT_TRANSPORT_RESET);
+
+        // And only once: once the driver has been told, a later resume of the same
+        // device -- the checkpoints this VM goes on taking -- owes it nothing.
+        restored.pending_event_ack = false;
+        restored.kick();
+        assert!(
+            !restored.pending_event_ack,
+            "a device that has already reset its driver must not reset it again"
+        );
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            1,
+            "a later resume must publish no second reset event"
+        );
+    }
+
+    #[test]
+    fn test_prepare_handoff_drops_the_backends_connections() {
+        // A handoff stops this guest for good, and nothing will ever arrive on the
+        // queues to say its connections are over. The backend drops them, which closes
+        // the host-side socket of each one.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        ctx.device.prepare_handoff();
+
+        assert_eq!(
+            ctx.device.backend.dropped_connections, 1,
+            "a handoff must drop the connections of the guest it stops"
+        );
     }
 
     #[test]

@@ -275,6 +275,7 @@ mod tests {
         let response = api_server.serve_vmm_action_request(
             Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
                 managed: false,
+                handoff: false,
                 snapshot_type: SnapshotType::Diff,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
@@ -290,6 +291,7 @@ mod tests {
         let response = api_server.serve_vmm_action_request(
             Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
                 managed: false,
+                handoff: false,
                 snapshot_type: SnapshotType::Diff,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),

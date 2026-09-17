@@ -308,20 +308,28 @@ impl VsockBackend for VsockMuxer {
             .map_err(VsockError::VsockUdsBackend)
     }
 
-    fn reset(&mut self) {
-        // Remove all connections and their epoll listeners.
+    fn drop_connections(&mut self) {
+        // Removing a connection drops the `MuxerConnection` that owns its host-side
+        // `UnixStream`, so the peer on the other end of that socket sees EOF at once
+        // rather than waiting on a guest that is never going to answer.
         let keys: Vec<ConnMapKey> = self.conn_map.keys().copied().collect();
         for key in keys {
             self.remove_connection(key);
         }
+
+        // Both queues only ever name connections, and there are none left.
+        self.rxq = MuxerRxQ::new();
+        self.killq = MuxerKillQ::new();
+    }
+
+    fn reset(&mut self) {
+        self.drop_connections();
 
         let fds: Vec<RawFd> = self.listener_map.keys().copied().collect();
         for fd in fds {
             self.remove_listener(fd);
         }
 
-        self.rxq = MuxerRxQ::new();
-        self.killq = MuxerKillQ::new();
         self.local_port_set.clear();
         self.local_port_last = (1u32 << 30) - 1;
     }
@@ -1239,6 +1247,44 @@ mod tests {
         ctx.muxer.recv_pkt(&mut ctx.rx_pkt).unwrap_err();
         assert!(ctx.muxer.listener_map.contains_key(&conn_fd));
         assert_eq!(ctx.count_epoll_listeners().1, 1);
+    }
+
+    #[test]
+    fn test_dropping_connections_closes_the_host_side_socket() {
+        // A driver that is told to reset its transport, and a guest that is stopped for
+        // good, both abandon their end of every connection without a packet to say so.
+        // Whoever is on the other end of the host-side socket has no other way of
+        // learning that no reply is coming, so dropping a connection must close it.
+        let mut ctx = MuxerTestContext::new("drop_conns_closes_host_sock");
+        let peer_port = 1025;
+        let (mut stream, local_port) = ctx.local_connect(peer_port);
+        let key = ConnMapKey {
+            local_port,
+            peer_port,
+        };
+        assert!(ctx.muxer.conn_map.contains_key(&key));
+        // Blocking, so that a read returning is the peer having closed rather than the
+        // socket merely having nothing to say yet.
+        stream.set_nonblocking(false).unwrap();
+
+        ctx.muxer.drop_connections();
+
+        assert!(ctx.muxer.conn_map.is_empty());
+        assert!(!ctx.muxer.has_pending_rx());
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            stream.read(&mut buf).unwrap(),
+            0,
+            "the host side of a dropped connection must see EOF"
+        );
+
+        // The muxer goes on serving: dropping connections is not resetting the backend,
+        // and the host socket is still listening for new ones.
+        let (_stream, next_local_port) = ctx.local_connect(peer_port);
+        assert!(ctx.muxer.conn_map.contains_key(&ConnMapKey {
+            local_port: next_local_port,
+            peer_port,
+        }));
     }
 
     #[test]

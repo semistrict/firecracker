@@ -154,6 +154,7 @@ mod tests {
         }"#;
         let expected_config = CreateSnapshotParams {
             managed: false,
+            handoff: false,
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
@@ -172,6 +173,7 @@ mod tests {
         }"#;
         let expected_config = CreateSnapshotParams {
             managed: false,
+            handoff: false,
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
@@ -188,6 +190,7 @@ mod tests {
         }"#;
         let expected_config = CreateSnapshotParams {
             managed: false,
+            handoff: false,
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),

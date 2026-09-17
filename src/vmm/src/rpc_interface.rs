@@ -1240,6 +1240,7 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::CreateSnapshot(
             CreateSnapshotParams {
                 managed: false,
+                handoff: false,
                 seal: true,
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),

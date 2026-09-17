@@ -177,6 +177,13 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    if params.handoff {
+        // This guest is stopped for good: a destination is restored from the state
+        // below and runs in its place. Everything the devices hold on the guest's
+        // behalf towards the outside world ends here, so that whoever is waiting on
+        // one of those is told now rather than by a timeout of their own.
+        vmm.device_manager.prepare_virtio_devices_for_handoff();
+    }
     #[cfg(feature = "sproutfs-memory")]
     if params.managed {
         if !params.mem_file_path.as_os_str().is_empty()

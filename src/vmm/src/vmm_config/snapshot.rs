@@ -51,6 +51,13 @@ pub struct CreateSnapshotParams {
     /// the destination is about to fault out of this host's frames.
     #[serde(default = "default_managed_seal")]
     pub seal: bool,
+    /// Whether this snapshot hands the VM off: its guest is stopped for good and a
+    /// destination will be restored from the state. A checkpoint, which the same VM
+    /// resumes from, leaves this false, and the difference is what devices holding
+    /// something on the guest's behalf act on -- a vsock connection to a guest that
+    /// will run again is left alone, and one to a guest that will not is closed.
+    #[serde(default)]
+    pub handoff: bool,
     /// This marks the type of snapshot we want to create.
     /// The default value is `Full`, which means a full snapshot.
     #[serde(default = "SnapshotType::default")]

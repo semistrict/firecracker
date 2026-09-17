@@ -248,6 +248,7 @@ fn verify_create_snapshot(
     };
     let snapshot_params = CreateSnapshotParams {
         managed: false,
+        handoff: false,
         seal: true,
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),

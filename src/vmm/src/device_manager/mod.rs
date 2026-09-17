@@ -388,6 +388,13 @@ impl DeviceManager {
         self.for_each_virtio_device_mut(|_, device| device.kick());
     }
 
+    /// Tell every VirtIO device that this guest is stopped for good and a destination
+    /// will be restored from the state about to be saved.
+    pub fn prepare_virtio_devices_for_handoff(&self) {
+        info!("Prepare devices for handoff");
+        self.for_each_virtio_device_mut(|_, device| device.prepare_handoff());
+    }
+
     /// Mark queue memory dirty for activated VirtIO devices
     pub fn mark_virtio_queue_memory_dirty(&self, mem: &GuestMemoryMmap) {
         self.for_each_virtio_device_mut(|_, device| {

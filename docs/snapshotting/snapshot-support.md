@@ -55,10 +55,12 @@ creation process).
 
 Both network and vsock packet loss can be expected on guests that are resumed
 from snapshots in another Firecracker process. It is also not guaranteed that
-the state of the network connections survives the process. Furthermore, vsock
-connections that are open when the snapshot is taken are closed, but existing
-vsock listen sockets in the guest still remain active and can accept new
-connections after resume (see [Vsock device reset](#vsock-device-reset)).
+the state of the network connections survives the process. Furthermore, the
+vsock connections a restored guest believes it has are closed, because they were
+made on the host the snapshot was taken on; existing vsock listen sockets in the
+guest still remain active and can accept new connections after resume (see
+[Vsock device reset](#vsock-device-reset)). The guest the snapshot was *taken*
+from keeps every connection it had: the reset belongs to the restore.
 
 In order to make restoring possible, Firecracker snapshots save the full state
 of the following resources:
@@ -369,10 +371,16 @@ should only be used when needed.
 
 Creating a snapshot has some minor effects on the currently running microVM:
 
-- The vsock device is [reset](#vsock-device-reset), causing the driver to
-  terminate connection on resumption.
 - On x86_64, a notification for KVM-clock is injected to notify the guest about
   being paused.
+
+A snapshot the same microVM resumes from -- a checkpoint -- leaves its vsock
+connections alone, so a command running over one of them runs to its end and is
+answered. Pass `"handoff": true` to `PUT /snapshot/create` when this guest is
+stopped for good and a destination will be restored from the state: the device
+then drops every vsock connection, closing the host side of each, rather than
+leaving the process on the other end waiting on a guest that is never scheduled
+again.
 
 #### Syncing snapshot files
 
@@ -666,14 +674,17 @@ For reference, the C code used in our tests is available
 
 ## Vsock device reset
 
-The vsock device is reset across snapshot/restore to avoid inconsistent state
-between device and driver leading to breakage
+The vsock device is reset on restore, to avoid inconsistent state between device
+and driver leading to breakage
 ([#2218](https://github.com/firecracker-microvm/firecracker/issues/2218)). This
 is done by sending a `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` event to the guest
-driver during `SnapshotCreate`
-([#2562](https://github.com/firecracker-microvm/firecracker/pull/2562)). On
-`SnapshotResume`, when the VM becomes active again, the vsock driver closes all
-existing connections. Existing listen sockets still remain active, but their CID
+driver of a microVM that has been restored from a snapshot, before its vCPUs run
+again. Upstream publishes that event during `SnapshotCreate` instead
+([#2562](https://github.com/firecracker-microvm/firecracker/pull/2562)), which
+also kills the connections of the guest the snapshot was taken from, whether or
+not it goes on running; a snapshot is not what invalidates a connection, and
+restoring one on another host is. When the VM becomes active again, the vsock
+driver closes all existing connections. Existing listen sockets still remain active, but their CID
 is updated to reflect the current `guest_cid`. More details about this event can
 be found in the official Virtio document
 [here](https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-4080006).

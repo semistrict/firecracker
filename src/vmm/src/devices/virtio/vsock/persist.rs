@@ -119,6 +119,12 @@ where
         vsock.avail_features = state.virtio_state.avail_features;
         vsock.device_state = DeviceState::Inactive;
         vsock.pending_event_ack = state.pending_event_ack;
+        // The driver in the restored guest believes it holds connections that were
+        // made on the host this snapshot was taken on; this host has a socket for
+        // none of them. It is told so before it runs again, which is where the vsock
+        // reset belongs: taking a snapshot does not invalidate a connection, and a VM
+        // resuming from its own checkpoint keeps every one it had.
+        vsock.reset_on_resume = true;
         Ok(vsock)
     }
 }

@@ -257,6 +257,13 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
 
     /// Prepare the device for saving its state
     fn prepare_save(&mut self) {}
+
+    /// Prepare the device for a handoff: this VM's guest is stopped for good, and a
+    /// destination will be restored from the state being saved. Whatever the device
+    /// holds on the guest's behalf towards the outside world is over, and anything
+    /// waiting on it should be told so rather than left waiting on a guest that is
+    /// never scheduled again.
+    fn prepare_handoff(&mut self) {}
 }
 
 impl fmt::Debug for dyn VirtioDevice {
