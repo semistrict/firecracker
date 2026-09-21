@@ -610,7 +610,10 @@ pub fn restore_from_snapshot(
         MemBackendType::Sproutfs => {
             #[cfg(feature = "sproutfs-memory")]
             {
-                if vm_resources.machine_config.huge_pages != HugePageConfig::Hugetlbfs2M
+                // As on the boot path, managed RAM takes no huge-page setting:
+                // the pager owns that memory and states its page when the
+                // session attaches.
+                if vm_resources.machine_config.huge_pages != HugePageConfig::None
                     || mem_state
                         .regions
                         .iter()
@@ -619,7 +622,7 @@ pub fn restore_from_snapshot(
                     return Err(
                         RestoreFromSnapshotGuestMemoryError::Managed(std::io::Error::new(
                             std::io::ErrorKind::Unsupported,
-                            "managed restore requires fixed RAM with 2 MiB HugeTLB backing",
+                            "managed restore requires fixed RAM and no huge-page setting",
                         ))
                         .into(),
                     );

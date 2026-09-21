@@ -508,17 +508,23 @@ impl VmResources {
         #[cfg(feature = "sproutfs-memory")]
         if let Some(config) = &self.managed_memory {
             use crate::vmm_config::drive::FileEngineType;
+            // Managed RAM is not backed by this process at all: the pager owns
+            // the memory and states its page when the session attaches, so the
+            // machine's own huge-page setting must say nothing about it. It is
+            // ordinary memory on the host — the pager's RAM arena is a plain
+            // memfd — so a HugeTLB setting here would be a claim about backing
+            // this VM does not choose.
             if self.balloon.get().is_some()
                 || self.memory_hotplug.is_some()
                 || self.machine_config.huge_pages
-                    != crate::vmm_config::machine_config::HugePageConfig::Hugetlbfs2M
+                    != crate::vmm_config::machine_config::HugePageConfig::None
                 || self.block.configs().iter().any(|drive| {
                     drive.socket.is_some() || drive.file_engine_type == Some(FileEngineType::Async)
                 })
             {
                 return Err(MemoryError::Managed(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "managed RAM requires 2 MiB HugeTLB pages and does not support ballooning, hotplug, vhost-user or asynchronous block I/O",
+                    "managed RAM is the pager's own backing, so it takes no huge-page setting, and it does not support ballooning, hotplug, vhost-user or asynchronous block I/O",
                 )));
             }
             return crate::managed_memory::ram(

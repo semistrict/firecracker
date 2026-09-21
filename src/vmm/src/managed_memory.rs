@@ -39,6 +39,10 @@ pub struct Owner {
     socket_path: std::path::PathBuf,
     control: Control,
     region: Region,
+    /// The page the host's pager runs for this region, which the session states
+    /// when it attaches. It is not the same for every owner: a host's RAM and
+    /// its PMEM are two pagers, 4 KiB and 2 MiB.
+    page_size: usize,
     stopping: Arc<AtomicBool>,
     service: Mutex<Option<JoinHandle<Session>>>,
 }
@@ -60,6 +64,7 @@ impl Owner {
             .clone();
         let mut session = Session::connect(path, spec)?;
         let region = session.region();
+        let page_size = session.page_size();
         let control = session.control();
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
@@ -85,6 +90,7 @@ impl Owner {
             socket_path: path.to_owned(),
             control,
             region,
+            page_size,
             stopping,
             service: Mutex::new(Some(service)),
         }))
@@ -93,6 +99,11 @@ impl Owner {
     /// The stable address retained by this owner.
     pub fn region(&self) -> Region {
         self.region
+    }
+
+    /// The page the host's pager runs for this region.
+    pub fn page_size(&self) -> usize {
+        self.page_size
     }
 
     /// Socket identity used to construct this attachment.
@@ -201,7 +212,15 @@ struct VolumeRange {
 /// The layout must be exactly the one this architecture gives that size. A
 /// snapshot restored onto a different split would otherwise read every byte
 /// past the first hole from the wrong volume offset.
-fn volume_ranges(layout: &[(GuestAddress, usize)]) -> io::Result<Vec<VolumeRange>> {
+///
+/// `page_size` is the page the host's RAM pager runs, which the session states
+/// when it attaches: every guest region is whole pages of it at a page-aligned
+/// guest address, so that a volume offset and a guest address name the same
+/// page on both sides.
+fn volume_ranges(
+    layout: &[(GuestAddress, usize)],
+    page_size: usize,
+) -> io::Result<Vec<VolumeRange>> {
     let refuse = |reason: &str| io::Error::new(io::ErrorKind::Unsupported, reason.to_owned());
     let total = layout
         .iter()
@@ -216,9 +235,7 @@ fn volume_ranges(layout: &[(GuestAddress, usize)]) -> io::Result<Vec<VolumeRange
     let mut offset = 0;
     let mut ranges = Vec::with_capacity(layout.len());
     for &(guest, len) in layout {
-        if len % sproutfs_vm_memory::PAGE_SIZE != 0
-            || guest.0 % sproutfs_vm_memory::PAGE_SIZE as u64 != 0
-        {
+        if len % page_size != 0 || guest.0 % page_size as u64 != 0 {
             return Err(refuse(
                 "managed RAM regions must be whole pager pages at page-aligned guest addresses",
             ));
@@ -240,8 +257,20 @@ pub fn ram(
     layout: &[(GuestAddress, usize)],
     track_dirty: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-    let ranges = volume_ranges(layout).map_err(MemoryError::Managed)?;
-    let len = ranges.iter().map(|range| range.len).sum();
+    // The volume is the guest's regions concatenated, so its length is known
+    // before the page is. The session states the page when it attaches, and the
+    // layout is checked against it before any of it becomes guest memory: an
+    // owner dropped here closes its session, having exposed nothing.
+    let len = layout
+        .iter()
+        .try_fold(0usize, |total, (_, len)| total.checked_add(*len))
+        .filter(|total| *total > 0)
+        .ok_or_else(|| {
+            MemoryError::Managed(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "managed RAM is an empty or overlong memory size",
+            ))
+        })?;
     let owner = Owner::connect(
         &config.socket_path,
         RegionSpec {
@@ -250,6 +279,7 @@ pub fn ram(
         },
     )
     .map_err(MemoryError::Managed)?;
+    let ranges = volume_ranges(layout, owner.page_size()).map_err(MemoryError::Managed)?;
     let region = owner.region();
     ranges
         .into_iter()
@@ -271,6 +301,11 @@ mod tests {
     use crate::arch::{MMIO64_MEM_SIZE, MMIO64_MEM_START, arch_memory_regions};
 
     const GIB: usize = 1 << 30;
+
+    /// The placement is about guest holes rather than about the page, so these
+    /// exercise it at the larger of the two pages the transport maps: a layout
+    /// that is whole 2 MiB pages is whole 4 KiB pages too.
+    const PAGE: usize = sproutfs_vm_memory::MAX_PAGE_SIZE;
 
     /// A seal handle that records whether it was waited on. Dropping a real
     /// PendingSeal without observing its completion closes the control session,
@@ -366,7 +401,7 @@ mod tests {
         let mut guest_end = 0;
         for range in ranges {
             assert_eq!(range.offset, offset);
-            assert!(range.len > 0 && range.len % sproutfs_vm_memory::PAGE_SIZE == 0);
+            assert!(range.len > 0 && range.len % PAGE == 0);
             assert!(range.guest.0 >= guest_end);
             offset += range.len;
             guest_end = range.guest.0 + range.len as u64;
@@ -377,7 +412,7 @@ mod tests {
     #[test]
     fn a_size_below_the_first_hole_is_one_range() {
         let size = GIB;
-        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        let ranges = volume_ranges(&arch_memory_regions(size), PAGE).unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].offset, 0);
         assert_eq!(ranges[0].len, size);
@@ -387,7 +422,7 @@ mod tests {
     #[test]
     fn a_size_spanning_the_64_bit_hole_skips_it() {
         let size = usize::try_from(MMIO64_MEM_START).unwrap() + GIB;
-        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        let ranges = volume_ranges(&arch_memory_regions(size), PAGE).unwrap();
         check_covers(&ranges, size);
         assert!(ranges.len() > 1, "the hole splits this size");
         let past = *ranges.last().unwrap();
@@ -406,13 +441,13 @@ mod tests {
         let size = 4 * GIB;
         let mut layout = arch_memory_regions(size);
         let (first, len) = layout[0];
-        layout[0] = (first, len - sproutfs_vm_memory::PAGE_SIZE);
+        layout[0] = (first, len - PAGE);
         layout.push((
-            GuestAddress(first.0 + len as u64 - sproutfs_vm_memory::PAGE_SIZE as u64),
-            sproutfs_vm_memory::PAGE_SIZE,
+            GuestAddress(first.0 + len as u64 - PAGE as u64),
+            PAGE,
         ));
         assert_eq!(
-            volume_ranges(&layout).unwrap_err().kind(),
+            volume_ranges(&layout, PAGE).unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
     }
@@ -420,7 +455,7 @@ mod tests {
     #[test]
     fn an_empty_layout_is_refused() {
         assert_eq!(
-            volume_ranges(&[]).unwrap_err().kind(),
+            volume_ranges(&[], PAGE).unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
     }
@@ -433,7 +468,7 @@ mod tests {
         use crate::arch::{FIRST_ADDR_PAST_32BITS, MMIO32_MEM_START};
 
         let size = 4 * GIB;
-        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        let ranges = volume_ranges(&arch_memory_regions(size), PAGE).unwrap();
         check_covers(&ranges, size);
         let below = usize::try_from(MMIO32_MEM_START).unwrap();
         assert_eq!(
@@ -463,7 +498,7 @@ mod tests {
     #[test]
     fn ram_up_to_the_32_bit_hole_is_one_range() {
         let size = usize::try_from(crate::arch::MMIO32_MEM_START).unwrap();
-        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        let ranges = volume_ranges(&arch_memory_regions(size), PAGE).unwrap();
         assert_eq!(ranges.len(), 1);
         check_covers(&ranges, size);
     }
@@ -476,7 +511,7 @@ mod tests {
         use crate::arch::DRAM_MEM_START;
 
         let size = 8 * GIB;
-        let ranges = volume_ranges(&arch_memory_regions(size)).unwrap();
+        let ranges = volume_ranges(&arch_memory_regions(size), PAGE).unwrap();
         assert_eq!(
             ranges,
             vec![VolumeRange {
