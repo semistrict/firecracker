@@ -11,6 +11,7 @@ impl Pmem {
     const PROCESS_ACTIVATE: u32 = 0;
     const PROCESS_PMEM_QUEUE: u32 = 1;
     const PROCESS_RATE_LIMITER: u32 = 2;
+    const PROCESS_FLUSH_ANSWERED: u32 = 3;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
@@ -26,6 +27,13 @@ impl Pmem {
             EventSet::IN,
         )) {
             error!("pmem: Failed to register rate-limiter event: {err}");
+        }
+        if let Err(err) = ops.add(Events::with_data(
+            &*self.flushes.answered,
+            Self::PROCESS_FLUSH_ANSWERED,
+            EventSet::IN,
+        )) {
+            error!("pmem: Failed to register flush-answer event: {err}");
         }
     }
 
@@ -95,6 +103,7 @@ impl MutEventSubscriber for Pmem {
             Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
             Self::PROCESS_PMEM_QUEUE => self.process_queue(),
             Self::PROCESS_RATE_LIMITER => self.process_rate_limiter_event(),
+            Self::PROCESS_FLUSH_ANSWERED => self.process_flush_answers(),
             _ => {
                 warn!("pmem: Unknown event received: {source}");
             }

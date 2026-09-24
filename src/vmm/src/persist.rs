@@ -168,8 +168,10 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
 }
 
-/// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
+/// Snapshot version. 14 records a managed PMEM device's flushes no host had
+/// answered, which the device asks for again on the host it is restored on; a
+/// version 13 snapshot has no place for them.
+pub const SNAPSHOT_VERSION: Version = Version::new(14, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(

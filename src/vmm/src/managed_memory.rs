@@ -110,6 +110,17 @@ impl Owner {
     pub fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
     }
+
+}
+
+/// A managed volume's flushes are the host's: it answers each once what the
+/// guest flushed is durable, which may take a disk checkpoint first. A session
+/// that ends answers every flush still waiting with EPIPE, so no guest waits on
+/// a host that is gone.
+impl crate::devices::virtio::pmem::device::FlushHost for Owner {
+    fn start_flush(&self, flushed: Box<dyn FnOnce(io::Result<()>) + Send>) -> io::Result<()> {
+        self.control.start_flush(flushed)
+    }
 }
 
 /// How long a seal request waits here. The host's own deadline is the one that

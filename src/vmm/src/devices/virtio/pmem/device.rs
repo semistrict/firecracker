@@ -1,10 +1,11 @@
 // Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{KVM_MEM_READONLY, kvm_userspace_memory_region};
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,150 @@ pub enum PmemError {
 const VIRTIO_PMEM_REQ_TYPE_FLUSH: u32 = 0;
 const SUCCESS: i32 = 0;
 const FAILURE: i32 = -1;
+
+/// Where a managed volume's flushes go: the host, which makes each durable and
+/// then answers it. The answer may be seconds away, so a device never waits for
+/// it; `flushed` runs once, on whatever thread the answer arrives on, unless
+/// starting the request fails, in which case it never runs.
+pub trait FlushHost: std::fmt::Debug + Send + Sync {
+    fn start_flush(
+        &self,
+        flushed: Box<dyn FnOnce(std::io::Result<()>) + Send>,
+    ) -> std::io::Result<()>;
+}
+
+/// One guest flush request the device has taken off its queue and not yet
+/// completed: the head of its descriptor chain, and the guest address its
+/// status goes to. A snapshot records these, so a guest restored elsewhere has
+/// its waiting flushes asked of the host it is restored on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFlush {
+    pub head: u16,
+    pub status: u64,
+}
+
+/// A managed volume's flushes between the queue and the host's answers.
+///
+/// Each queue drain is one request to the host covering every flush in it,
+/// since one answer makes all of them durable. A request's answer is handed
+/// over by the thread it arrives on through `answers` and `answered`, and the
+/// device completes its flushes on its own thread when the event fires, so
+/// the VMM thread never waits for the host.
+#[derive(Debug)]
+pub struct Flushes {
+    host: Option<Arc<dyn FlushHost>>,
+    /// Requests the host has been sent and has not answered, by request.
+    sent: BTreeMap<u64, Vec<PendingFlush>>,
+    /// Flushes the host this device now serves has never been asked: those a
+    /// snapshot restored, and those held over a handoff. The next kick, which
+    /// is the resume that runs the guest again, asks for them.
+    unsent: Vec<PendingFlush>,
+    next: u64,
+    answers: Answers,
+    pub answered: Arc<EventFd>,
+}
+
+/// The host's answers, by request, as the threads they arrive on hand them over.
+type Answers = Arc<Mutex<Vec<(u64, std::io::Result<()>)>>>;
+
+impl Flushes {
+    fn new(host: Option<Arc<dyn FlushHost>>) -> Result<Self, PmemError> {
+        Ok(Self {
+            host,
+            sent: BTreeMap::new(),
+            unsent: Vec::new(),
+            next: 0,
+            answers: Arc::new(Mutex::new(Vec::new())),
+            answered: Arc::new(EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?),
+        })
+    }
+
+    /// Whether a host answers this device's flushes, rather than msync.
+    fn hosted(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Asks the host to make these flushes durable. A request that cannot be
+    /// started is answered with its error at once, through the same event.
+    fn send(&mut self, flushes: Vec<PendingFlush>) {
+        let Some(host) = &self.host else {
+            return;
+        };
+        let request = self.next;
+        self.next += 1;
+        self.sent.insert(request, flushes);
+        let answer = {
+            let answers = self.answers.clone();
+            let answered = self.answered.clone();
+            move |result| {
+                answers.lock().unwrap().push((request, result));
+                if let Err(err) = answered.write(1) {
+                    error!("pmem: Unable to signal a flush's answer: {err}");
+                }
+            }
+        };
+        if let Err(err) = host.start_flush(Box::new(answer)) {
+            self.answers.lock().unwrap().push((request, Err(err)));
+            if let Err(err) = self.answered.write(1) {
+                error!("pmem: Unable to signal a flush's answer: {err}");
+            }
+        }
+    }
+
+    /// Takes the flushes the host has answered, with its answer. An answer to
+    /// a request this device has since forgotten — over a reset, or a handoff
+    /// that gave its flushes to the guest's next host — completes nothing.
+    fn take_answered(&mut self) -> Vec<(Vec<PendingFlush>, std::io::Result<()>)> {
+        // Read before the answers are taken: an answer pushed after this read
+        // signals again, and one pushed before it is taken below.
+        if let Err(err) = self.answered.read()
+            && err.kind() != std::io::ErrorKind::WouldBlock
+        {
+            error!("pmem: Unable to consume a flush's answer: {err}");
+        }
+        let answers = std::mem::take(&mut *self.answers.lock().unwrap());
+        answers
+            .into_iter()
+            .filter_map(|(request, result)| {
+                self.sent.remove(&request).map(|flushes| (flushes, result))
+            })
+            .collect()
+    }
+
+    /// Every flush that is waiting, whether or not its host has been asked.
+    pub fn pending(&self) -> Vec<PendingFlush> {
+        let mut pending = self.unsent.clone();
+        pending.extend(self.sent.values().flatten());
+        pending
+    }
+
+    /// Takes back every flush sent to this host, which will never answer them:
+    /// the guest is stopped for a destination, and its flushes are asked of the
+    /// host it is restored on. If it runs here again instead, they are asked
+    /// again on its resume.
+    fn hand_off(&mut self) {
+        let sent = std::mem::take(&mut self.sent);
+        self.unsent.extend(sent.into_values().flatten());
+    }
+
+    /// Asks for the flushes this host has never been asked.
+    fn resend(&mut self) {
+        if !self.unsent.is_empty() && self.hosted() {
+            let unsent = std::mem::take(&mut self.unsent);
+            self.send(unsent);
+        }
+    }
+
+    /// Records flushes a snapshot held, to be asked on the next resume.
+    pub fn restore(&mut self, pending: &[PendingFlush]) {
+        self.unsent.extend_from_slice(pending);
+    }
+
+    fn reset(&mut self) {
+        self.sent.clear();
+        self.unsent.clear();
+    }
+}
 
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize)]
 #[repr(C)]
@@ -185,6 +330,16 @@ impl PmemMmap {
         self.managed.as_ref()
     }
 
+    /// The host a managed volume's flushes go to; none for a file-backed one,
+    /// which msync makes durable itself.
+    fn flush_host(&self) -> Option<Arc<dyn FlushHost>> {
+        #[cfg(feature = "sproutfs-memory")]
+        if let Some(owner) = &self.managed {
+            return Some(owner.clone());
+        }
+        None
+    }
+
     fn from_config(config: &PmemConfig) -> Result<Self, PmemError> {
         if let Some(managed) = &config.managed {
             if !config.path_on_host.is_empty()
@@ -227,10 +382,12 @@ impl PmemMmap {
     fn flush(&self) -> std::io::Result<()> {
         #[cfg(feature = "sproutfs-memory")]
         if self.managed.is_some() {
-            // A managed volume's durability is the host's interval checkpoint, taken
-            // under a vCPU pause, so a guest flush neither fences nor triggers
-            // anything. It succeeds here and costs nothing.
-            return Ok(());
+            // A managed volume's flush is the host's to answer, through the
+            // device's FlushHost; there is no file here to sync.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a managed volume is flushed by its host",
+            ));
         }
         // SAFETY: The mmap remains live for self's lifetime.
         if unsafe {
@@ -362,6 +519,7 @@ pub struct Pmem {
     pub mmap: PmemMmap,
     pub metrics: Arc<PmemMetrics>,
     pub rate_limiter: RateLimiter,
+    pub flushes: Flushes,
 
     pub config: PmemConfig,
 }
@@ -408,6 +566,7 @@ impl Pmem {
             .rate_limiter
             .map(RateLimiter::from)
             .unwrap_or_default();
+        let flushes = Flushes::new(mmap.flush_host())?;
 
         Ok(Self {
             avail_features: 1u64 << VIRTIO_F_VERSION_1,
@@ -419,6 +578,7 @@ impl Pmem {
             guest_region,
             metrics: PmemMetricsPerDevice::alloc(config.id.clone()),
             rate_limiter,
+            flushes,
             config,
             mmap,
             kvm_mem_slot,
@@ -453,9 +613,24 @@ impl Pmem {
         }
 
         let mut cached_result = None;
+        // A managed volume's flushes wait for the host, all of this drain's as
+        // one request; a file-backed one's are made durable here, by msync.
+        let mut flushed = Vec::new();
         while let Some(head) = self.queues[0].pop()? {
-            let add_result = match self.process_chain(head, &mut cached_result) {
-                Ok(()) => self.queues[0].add_used(head.index, 4),
+            let processed = if self.flushes.hosted() {
+                self.status_address(head).map(|status| {
+                    flushed.push(PendingFlush {
+                        head: head.index,
+                        status: status.0,
+                    });
+                    false
+                })
+            } else {
+                self.process_chain(head, &mut cached_result).map(|()| true)
+            };
+            let add_result = match processed {
+                Ok(false) => continue,
+                Ok(true) => self.queues[0].add_used(head.index, 4),
                 Err(err) => {
                     error!("pmem: {err}");
                     self.metrics.event_fails.inc();
@@ -467,6 +642,9 @@ impl Pmem {
                 self.metrics.event_fails.inc();
                 break;
             }
+        }
+        if !flushed.is_empty() {
+            self.flushes.send(flushed);
         }
 
         self.queues[0].advance_used_ring_idx();
@@ -558,6 +736,49 @@ impl Pmem {
             error!("pmem: {err:?}");
             self.metrics.event_fails.inc();
         });
+    }
+
+    /// Completes the flushes the host has answered: each gets the host's answer
+    /// as its status, and the guest is interrupted once for all of them.
+    pub fn process_flush_answers(&mut self) {
+        let answered = self.flushes.take_answered();
+        if answered.is_empty() {
+            return;
+        }
+        let active_state = self.device_state.active_state().unwrap();
+        for (flushes, result) in answered {
+            let status = match result {
+                Ok(()) => SUCCESS,
+                Err(err) => {
+                    error!("pmem: The host could not make a flush durable: {err}");
+                    self.metrics.event_fails.inc();
+                    FAILURE
+                }
+            };
+            for flush in flushes {
+                if let Err(err) = active_state
+                    .mem
+                    .write_obj(status, GuestAddress(flush.status))
+                {
+                    error!("pmem: {err}");
+                    self.metrics.event_fails.inc();
+                }
+                if let Err(err) = self.queues[0].add_used(flush.head, 4) {
+                    error!("pmem: {err}");
+                    self.metrics.event_fails.inc();
+                }
+            }
+        }
+        self.queues[0].advance_used_ring_idx();
+        if self.queues[0].prepare_kick() {
+            active_state
+                .interrupt
+                .trigger(VirtioInterruptType::Queue(0))
+                .unwrap_or_else(|err| {
+                    error!("pmem: {err}");
+                    self.metrics.event_fails.inc();
+                });
+        }
     }
 
     pub fn process_rate_limiter_event(&mut self) {
@@ -656,16 +877,30 @@ impl VirtioDevice for Pmem {
     }
 
     fn _reset(&mut self) -> bool {
+        // The driver that made them is gone, so its flushes complete nothing,
+        // and an answer to one arriving later is dropped.
+        self.flushes.reset();
         true
     }
 
     fn kick(&mut self) {
         if self.is_activated() {
             info!("kick pmem {}.", self.config.id);
+            // A kick is the resume that runs the guest again, and the host it
+            // runs on is asked for the flushes it has never been asked for.
+            self.flushes.resend();
             if let Err(err) = self.handle_queue() {
                 error!("pmem: Failed to process queue: {err}");
             }
         }
+    }
+
+    fn prepare_handoff(&mut self) {
+        // The host drops the flushes of a guest that leaves it and never answers
+        // them, since an answer would write into memory the destination now
+        // owns. They stay pending, and the snapshot being saved carries them to
+        // the host the guest is restored on.
+        self.flushes.hand_off();
     }
 }
 
@@ -882,5 +1117,211 @@ mod tests {
                 PmemError::Non4byteStatusDescriptor(0x69),
             ));
         }
+    }
+
+    type Answer = Box<dyn FnOnce(std::io::Result<()>) + Send>;
+
+    /// A host that answers nothing until the test says so, as a managed
+    /// volume's host answers a flush only once it is durable.
+    #[derive(Default)]
+    struct HeldHost(Mutex<Vec<Answer>>);
+
+    impl std::fmt::Debug for HeldHost {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("HeldHost").finish_non_exhaustive()
+        }
+    }
+
+    impl FlushHost for HeldHost {
+        fn start_flush(&self, flushed: Answer) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(flushed);
+            Ok(())
+        }
+    }
+
+    impl HeldHost {
+        fn asked(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+
+        /// Answers the oldest request the host holds.
+        fn answer(&self, result: std::io::Result<()>) {
+            let flushed = self.0.lock().unwrap().remove(0);
+            flushed(result);
+        }
+    }
+
+    const REQUEST: u64 = 0x4000;
+    const STATUS: u64 = 0x5000;
+    const UNWRITTEN: i32 = 0x69;
+
+    /// A file-backed device whose flushes go to `host`, with one flush request
+    /// on its queue, whose chain is descriptors 0 and 1 and whose status the
+    /// device has not written yet.
+    struct Flushing {
+        _backing: TempFile,
+        vm: Arc<KvmVm>,
+        pmem: Pmem,
+    }
+
+    fn flushing(mem: &GuestMemoryMmap, host: Arc<HeldHost>) -> (Flushing, VirtQueue<'_>) {
+        let kvm = Kvm::new(vec![]).unwrap();
+        let vm = Arc::new(KvmVm::new(kvm).unwrap());
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(0x20_0000).unwrap();
+        let config = PmemConfig {
+            id: "1".into(),
+            path_on_host: backing.as_path().to_str().unwrap().to_string(),
+            root_device: true,
+            read_only: false,
+            ..Default::default()
+        };
+        let mut pmem = Pmem::new(vm.clone(), config).unwrap();
+        pmem.flushes.host = Some(host);
+        // A restore checks the queue it is given against the device's own size.
+        let vq = VirtQueue::new(GuestAddress(0), mem, PMEM_QUEUE_SIZE);
+        pmem.queues[0] = vq.create_queue();
+        pmem.activate(mem.clone(), default_interrupt()).unwrap();
+        vq.avail.ring[0].set(0);
+        vq.dtable[0].set(REQUEST, 4, VIRTQ_DESC_F_NEXT, 1);
+        vq.dtable[1].set(STATUS, 4, VIRTQ_DESC_F_WRITE, 0);
+        mem.write_obj::<u32>(VIRTIO_PMEM_REQ_TYPE_FLUSH, GuestAddress(REQUEST))
+            .unwrap();
+        mem.write_obj::<i32>(UNWRITTEN, GuestAddress(STATUS))
+            .unwrap();
+        vq.used.idx.set(0);
+        vq.avail.idx.set(1);
+        (
+            Flushing {
+                _backing: backing,
+                vm,
+                pmem,
+            },
+            vq,
+        )
+    }
+
+    fn status(mem: &GuestMemoryMmap) -> i32 {
+        mem.read_obj::<i32>(GuestAddress(STATUS)).unwrap()
+    }
+
+    // A managed volume's flush waits for its host: the device takes it off the
+    // queue and asks, and completes it — status, used ring and interrupt — only
+    // once the answer is in, on its own thread and not while it waits.
+    #[test]
+    fn a_managed_flush_completes_when_its_host_answers() {
+        let host = Arc::new(HeldHost::default());
+        let mem = default_mem();
+        let (mut f, vq) = flushing(&mem, host.clone());
+        f.pmem.handle_queue().unwrap();
+        assert_eq!(host.asked(), 1);
+        assert_eq!(
+            vq.used.idx.get(),
+            0,
+            "the flush completed before its host answered"
+        );
+        assert_eq!(status(&mem), UNWRITTEN);
+        f.pmem.process_flush_answers();
+        assert_eq!(
+            vq.used.idx.get(),
+            0,
+            "the flush completed with no answer in"
+        );
+
+        host.answer(Ok(()));
+        f.pmem.process_flush_answers();
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().id, 0);
+        assert_eq!(status(&mem), SUCCESS);
+        assert_eq!(f.pmem.flushes.pending(), []);
+    }
+
+    // A session that ends answers every flush still waiting with EPIPE, and the
+    // guest reads that as a failed flush rather than waiting forever.
+    #[test]
+    fn a_lost_host_fails_the_flush() {
+        let host = Arc::new(HeldHost::default());
+        let mem = default_mem();
+        let (mut f, vq) = flushing(&mem, host.clone());
+        f.pmem.handle_queue().unwrap();
+        host.answer(Err(std::io::Error::from_raw_os_error(libc::EPIPE)));
+        f.pmem.process_flush_answers();
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(status(&mem), FAILURE);
+    }
+
+    // A snapshot taken while a flush waits carries it, and the device restored
+    // from it asks its own host for it when the guest resumes — the host the
+    // snapshot was taken on may never answer — and completes it on that answer.
+    #[test]
+    fn a_pending_flush_survives_a_snapshot() {
+        use crate::devices::virtio::pmem::persist::PmemConstructorArgs;
+        use crate::snapshot::Persist;
+
+        let before = Arc::new(HeldHost::default());
+        let mem = default_mem();
+        let (mut f, vq) = flushing(&mem, before.clone());
+        f.pmem.handle_queue().unwrap();
+        f.pmem.prepare_handoff();
+        let state = f.pmem.save();
+        assert_eq!(
+            state.pending_flushes,
+            [PendingFlush {
+                head: 0,
+                status: STATUS
+            }]
+        );
+        let Flushing { _backing, vm, pmem } = f;
+        drop(pmem);
+
+        let after = Arc::new(HeldHost::default());
+        let mut restored = Pmem::restore(
+            PmemConstructorArgs {
+                mem: &mem,
+                vm: vm.clone(),
+            },
+            &state,
+        )
+        .unwrap();
+        restored.flushes.host = Some(after.clone());
+        restored.activate(mem.clone(), default_interrupt()).unwrap();
+        assert_eq!(
+            after.asked(),
+            0,
+            "the flush was asked before the guest resumed"
+        );
+        restored.kick();
+        assert_eq!(after.asked(), 1, "the restored device did not ask its host");
+        assert_eq!(vq.used.idx.get(), 0);
+
+        after.answer(Ok(()));
+        restored.process_flush_answers();
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().id, 0);
+        assert_eq!(status(&mem), SUCCESS);
+    }
+
+    // The host a guest leaves never answers its flushes, and an answer that
+    // arrives anyway — a session ending with EPIPE — completes nothing: those
+    // flushes are the destination's. A guest that stays after all, because the
+    // handoff was abandoned and the guest resumed here, asks again.
+    #[test]
+    fn a_handoff_gives_its_flushes_to_the_next_resume() {
+        let host = Arc::new(HeldHost::default());
+        let mem = default_mem();
+        let (mut f, vq) = flushing(&mem, host.clone());
+        f.pmem.handle_queue().unwrap();
+        f.pmem.prepare_handoff();
+        host.answer(Err(std::io::Error::from_raw_os_error(libc::EPIPE)));
+        f.pmem.process_flush_answers();
+        assert_eq!(vq.used.idx.get(), 0, "a handed-off flush was completed");
+        assert_eq!(status(&mem), UNWRITTEN);
+
+        f.pmem.kick();
+        assert_eq!(host.asked(), 1);
+        host.answer(Ok(()));
+        f.pmem.process_flush_answers();
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(status(&mem), SUCCESS);
     }
 }

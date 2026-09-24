@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::device::{ConfigSpace, Pmem, PmemError};
+use super::device::{ConfigSpace, PendingFlush, Pmem, PmemError};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::devices::virtio::pmem::{PMEM_NUM_QUEUES, PMEM_QUEUE_SIZE};
@@ -22,6 +22,9 @@ pub struct PmemState {
     pub config_space: ConfigSpace,
     pub config: PmemConfig,
     pub rate_limiter_state: RateLimiterState,
+    /// The guest's flushes no host had answered when this was saved. The
+    /// device asks the host it is restored on for them when the guest resumes.
+    pub pending_flushes: Vec<PendingFlush>,
 }
 
 #[derive(Debug)]
@@ -53,6 +56,7 @@ impl<'a> Persist<'a> for Pmem {
             config_space: self.guest_region.config_space,
             config: self.config.clone(),
             rate_limiter_state: self.rate_limiter.save(),
+            pending_flushes: self.flushes.pending(),
         }
     }
 
@@ -76,6 +80,7 @@ impl<'a> Persist<'a> for Pmem {
         )?;
         pmem.rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
             .map_err(PmemPersistError::RateLimiter)?;
+        pmem.flushes.restore(&state.pending_flushes);
 
         Ok(pmem)
     }
