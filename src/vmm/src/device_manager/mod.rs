@@ -408,21 +408,32 @@ impl DeviceManager {
         });
     }
 
-    /// Returns disk owners, requiring every disk to participate in the checkpoint.
+    /// Returns disk owners, requiring every disk the guest can write to
+    /// participate in the checkpoint. A read-only drive or PMEM file is left
+    /// out: its bytes are the file's, the same wherever the VM is restored, so
+    /// a checkpoint has nothing of it to hold.
     #[cfg(feature = "sproutfs-memory")]
     pub fn managed_disk_owners(&self) -> Result<Vec<Arc<crate::managed_memory::Owner>>, String> {
         let mut owners = Vec::new();
         let mut error = None;
         self.for_each_virtio_device(|kind, device| {
-            if kind == VirtioDeviceType::Block {
-                error = Some("managed captures require volume-backed PMEM disks".into());
+            if kind == VirtioDeviceType::Block
+                && !device
+                    .as_any()
+                    .downcast_ref::<Block>()
+                    .is_some_and(Block::read_only)
+            {
+                error =
+                    Some("managed captures require writable disks to be volume-backed PMEM".into());
             }
             if let Some(pmem) = device.as_any().downcast_ref::<Pmem>() {
                 if let Some(owner) = pmem.mmap.managed_owner() {
                     owners.push(owner.clone());
-                } else {
-                    error =
-                        Some("ordinary PMEM files cannot participate in a managed capture".into());
+                } else if !pmem.config.read_only {
+                    error = Some(
+                        "writable ordinary PMEM files cannot participate in a managed capture"
+                            .into(),
+                    );
                 }
             }
         });
