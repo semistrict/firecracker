@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use sproutfs_vm_memory::{Control, Region, RegionKind, RegionSpec, Session};
+use sproutfs_vm_memory::{Control, MemoryRegion, MemoryRegionKind, MemoryRegionSpec, Session};
 use vm_memory::GuestAddress;
 
 use crate::resources::ManagedMemoryConfig;
@@ -38,8 +38,8 @@ pub fn configure_worker_policy(filters: &BpfThreadMap) -> io::Result<()> {
 pub struct Owner {
     socket_path: std::path::PathBuf,
     control: Control,
-    region: Region,
-    /// The page the host's pager runs for this region, which the session states
+    memory_region: MemoryRegion,
+    /// The page the host's pager runs for this memory region, which the session states
     /// when it attaches. It is not the same for every owner: a host's RAM and
     /// its PMEM are two pagers, 4 KiB and 2 MiB.
     page_size: usize,
@@ -50,20 +50,20 @@ pub struct Owner {
 impl std::fmt::Debug for Owner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManagedMemoryOwner")
-            .field("region", &self.region)
+            .field("memory_region", &self.memory_region)
             .finish_non_exhaustive()
     }
 }
 
 impl Owner {
     /// Connects before exposing any mapping and starts a dedicated service.
-    pub fn connect(path: &std::path::Path, spec: RegionSpec) -> io::Result<Arc<Self>> {
+    pub fn connect(path: &std::path::Path, spec: MemoryRegionSpec) -> io::Result<Arc<Self>> {
         let service_policy = WORKER_POLICY
             .get()
             .ok_or_else(|| io::Error::other("memory-worker policy not configured"))?
             .clone();
         let mut session = Session::connect(path, spec)?;
-        let region = session.region();
+        let memory_region = session.memory_region();
         let page_size = session.page_size();
         let control = session.control();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -89,7 +89,7 @@ impl Owner {
         Ok(Arc::new(Self {
             socket_path: path.to_owned(),
             control,
-            region,
+            memory_region,
             page_size,
             stopping,
             service: Mutex::new(Some(service)),
@@ -97,11 +97,11 @@ impl Owner {
     }
 
     /// The stable address retained by this owner.
-    pub fn region(&self) -> Region {
-        self.region
+    pub fn memory_region(&self) -> MemoryRegion {
+        self.memory_region
     }
 
-    /// The page the host's pager runs for this region.
+    /// The page the host's pager runs for this memory region.
     pub fn page_size(&self) -> usize {
         self.page_size
     }
@@ -284,20 +284,20 @@ pub fn ram(
         })?;
     let owner = Owner::connect(
         &config.socket_path,
-        RegionSpec {
-            kind: RegionKind::Ram,
+        MemoryRegionSpec {
+            kind: MemoryRegionKind::Ram,
             len,
         },
     )
     .map_err(MemoryError::Managed)?;
     let ranges = volume_ranges(layout, owner.page_size()).map_err(MemoryError::Managed)?;
-    let region = owner.region();
+    let memory_region = owner.memory_region();
     ranges
         .into_iter()
         .map(|range| {
             GuestRegionMmap::managed(
                 range.guest,
-                region.address + range.offset,
+                memory_region.address + range.offset,
                 range.len,
                 owner.clone(),
                 track_dirty,
