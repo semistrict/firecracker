@@ -855,7 +855,64 @@
             },
             {
                 "syscall": "fstatfs",
-                "comment": "Validate the managed arena is a 2 MiB HugeTLB memfd during restore."
+                "comment": "Check a managed-memory file is the memory its session runs"
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Check a managed-memory file's access mode as its session attaches",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "F_GETFL"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Map a run of a read-only managed-memory file privately, away from the memory region",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 16386,
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_NORESERVE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Map a run of a read-only managed-memory file privately into a batch's staging span",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 16402,
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_NORESERVE | libc::MAP_FIXED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
             }
         ]
     },
@@ -1656,6 +1713,31 @@
         "filter": [
             {
                 "syscall": "read"
+            },
+            {
+                "syscall": "recvmsg",
+                "comment": "Managed-memory frames, and the descriptor a FILE frame carries"
+            },
+            {
+                "syscall": "fstat",
+                "comment": "Check a managed-memory file handed over mid-session"
+            },
+            {
+                "syscall": "fstatfs",
+                "comment": "Check a managed-memory file is the memory its session runs"
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Check a managed-memory file's access mode",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "F_GETFL"
+                    }
+                ]
             },
             {
                 "syscall": "lseek"
