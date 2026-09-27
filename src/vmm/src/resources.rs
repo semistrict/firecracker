@@ -563,6 +563,17 @@ impl VmResources {
         }
     }
 
+    /// Whether a pager manages some of this microVM's guest memory: its RAM or
+    /// a PMEM device.
+    pub fn has_managed_memory(&self) -> bool {
+        self.managed_memory.is_some()
+            || self
+                .pmem
+                .configs
+                .iter()
+                .any(|config| config.managed.is_some())
+    }
+
     /// Allocates guest memory in a configuration most appropriate for these [`VmResources`].
     pub fn allocate_guest_memory(&self) -> Result<Vec<GuestRegionMmap>, MemoryError> {
         let regions =

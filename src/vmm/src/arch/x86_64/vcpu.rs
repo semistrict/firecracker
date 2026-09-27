@@ -21,6 +21,7 @@ use crate::arch::EntryPoint;
 use crate::arch::x86_64::generated::msr_index::{MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE};
 use crate::arch::x86_64::interrupts;
 use crate::arch::x86_64::msr::{MsrError, create_boot_msr_entries};
+use crate::arch::x86_64::nested::{self, NestedError, NestedState};
 use crate::arch::x86_64::regs::{SetupFpuError, SetupRegistersError, SetupSpecialRegistersError};
 use crate::cpu_config::x86_64::{CpuConfiguration, cpuid};
 use crate::logger::{IncMetric, METRICS, error, warn};
@@ -105,6 +106,8 @@ pub enum KvmVcpuError {
     VcpuSetXcrs(kvm_ioctls::Error),
     /// Failed to set KVM vcpu xsave: {0}
     VcpuSetXsave(kvm_ioctls::Error),
+    /// Failed to save or restore nested virtualization state: {0}
+    Nested(#[from] NestedError),
 }
 
 /// Error type for [`KvmVcpu::get_tsc_khz`] and [`KvmVcpu::is_tsc_scaling_required`].
@@ -136,6 +139,8 @@ pub enum KvmVcpuConfigureError {
     SetupSpecialRegisters(#[from] SetupSpecialRegistersError),
     /// Failed to configure LAPICs: {0}
     SetLint(#[from] interrupts::InterruptError),
+    /// Failed to limit the VMX controls offered to the guest: {0}
+    Nested(#[from] NestedError),
 }
 
 /// A wrapper around creating and using a kvm x86_64 vcpu.
@@ -154,6 +159,14 @@ pub struct KvmVcpu {
     ///
     /// `None` if `KVM_CAP_XSAVE2` not supported.
     xsave2_size: Option<usize>,
+    /// Size in bytes of the largest `kvm_nested_state`.
+    ///
+    /// `None` if `KVM_CAP_NESTED_STATE` not supported.
+    nested_state_size: Option<usize>,
+    /// A pager manages some of this guest's memory: it write-protects and
+    /// moves the pages. When the guest is offered VMX, the VMX controls that
+    /// make KVM pin guest pages are taken away before the vCPU first runs.
+    pub managed_memory: bool,
 }
 
 /// Vcpu peripherals
@@ -184,6 +197,8 @@ impl KvmVcpu {
             peripherals: Default::default(),
             msrs_to_save: vm.msrs_to_save().to_vec(),
             xsave2_size: vm.xsave2_size(),
+            nested_state_size: vm.nested_state_size(),
+            managed_memory: false,
         })
     }
 
@@ -277,6 +292,10 @@ impl KvmVcpu {
             .collect::<Vec<_>>();
 
         crate::arch::x86_64::msr::set_msrs(&self.fd, &kvm_msrs)?;
+        // Last, so that no template MSR offers them again.
+        if self.managed_memory && nested::offers_vmx(configured_cpuid) {
+            nested::forbid_pinning_controls(&self.fd)?;
+        }
         Ok(())
     }
 
@@ -630,6 +649,13 @@ impl KvmVcpu {
             .fd
             .get_vcpu_events()
             .map_err(KvmVcpuError::VcpuGetVcpuEvents)?;
+        // Last, as in QEMU. KVM_GET_NESTED_STATE first copies a running L2's
+        // state into the vmcs12 it returns.
+        let nested = if nested::offers_vmx(&cpuid) {
+            Some(nested::save(&self.fd, self.nested_state_size)?)
+        } else {
+            None
+        };
 
         Ok(VcpuState {
             cpuid,
@@ -643,6 +669,7 @@ impl KvmVcpu {
             xcrs,
             xsave,
             tsc_khz,
+            nested,
         })
     }
 
@@ -702,10 +729,24 @@ impl KvmVcpu {
         //
         // SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
         // only restores successfully, when the LAPIC is correctly configured.
+        //
+        // KVM takes the VMX capability MSRs only when CPUID offers VMX and L1
+        // is outside VMX operation. So they come after SET_CPUID2 and before
+        // SET_NESTED_STATE. SET_NESTED_STATE comes after SET_SREGS and before
+        // the rest, as in QEMU's kvm_arch_put_registers. A guest with managed
+        // memory loses the pinning controls before its nested state goes
+        // back, so KVM refuses a vmcs12 that uses them instead of mapping its
+        // pages.
 
         self.fd
             .set_cpuid2(&state.cpuid)
             .map_err(KvmVcpuError::VcpuSetCpuid)?;
+        if let Some(nested) = &state.nested {
+            nested::set_capabilities(&self.fd, &nested.vmx_capabilities)?;
+        }
+        if self.managed_memory && nested::offers_vmx(&state.cpuid) {
+            nested::forbid_pinning_controls(&self.fd)?;
+        }
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(KvmVcpuError::VcpuSetMpState)?;
@@ -715,6 +756,9 @@ impl KvmVcpu {
         self.fd
             .set_sregs(&state.sregs)
             .map_err(KvmVcpuError::VcpuSetSregs)?;
+        if let Some(nested) = &state.nested {
+            nested::restore(&self.fd, nested)?;
+        }
         // SAFETY: Safe unless the snapshot is corrupted.
         unsafe {
             // kvm-ioctl's `set_xsave2()` can be called even on kernel versions not supporting
@@ -814,6 +858,44 @@ pub struct VcpuState {
     pub xsave: Xsave,
     /// Tsc khz.
     pub tsc_khz: Option<u32>,
+    /// Nested virtualization state, when CPUID offers VMX.
+    pub nested: Option<NestedState>,
+}
+
+/// A vCPU's state in a version 14.0 snapshot, which has no nested state.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+pub(crate) struct VcpuStateV14 {
+    cpuid: CpuId,
+    saved_msrs: Vec<Msrs>,
+    debug_regs: kvm_debugregs,
+    lapic: kvm_lapic_state,
+    mp_state: kvm_mp_state,
+    regs: kvm_regs,
+    sregs: kvm_sregs,
+    vcpu_events: kvm_vcpu_events,
+    xcrs: kvm_xcrs,
+    xsave: Xsave,
+    tsc_khz: Option<u32>,
+}
+
+impl From<VcpuStateV14> for VcpuState {
+    fn from(state: VcpuStateV14) -> Self {
+        VcpuState {
+            cpuid: state.cpuid,
+            saved_msrs: state.saved_msrs,
+            debug_regs: state.debug_regs,
+            lapic: state.lapic,
+            mp_state: state.mp_state,
+            regs: state.regs,
+            sregs: state.sregs,
+            vcpu_events: state.vcpu_events,
+            xcrs: state.xcrs,
+            xsave: state.xsave,
+            tsc_khz: state.tsc_khz,
+            nested: None,
+        }
+    }
 }
 
 impl Debug for VcpuState {
@@ -835,6 +917,7 @@ impl Debug for VcpuState {
             .field("xcrs", &self.xcrs)
             .field("xsave", &self.xsave)
             .field("tsc_khz", &self.tsc_khz)
+            .field("nested", &self.nested)
             .finish()
     }
 }
@@ -850,6 +933,10 @@ mod tests {
     use super::*;
     use crate::arch::BootProtocol;
     use crate::arch::x86_64::cpu_model::CpuModel;
+    use crate::arch::x86_64::generated::msr_index::{
+        MSR_IA32_VMX_PROCBASED_CTLS2, MSR_IA32_VMX_TRUE_PINBASED_CTLS,
+        MSR_IA32_VMX_TRUE_PROCBASED_CTLS,
+    };
     use crate::cpu_config::templates::{
         CpuTemplateType, CustomCpuTemplate, GetCpuTemplate, StaticCpuTemplate,
     };
@@ -873,6 +960,25 @@ mod tests {
                 xcrs: Default::default(),
                 xsave: Xsave::new(0).unwrap(),
                 tsc_khz: Some(0),
+                nested: None,
+            }
+        }
+    }
+
+    impl From<VcpuState> for VcpuStateV14 {
+        fn from(state: VcpuState) -> Self {
+            VcpuStateV14 {
+                cpuid: state.cpuid,
+                saved_msrs: state.saved_msrs,
+                debug_regs: state.debug_regs,
+                lapic: state.lapic,
+                mp_state: state.mp_state,
+                regs: state.regs,
+                sregs: state.sregs,
+                vcpu_events: state.vcpu_events,
+                xcrs: state.xcrs,
+                xsave: state.xsave,
+                tsc_khz: state.tsc_khz,
             }
         }
     }
@@ -1333,5 +1439,111 @@ mod tests {
                     .chain(DEFERRED_MSRS.iter()),
             )
             .for_each(|(left, &right)| assert_eq!(left.index, right));
+    }
+
+    // The tests below need an Intel host whose KVM offers nested
+    // virtualization, so that KVM's supported CPUID has VMX.
+
+    fn setup_nested_vcpu(managed_memory: bool) -> (KvmVm, KvmVcpu, CpuId) {
+        let (vm, mut vcpu) = setup_vcpu(0x10000);
+        vcpu.managed_memory = managed_memory;
+        let cpuid = Cpuid::try_from(vm.kvm().supported_cpuid.clone()).unwrap();
+        let configured_cpuid = vcpu.configure_cpuid(&cpuid, 1, false).unwrap();
+        assert!(nested::offers_vmx(&configured_cpuid));
+        (vm, vcpu, configured_cpuid)
+    }
+
+    fn pinning_capabilities(vcpu: &KvmVcpu) -> BTreeMap<u32, u64> {
+        vcpu.get_msrs(
+            [
+                MSR_IA32_VMX_TRUE_PINBASED_CTLS,
+                MSR_IA32_VMX_TRUE_PROCBASED_CTLS,
+                MSR_IA32_VMX_PROCBASED_CTLS2,
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_managed_memory_forbids_pinning_controls() {
+        let (_vm, mut vcpu, cpuid) = setup_nested_vcpu(true);
+        let offered = pinning_capabilities(&vcpu);
+        vcpu.configure_msrs_for_boot(&BTreeMap::new(), &cpuid)
+            .unwrap();
+        let narrowed = pinning_capabilities(&vcpu);
+        assert_eq!(
+            narrowed,
+            offered
+                .iter()
+                .map(|(&index, &value)| (index, nested::without_pinning_controls(index, value)))
+                .collect()
+        );
+        // KVM offers L1 TPR shadow, so the narrowing took something away.
+        assert_ne!(narrowed, offered);
+    }
+
+    #[test]
+    fn test_unmanaged_memory_keeps_pinning_controls() {
+        let (_vm, mut vcpu, cpuid) = setup_nested_vcpu(false);
+        let offered = pinning_capabilities(&vcpu);
+        vcpu.configure_msrs_for_boot(&BTreeMap::new(), &cpuid)
+            .unwrap();
+        assert_eq!(pinning_capabilities(&vcpu), offered);
+    }
+
+    #[test]
+    fn test_nested_state_save_restore() {
+        let (_vm, mut vcpu, cpuid) = setup_nested_vcpu(true);
+        vcpu.configure_msrs_for_boot(&BTreeMap::new(), &cpuid)
+            .unwrap();
+        let state = vcpu.save_state().unwrap();
+        let saved = state.nested.as_ref().unwrap();
+        // L1 has not executed VMXON, so KVM returns the header alone.
+        assert_eq!(
+            saved.kvm_nested_state.len(),
+            size_of::<kvm_bindings::kvm_nested_state>()
+        );
+        let mut indices = nested::VMX_CAPABILITY_MSRS.to_vec();
+        indices.sort_unstable();
+        assert_eq!(
+            saved.vmx_capabilities.keys().copied().collect::<Vec<_>>(),
+            indices
+        );
+
+        // A new vCPU, as on a restore.
+        let (_vm, mut restored) = setup_vcpu(0x10000);
+        restored.managed_memory = true;
+        restored.restore_state(&state).unwrap();
+        assert_eq!(restored.save_state().unwrap().nested, state.nested);
+    }
+
+    #[test]
+    fn test_restore_forbids_pinning_controls() {
+        // A snapshot of a guest that was offered every control, restored with
+        // managed memory.
+        let (_vm, vcpu, _) = setup_nested_vcpu(false);
+        let state = vcpu.save_state().unwrap();
+        let offered = &state.nested.as_ref().unwrap().vmx_capabilities;
+
+        let (_vm, mut restored) = setup_vcpu(0x10000);
+        restored.managed_memory = true;
+        restored.restore_state(&state).unwrap();
+        for (index, value) in pinning_capabilities(&restored) {
+            assert_eq!(
+                value,
+                nested::without_pinning_controls(index, offered[&index])
+            );
+        }
+    }
+
+    #[test]
+    fn test_version_14_0_vcpu_state() {
+        // A 14.0 vCPU state has no nested state and reads as having none.
+        let old = VcpuStateV14::from(VcpuState::default());
+        let bytes = bitcode::serialize(&old).unwrap();
+        let state = VcpuState::from(bitcode::deserialize::<VcpuStateV14>(&bytes).unwrap());
+        assert_eq!(state.nested, None);
+        assert_eq!(state.tsc_khz, Some(0));
     }
 }

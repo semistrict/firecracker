@@ -147,13 +147,7 @@ pub fn build_microvm_for_boot(
     seccomp_filters: &BpfThreadMap,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     #[cfg(feature = "sproutfs-memory")]
-    if vm_resources.managed_memory.is_some()
-        || vm_resources
-            .pmem
-            .configs
-            .iter()
-            .any(|config| config.managed.is_some())
-    {
+    if vm_resources.has_managed_memory() {
         crate::managed_memory::configure_worker_policy(seccomp_filters).map_err(|err| {
             StartMicrovmError::GuestMemory(crate::vstate::memory::MemoryError::Managed(err))
         })?;
@@ -189,6 +183,10 @@ pub fn build_microvm_for_boot(
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm)?;
     let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
+    #[cfg(target_arch = "x86_64")]
+    for vcpu in &mut vcpus {
+        vcpu.kvm_vcpu.managed_memory = vm_resources.has_managed_memory();
+    }
     vm.register_dram_memory_regions(guest_memory)?;
 
     // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,
@@ -458,6 +456,10 @@ pub fn build_microvm_from_snapshot(
     let mut vcpus = vm
         .create_vcpus(vm_resources.machine_config.vcpu_count)
         .map_err(StartMicrovmError::KvmVm)?;
+    #[cfg(target_arch = "x86_64")]
+    for vcpu in &mut vcpus {
+        vcpu.kvm_vcpu.managed_memory = microvm_state.has_managed_memory();
+    }
 
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
         .map_err(StartMicrovmError::KvmVm)?;

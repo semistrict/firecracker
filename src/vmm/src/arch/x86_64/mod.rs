@@ -19,6 +19,8 @@ pub mod layout;
 mod mptable;
 /// Logic for configuring x86_64 model specific registers (MSRs).
 pub mod msr;
+/// Nested virtualization on Intel VMX.
+pub mod nested;
 /// Logic for configuring x86_64 registers.
 pub mod regs;
 /// Architecture specific vCPU code

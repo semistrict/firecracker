@@ -24,7 +24,7 @@ pub enum UtilsError {
 #[allow(unused)]
 pub fn open_vmstate(snapshot_path: &PathBuf) -> Result<Snapshot<MicrovmState>, UtilsError> {
     let mut snapshot_reader = File::open(snapshot_path).map_err(UtilsError::VmStateFileOpen)?;
-    Snapshot::load(&mut snapshot_reader).map_err(UtilsError::VmStateLoad)
+    MicrovmState::load(&mut snapshot_reader).map_err(UtilsError::VmStateLoad)
 }
 
 // This method is used only in aarch64 code so far

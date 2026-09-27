@@ -5,7 +5,7 @@
 
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::mem::forget;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::arch::VcpuStateV14;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
@@ -34,7 +35,7 @@ pub use crate::device_manager::VirtioDevicesState;
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, SnapshotError};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -107,6 +108,56 @@ pub struct MicrovmState {
     pub device_states: DevicesState,
 }
 
+impl MicrovmState {
+    /// Loads a snapshot of a microVM's state written in this version's layout
+    /// or in the version 14.0 one.
+    pub fn load<R: Read>(reader: &mut R) -> Result<Snapshot<Self>, SnapshotError> {
+        Snapshot::load_or_upgrade::<MicrovmStateV14, _>(reader, MICROVM_STATE_SINCE_MINOR)
+    }
+
+    /// Whether a pager manages some of this microVM's guest memory: its RAM
+    /// or a PMEM device.
+    pub fn has_managed_memory(&self) -> bool {
+        let managed_pmem = match &self.device_states.virtio_state {
+            VirtioDevicesState::Mmio(state) => state
+                .pmem_devices
+                .iter()
+                .any(|device| device.device_state.config.managed.is_some()),
+            VirtioDevicesState::Pci(state) => state
+                .pmem_devices
+                .iter()
+                .any(|device| device.device_state.config.managed.is_some()),
+        };
+        self.vm_info.managed_memory || managed_pmem
+    }
+}
+
+/// A microVM's state in a version 14.0 snapshot. Only an x86_64 vCPU's state
+/// differs: it has no nested virtualization state.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+pub(crate) struct MicrovmStateV14 {
+    vm_info: VmInfo,
+    kvm_state: KvmState,
+    vm_state: VmState,
+    vcpu_states: Vec<VcpuStateV14>,
+    device_states: DevicesState,
+}
+
+impl From<MicrovmStateV14> for MicrovmState {
+    // An aarch64 vCPU's state did not change, so there its conversion is the identity.
+    #[cfg_attr(target_arch = "aarch64", allow(clippy::useless_conversion))]
+    fn from(state: MicrovmStateV14) -> Self {
+        MicrovmState {
+            vm_info: state.vm_info,
+            kvm_state: state.kvm_state,
+            vm_state: state.vm_state,
+            vcpu_states: state.vcpu_states.into_iter().map(Into::into).collect(),
+            device_states: state.device_states,
+        }
+    }
+}
+
 /// This describes the mapping between Firecracker base virtual address and
 /// offset in the buffer or file backend for a guest memory region. It is used
 /// to tell an external process/thread where to populate the guest memory data
@@ -170,8 +221,13 @@ pub enum CreateSnapshotError {
 
 /// Snapshot version. 14 records a managed PMEM device's flushes no host had
 /// answered, which the device asks for again on the host it is restored on; a
-/// version 13 snapshot has no place for them.
-pub const SNAPSHOT_VERSION: Version = Version::new(14, 0, 0);
+/// version 13 snapshot has no place for them. 14.1 adds an x86_64 vCPU's
+/// nested virtualization state. A 14.0 snapshot still loads, with none.
+pub const SNAPSHOT_VERSION: Version = Version::new(14, 1, 0);
+
+/// The first minor version whose layout is [`MicrovmState`]'s. Earlier minor
+/// versions of the same major are in [`MicrovmStateV14`]'s.
+pub(crate) const MICROVM_STATE_SINCE_MINOR: u64 = 1;
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -708,7 +764,7 @@ fn snapshot_state_from_file(
     snapshot_path: &Path,
 ) -> Result<MicrovmState, SnapshotStateFromFileError> {
     let mut snapshot_reader = File::open(snapshot_path)?;
-    let snapshot = Snapshot::load(&mut snapshot_reader)?;
+    let snapshot = MicrovmState::load(&mut snapshot_reader)?;
 
     Ok(snapshot.data)
 }
@@ -987,6 +1043,80 @@ mod tests {
             panic!("expected MMIO virtio device state");
         };
         assert_eq!(restored_mmio, mmio)
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "aarch64", allow(clippy::useless_conversion))]
+    fn test_load_version_14_0_snapshot() {
+        // A snapshot from before vCPU state had nested state.
+        let old = MicrovmStateV14 {
+            vm_info: VmInfo {
+                mem_size_mib: 3,
+                ..Default::default()
+            },
+            kvm_state: Default::default(),
+            vm_state: Default::default(),
+            vcpu_states: vec![VcpuState::default().into(), VcpuState::default().into()],
+            device_states: Default::default(),
+        };
+        let mut buf = Vec::new();
+        Snapshot::new(old)
+            .with_version(Version::new(14, 0, 0))
+            .save(&mut buf)
+            .unwrap();
+
+        assert_eq!(
+            crate::snapshot::get_format_version(&mut buf.as_slice()).unwrap(),
+            Version::new(14, 0, 0)
+        );
+        let snapshot = MicrovmState::load(&mut buf.as_slice()).unwrap();
+        assert_eq!(snapshot.version(), &Version::new(14, 0, 0));
+        assert_eq!(snapshot.data.vm_info.mem_size_mib, 3);
+        assert_eq!(snapshot.data.vcpu_states.len(), 2);
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            snapshot
+                .data
+                .vcpu_states
+                .iter()
+                .all(|state| state.nested.is_none())
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_nested_state_in_snapshot() {
+        use crate::arch::x86_64::nested::NestedState;
+
+        let nested = NestedState {
+            vmx_capabilities: [(0x48d, 0x7f_0000_0016), (0x48b, 0x0053_7cee_0000_0000)].into(),
+            kvm_nested_state: vec![1; 128 + 4096],
+        };
+        let state = MicrovmState {
+            vcpu_states: vec![
+                VcpuState {
+                    nested: Some(nested.clone()),
+                    ..Default::default()
+                },
+                VcpuState::default(),
+            ],
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        Snapshot::new(state).save(&mut buf).unwrap();
+
+        let snapshot = MicrovmState::load(&mut buf.as_slice()).unwrap();
+        assert_eq!(snapshot.version(), &SNAPSHOT_VERSION);
+        assert_eq!(snapshot.data.vcpu_states[0].nested, Some(nested));
+        assert_eq!(snapshot.data.vcpu_states[1].nested, None);
+    }
+
+    #[test]
+    fn test_has_managed_memory() {
+        let mut state = MicrovmState::default();
+        assert!(!state.has_managed_memory());
+        state.vm_info.managed_memory = true;
+        assert!(state.has_managed_memory());
     }
 
     #[test]

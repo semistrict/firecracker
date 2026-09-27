@@ -65,6 +65,10 @@ pub struct KvmVm {
     ///
     /// `None` if `KVM_CAP_XSAVE2` not supported.
     xsave2_size: Option<usize>,
+    /// Size in bytes of the largest `kvm_nested_state` KVM_GET_NESTED_STATE returns.
+    ///
+    /// `None` if `KVM_CAP_NESTED_STATE` not supported.
+    nested_state_size: Option<usize>,
     /// Port IO bus
     pub pio_bus: Arc<Bus>,
 }
@@ -98,6 +102,20 @@ impl KvmVm {
             ret => Some(usize::try_from(ret).unwrap()),
         };
 
+        // `KVM_CHECK_EXTENSION(KVM_CAP_NESTED_STATE)` returns the largest size of
+        // `struct kvm_nested_state`, or 0 when KVM cannot save nested state.
+        let nested_state_size = match common.fd.check_extension_int(Cap::NestedState) {
+            ..=-1 => {
+                return Err(VmError::Arch(KvmVmError::CheckCapability(
+                    Cap::NestedState,
+                    vmm_sys_util::errno::Error::last(),
+                )));
+            }
+            0 => None,
+            // SAFETY: Safe because negative values are handled above.
+            ret => Some(usize::try_from(ret).unwrap()),
+        };
+
         common
             .fd
             .set_tss_address(u64_to_usize(crate::arch::x86_64::layout::KVM_TSS_ADDRESS))
@@ -109,6 +127,7 @@ impl KvmVm {
             common,
             msrs_to_save,
             xsave2_size,
+            nested_state_size,
             pio_bus,
         })
     }
@@ -232,6 +251,11 @@ impl KvmVm {
     /// Gets the size (in bytes) of the `kvm_xsave` struct.
     pub fn xsave2_size(&self) -> Option<usize> {
         self.xsave2_size
+    }
+
+    /// Gets the size (in bytes) of the largest `kvm_nested_state` struct.
+    pub fn nested_state_size(&self) -> Option<usize> {
+        self.nested_state_size
     }
 }
 

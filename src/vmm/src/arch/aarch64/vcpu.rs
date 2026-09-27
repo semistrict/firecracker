@@ -506,6 +506,10 @@ impl Peripherals {
     }
 }
 
+/// A vCPU's state in a version 14.0 snapshot. Its layout has not changed
+/// since.
+pub(crate) type VcpuStateV14 = VcpuState;
+
 /// Structure holding VCPU kvm state.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct VcpuState {

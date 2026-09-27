@@ -79,9 +79,8 @@ struct SnapshotHdr {
     version: Version,
 }
 
-/// Assumes the raw bytes stream read from the given [`Read`] instance is a snapshot file,
-/// and returns the version of it.
-pub fn get_format_version<R: Read>(reader: &mut R) -> Result<Version, SnapshotError> {
+/// Reads a whole snapshot file: the serialized snapshot followed by its 8-byte CRC.
+fn read_snapshot_file<R: Read>(reader: &mut R) -> Result<Vec<u8>, SnapshotError> {
     // Check size limit before reading the full file to prevent DOS attacks
     let mut buf = Vec::new();
     let bytes_read = reader
@@ -94,32 +93,55 @@ pub fn get_format_version<R: Read>(reader: &mut R) -> Result<Version, SnapshotEr
         ));
     }
 
-    // The last 8 bytes are the CRC, so we need to separate them for deserialization
+    // The last 8 bytes are the CRC, so we need to separate them
     if buf.len() < 8 {
         return Err(SnapshotError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "File too short to contain CRC",
         )));
     }
+    Ok(buf)
+}
 
+/// Decodes a snapshot whose data is in `Data`'s layout from minor version
+/// `since` on, and in `Old`'s layout below it, converting the latter.
+///
+/// bitcode cannot read the header alone, so this decodes in the current
+/// layout and falls back to the old one; a decode counts only when the
+/// version it finds belongs to that layout. The header is not validated.
+fn decode_or_upgrade<Data, Old>(buf: &[u8], since: u64) -> Result<Snapshot<Data>, SnapshotError>
+where
+    Data: DeserializeOwned,
+    Old: DeserializeOwned + Into<Data>,
+{
+    let current = bitcode::deserialize::<Snapshot<Data>>(buf);
+    if matches!(&current, Ok(snapshot) if snapshot.header.version.minor >= since) {
+        return Ok(current?);
+    }
+    match bitcode::deserialize::<Snapshot<Old>>(buf) {
+        Ok(old) if old.header.version.minor < since => Ok(Snapshot {
+            header: old.header,
+            data: old.data.into(),
+        }),
+        _ => Ok(current?),
+    }
+}
+
+/// Assumes the raw bytes stream read from the given [`Read`] instance is a snapshot file,
+/// and returns the version of it.
+pub fn get_format_version<R: Read>(reader: &mut R) -> Result<Version, SnapshotError> {
+    let buf = read_snapshot_file(reader)?;
     let (data_buf, _crc_buf) = buf.split_at(buf.len() - 8);
 
     // Since bitcode requires exact type matching, we need to try deserializing
-    // as the specific snapshot type we know about. In practice, all snapshots
-    // in Firecracker use MicrovmState as the data type.
-    use crate::persist::MicrovmState;
+    // as the specific snapshot types we know about. In practice, all snapshots
+    // in Firecracker use MicrovmState as the data type. If deserialization
+    // fails, the snapshot is from an older layout this build cannot read
+    // (such as bincode), or it is corrupted.
+    use crate::persist::{MICROVM_STATE_SINCE_MINOR, MicrovmState, MicrovmStateV14};
 
-    match bitcode::deserialize::<Snapshot<MicrovmState>>(data_buf) {
-        Ok(snapshot) => Ok(snapshot.header.version),
-        Err(e) => {
-            // If deserialization fails, it could be due to:
-            // 1. The snapshot was created with bincode (older versions)
-            // 2. The MicrovmState structure has changed and is incompatible
-            // 3. The snapshot file is corrupted
-            // Since supporting bincode is out of scope, we return a descriptive error.
-            Err(SnapshotError::Bitcode(e))
-        }
-    }
+    decode_or_upgrade::<MicrovmState, MicrovmStateV14>(data_buf, MICROVM_STATE_SINCE_MINOR)
+        .map(|snapshot| snapshot.header.version)
 }
 
 /// Firecracker snapshot type
@@ -148,60 +170,77 @@ impl<Data> Snapshot<Data> {
     pub fn version(&self) -> &Version {
         &self.header.version
     }
+
+    /// Checks the magic value and that this build reads the version.
+    fn validate(self) -> Result<Self, SnapshotError> {
+        if self.header.magic != SNAPSHOT_MAGIC_ID {
+            return Err(SnapshotError::InvalidMagic(self.header.magic));
+        }
+
+        if self.header.version.major != SNAPSHOT_VERSION.major
+            || self.header.version.minor > SNAPSHOT_VERSION.minor
+        {
+            return Err(SnapshotError::InvalidFormatVersion(self.header.version));
+        }
+
+        Ok(self)
+    }
+}
+
+/// Checks the size limit to prevent DOS attacks.
+fn check_size(buf: &[u8]) -> Result<(), SnapshotError> {
+    if buf.len() > SNAPSHOT_DESERIALIZATION_BYTES_LIMIT {
+        return Err(SnapshotError::SizeLimitExceeded(
+            SNAPSHOT_DESERIALIZATION_BYTES_LIMIT,
+        ));
+    }
+    Ok(())
 }
 
 impl<Data: DeserializeOwned> Snapshot<Data> {
     pub(crate) fn load_without_crc_check(buf: &[u8]) -> Result<Self, SnapshotError> {
-        // Check size limit to prevent DOS attacks
-        if buf.len() > SNAPSHOT_DESERIALIZATION_BYTES_LIMIT {
-            return Err(SnapshotError::SizeLimitExceeded(
-                SNAPSHOT_DESERIALIZATION_BYTES_LIMIT,
-            ));
-        }
+        check_size(buf)?;
+        bitcode::deserialize::<Self>(buf)?.validate()
+    }
 
-        let snapshot: Self = bitcode::deserialize(buf)?;
-
-        // Validate the header
-        if snapshot.header.magic != SNAPSHOT_MAGIC_ID {
-            return Err(SnapshotError::InvalidMagic(snapshot.header.magic));
-        }
-
-        if snapshot.header.version.major != SNAPSHOT_VERSION.major
-            || snapshot.header.version.minor > SNAPSHOT_VERSION.minor
-        {
-            return Err(SnapshotError::InvalidFormatVersion(
-                snapshot.header.version.clone(),
-            ));
-        }
-
-        Ok(snapshot)
+    /// As [`Self::load_without_crc_check`], for data whose layout changed at
+    /// minor version `since`: an older snapshot is read in `Old`'s layout.
+    pub(crate) fn load_without_crc_check_or_upgrade<Old>(
+        buf: &[u8],
+        since: u64,
+    ) -> Result<Self, SnapshotError>
+    where
+        Old: DeserializeOwned + Into<Data>,
+    {
+        check_size(buf)?;
+        decode_or_upgrade::<Data, Old>(buf, since)?.validate()
     }
 
     /// Loads a snapshot from the given [`Read`] instance, performing all validations
     /// (CRC, snapshot magic value, snapshot version).
     pub fn load<R: Read>(reader: &mut R) -> Result<Self, SnapshotError> {
-        // Check size limit before reading the full file to prevent DOS attacks
-        let mut buf = Vec::new();
-        let bytes_read = reader
-            .take((SNAPSHOT_DESERIALIZATION_BYTES_LIMIT + 1) as u64)
-            .read_to_end(&mut buf)?;
+        Self::load_with(reader, Self::load_without_crc_check)
+    }
 
-        if bytes_read > SNAPSHOT_DESERIALIZATION_BYTES_LIMIT {
-            return Err(SnapshotError::SizeLimitExceeded(
-                SNAPSHOT_DESERIALIZATION_BYTES_LIMIT,
-            ));
-        }
+    /// As [`Self::load`], for data whose layout changed at minor version
+    /// `since`: an older snapshot is read in `Old`'s layout and converted.
+    pub fn load_or_upgrade<Old, R>(reader: &mut R, since: u64) -> Result<Self, SnapshotError>
+    where
+        Old: DeserializeOwned + Into<Data>,
+        R: Read,
+    {
+        Self::load_with(reader, |buf| {
+            Self::load_without_crc_check_or_upgrade::<Old>(buf, since)
+        })
+    }
 
-        // The last 8 bytes are the CRC, so we need to separate them
-        if buf.len() < 8 {
-            return Err(SnapshotError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "File too short to contain CRC",
-            )));
-        }
-
+    fn load_with<R: Read>(
+        reader: &mut R,
+        decode: impl FnOnce(&[u8]) -> Result<Self, SnapshotError>,
+    ) -> Result<Self, SnapshotError> {
+        let buf = read_snapshot_file(reader)?;
         let (data_buf, _crc_buf) = buf.split_at(buf.len() - 8);
-        let snapshot = Self::load_without_crc_check(data_buf)?;
+        let snapshot = decode(data_buf)?;
 
         let computed_checksum = crc64(0, buf.as_slice());
         // When we read the entire file, we also read the checksum into the buffer. The CRC has the
@@ -229,9 +268,109 @@ impl<Data: Serialize> Snapshot<Data> {
 }
 
 #[cfg(test)]
+impl<Data> Snapshot<Data> {
+    /// Gives this snapshot another version, as an older build would write it.
+    pub(crate) fn with_version(mut self, version: Version) -> Self {
+        self.header.version = version;
+        self
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::persist::MicrovmState;
+
+    /// A layout that gained a field at minor version 1.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct New {
+        a: u32,
+        b: Option<Vec<u8>>,
+    }
+
+    /// The layout before it.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Old {
+        a: u32,
+    }
+
+    impl From<Old> for New {
+        fn from(old: Old) -> Self {
+            New { a: old.a, b: None }
+        }
+    }
+
+    fn saved<D: Serialize>(data: D, minor: u64) -> Vec<u8> {
+        let version = Version::new(SNAPSHOT_VERSION.major, minor, 0);
+        let mut buf = Vec::new();
+        Snapshot::new(data)
+            .with_version(version)
+            .save(&mut buf)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn test_load_or_upgrade() {
+        // The current layout at the version that introduced it.
+        let buf = saved(
+            New {
+                a: 1,
+                b: Some(vec![2; 3]),
+            },
+            1,
+        );
+        let snapshot = Snapshot::<New>::load_or_upgrade::<Old, _>(&mut buf.as_slice(), 1).unwrap();
+        assert_eq!(
+            snapshot.version(),
+            &Version::new(SNAPSHOT_VERSION.major, 1, 0)
+        );
+        assert_eq!(
+            snapshot.data,
+            New {
+                a: 1,
+                b: Some(vec![2; 3])
+            }
+        );
+
+        // The old layout at a version before it is converted.
+        let buf = saved(Old { a: 4 }, 0);
+        let snapshot = Snapshot::<New>::load_or_upgrade::<Old, _>(&mut buf.as_slice(), 1).unwrap();
+        assert_eq!(
+            snapshot.version(),
+            &Version::new(SNAPSHOT_VERSION.major, 0, 0)
+        );
+        assert_eq!(snapshot.data, New { a: 4, b: None });
+
+        // The old layout cannot be read without the upgrade.
+        assert!(matches!(
+            Snapshot::<New>::load(&mut buf.as_slice()),
+            Err(SnapshotError::Bitcode(_))
+        ));
+
+        // The old layout claiming a version of the new one is not read.
+        let buf = saved(Old { a: 5 }, 1);
+        assert!(matches!(
+            Snapshot::<New>::load_or_upgrade::<Old, _>(&mut buf.as_slice(), 1),
+            Err(SnapshotError::Bitcode(_))
+        ));
+
+        // The upgrade does not widen the versions this build reads.
+        let buf = saved(New { a: 6, b: None }, SNAPSHOT_VERSION.minor + 1);
+        assert!(matches!(
+            Snapshot::<New>::load_or_upgrade::<Old, _>(&mut buf.as_slice(), 1),
+            Err(SnapshotError::InvalidFormatVersion(v)) if v.minor == SNAPSHOT_VERSION.minor + 1
+        ));
+
+        // Nor does it skip the CRC.
+        let mut buf = saved(Old { a: 7 }, 0);
+        let last = buf.len() - 1;
+        buf[last] ^= 0xff;
+        assert!(matches!(
+            Snapshot::<New>::load_or_upgrade::<Old, _>(&mut buf.as_slice(), 1),
+            Err(SnapshotError::Crc64)
+        ));
+    }
 
     #[test]
     fn test_snapshot_restore() {
