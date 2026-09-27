@@ -1752,6 +1752,19 @@
                 ]
             },
             {
+                "syscall": "fcntl",
+                "comment": "Rust checks a descriptor is open as it closes it in debug builds: a managed-memory file the pager took back",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "F_GETFD"
+                    }
+                ]
+            },
+            {
                 "syscall": "lseek"
             },
             {
