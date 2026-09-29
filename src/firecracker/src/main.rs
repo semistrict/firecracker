@@ -259,6 +259,11 @@ fn main_exec() -> Result<(), MainError> {
                     .help("Print the supported data format version."),
             )
             .arg(
+                Argument::new("sproutfs-api-revision")
+                    .takes_value(false)
+                    .help("Print the revision of the sproutfs managed-memory API."),
+            )
+            .arg(
                 Argument::new("describe-snapshot")
                     .takes_value(true)
                     .help("Print the data format version of the provided snapshot state file."),
@@ -296,6 +301,11 @@ fn main_exec() -> Result<(), MainError> {
 
     if arguments.flag_present("snapshot-version") {
         println!("v{SNAPSHOT_VERSION}");
+        return Ok(());
+    }
+
+    if arguments.flag_present("sproutfs-api-revision") {
+        println!("{}", vmm::SPROUTFS_API_REVISION);
         return Ok(());
     }
 

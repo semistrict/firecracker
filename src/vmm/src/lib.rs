@@ -91,6 +91,20 @@ pub mod logger;
 /// Externally paged memory ownership and durable flush integration.
 #[cfg(feature = "sproutfs-memory")]
 pub mod managed_memory;
+
+/// The revision of the managed-memory API a sproutfs host drives this VMM
+/// with: the fields of the boot configuration, snapshot load and snapshot
+/// create that upstream Firecracker lacks. The host refuses to start unless
+/// this is the revision it speaks, because a VMM missing a field it sends boots
+/// guests and fails only at their first checkpoint, which loses their writes
+/// since the last one. Raise it with the host's whenever the host starts sending
+/// a field, or relying on a behaviour, that the previous revision lacks.
+#[cfg(feature = "sproutfs-memory")]
+pub const SPROUTFS_API_REVISION: u32 = 1;
+/// A VMM built without the managed memory speaks none of the API.
+#[cfg(not(feature = "sproutfs-memory"))]
+pub const SPROUTFS_API_REVISION: u32 = 0;
+
 /// microVM Metadata Service MMDS
 pub mod mmds;
 /// PCI specific emulation code.
