@@ -437,7 +437,7 @@ pub enum BuildMicrovmFromSnapshotError {
 pub fn build_microvm_from_snapshot(
     instance_info: &InstanceInfo,
     event_manager: &mut EventManager,
-    microvm_state: MicrovmState,
+    #[cfg_attr(target_arch = "aarch64", allow(unused_mut))] mut microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
@@ -474,6 +474,20 @@ pub fn build_microvm_from_snapshot(
                 for vcpu in &vcpus {
                     vcpu.kvm_vcpu.set_tsc_khz(state_tsc)?;
                 }
+            }
+        }
+        // A restore that moves kvmclock on by the wall time its state spent
+        // stopped moves the TSC on by the same, at the guest's TSC frequency.
+        // A guest whose clocksource is the TSC, which Linux prefers where the
+        // TSC is invariant, reads its time from the TSC alone.
+        if clock_realtime {
+            let stopped_ns = microvm_state.vm_state.stopped_ns();
+            let khz = match microvm_state.vcpu_states[0].tsc_khz {
+                Some(khz) => khz,
+                None => vcpus[0].kvm_vcpu.get_tsc_khz()?,
+            };
+            for state in &mut microvm_state.vcpu_states {
+                state.advance_tsc(stopped_ns, khz);
             }
         }
     }

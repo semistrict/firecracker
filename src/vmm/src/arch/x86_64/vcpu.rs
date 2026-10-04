@@ -862,6 +862,23 @@ pub struct VcpuState {
     pub nested: Option<NestedState>,
 }
 
+impl VcpuState {
+    /// Moves the guest's TSC on by `ns` nanoseconds at `khz`, as if the guest
+    /// had run for them. A restore moves it on by the wall time its state spent
+    /// stopped, beside kvmclock (see `KvmVm::restore_state`): a guest whose
+    /// clocksource is the TSC reads its time from the TSC alone.
+    pub fn advance_tsc(&mut self, ns: u64, khz: u32) {
+        let ticks = u64::try_from(u128::from(ns) * u128::from(khz) / 1_000_000).unwrap_or(u64::MAX);
+        for msrs in &mut self.saved_msrs {
+            for msr in msrs.as_mut_slice() {
+                if msr.index == MSR_IA32_TSC {
+                    msr.data = msr.data.wrapping_add(ticks);
+                }
+            }
+        }
+    }
+}
+
 /// A vCPU's state in a version 14.0 snapshot, which has no nested state.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
@@ -1107,6 +1124,41 @@ mod tests {
                 assert!(!t2a_res);
             }
         }
+    }
+
+    #[test]
+    fn test_advance_tsc_moves_the_restored_tsc_on() {
+        let (vm, vcpu) = setup_vcpu(0x10000);
+        vcpu.fd.set_cpuid2(&vm.kvm().supported_cpuid).unwrap();
+        let tsc = |state: &VcpuState| {
+            state
+                .saved_msrs
+                .iter()
+                .flat_map(|msrs| msrs.as_slice())
+                .find(|msr| msr.index == MSR_IA32_TSC)
+                .unwrap()
+                .data
+        };
+
+        let mut state = vcpu.save_state().unwrap();
+        let saved = tsc(&state);
+        let khz = vcpu.get_tsc_khz().unwrap();
+        // Ten seconds are ten thousand milliseconds of khz ticks each.
+        let ticks = u64::from(khz) * 10_000;
+        state.advance_tsc(10_000_000_000, khz);
+        assert_eq!(tsc(&state), saved + ticks);
+
+        // A vCPU restored from it runs on from there: past it, and by less
+        // than a second of its own ticks.
+        let (_vm, restored) = setup_vcpu(0x10000);
+        restored.restore_state(&state).unwrap();
+        let now = tsc(&restored.save_state().unwrap());
+        let second = u64::from(khz) * 1000;
+        assert!(
+            (saved + ticks..saved + ticks + second).contains(&now),
+            "the restored TSC is {now}, want {} plus less than {second}",
+            saved + ticks
+        );
     }
 
     #[test]

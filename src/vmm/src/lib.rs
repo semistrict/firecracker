@@ -100,7 +100,7 @@ pub mod managed_memory;
 /// since the last one. Raise it with the host's whenever the host starts sending
 /// a field, or relying on a behaviour, that the previous revision lacks.
 #[cfg(feature = "sproutfs-memory")]
-pub const SPROUTFS_API_REVISION: u32 = 1;
+pub const SPROUTFS_API_REVISION: u32 = 2;
 /// A VMM built without the managed memory speaks none of the API.
 #[cfg(not(feature = "sproutfs-memory"))]
 pub const SPROUTFS_API_REVISION: u32 = 0;

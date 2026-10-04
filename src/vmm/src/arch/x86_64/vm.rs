@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use kvm_bindings::{
     KVM_CLOCK_REALTIME, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
@@ -12,6 +13,7 @@ use kvm_ioctls::Cap;
 use serde::{Deserialize, Serialize};
 
 use crate::arch::x86_64::msr::MsrError;
+use crate::logger::warn;
 use crate::snapshot::Persist;
 use crate::utils::u64_to_usize;
 use crate::vstate::bus::Bus;
@@ -31,8 +33,6 @@ pub enum KvmVmError {
     SetPit2(kvm_ioctls::Error),
     /// Set clock error: {0}
     SetClock(kvm_ioctls::Error),
-    /// clock_realtime requested but not present in the snapshot state
-    ClockRealtimeNotInState,
     /// Set IrqChipPicMaster error: {0}
     SetIrqChipPicMaster(kvm_ioctls::Error),
     /// Set IrqChipPicSlave error: {0}
@@ -163,11 +163,19 @@ impl KvmVm {
             .map_err(KvmVmError::SetPit2)?;
         let mut clock = state.clock;
         clock.flags = if clock_realtime {
-            // clock_realtime needs to be present in the snapshot
+            // clock_realtime needs to be present in the snapshot. Every state
+            // this build saves has it (see `save_state`). One an older build
+            // saved on a host without a TSC master clock does not, and it is
+            // restored with its clock where it stopped rather than refused.
             if clock.flags & KVM_CLOCK_REALTIME == 0 {
-                return Err(KvmVmError::ClockRealtimeNotInState);
+                warn!(
+                    "The snapshot pairs no wall clock with the guest's clock, so the guest's \
+                     clock resumes where the snapshot stopped it."
+                );
+                0
+            } else {
+                KVM_CLOCK_REALTIME
             }
-            KVM_CLOCK_REALTIME
         } else {
             0
         };
@@ -206,7 +214,17 @@ impl KvmVm {
     pub fn save_state(&self) -> Result<VmState, KvmVmError> {
         let pitstate = self.fd().get_pit2().map_err(KvmVmError::VmGetPit2)?;
 
-        let clock = self.fd().get_clock().map_err(KvmVmError::VmGetClock)?;
+        let mut clock = self.fd().get_clock().map_err(KvmVmError::VmGetClock)?;
+        // KVM pairs the guest's clock with the host's wall clock only on a
+        // host whose own clock is the TSC. A nested host on kvm-clock gets no
+        // pairing, and a restore could then not move the guest's clock on by
+        // the wall time the state spent stopped. So the pairing is made here,
+        // from a wall clock read just after the guest's clock. The two are a
+        // few microseconds apart, which is what a restored clock is off by.
+        if clock.flags & KVM_CLOCK_REALTIME == 0 {
+            clock.realtime = wall_clock_ns();
+            clock.flags |= KVM_CLOCK_REALTIME;
+        }
 
         let mut pic_master = kvm_irqchip {
             chip_id: KVM_IRQCHIP_PIC_MASTER,
@@ -259,6 +277,28 @@ impl KvmVm {
     }
 }
 
+impl VmState {
+    /// The host's wall time since this state was saved, which a restore with
+    /// `clock_realtime` moves the guest's clocks on by. It is zero for a state
+    /// that pairs no wall clock with the guest's clock, and for one whose wall
+    /// clock is ahead of this host's.
+    pub fn stopped_ns(&self) -> u64 {
+        if self.clock.flags & KVM_CLOCK_REALTIME == 0 {
+            return 0;
+        }
+        wall_clock_ns().saturating_sub(self.clock.realtime)
+    }
+}
+
+/// The host's wall clock in nanoseconds since the Unix epoch, which is what KVM
+/// pairs with a guest's clock in `kvm_clock_data::realtime`.
+fn wall_clock_ns() -> u64 {
+    let since = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("the host's wall clock is before 1970");
+    u64::try_from(since.as_nanos()).expect("the host's wall clock is past 2554")
+}
+
 #[derive(Default, Deserialize, Serialize)]
 /// Structure holding VM kvm state.
 pub struct VmState {
@@ -296,7 +336,6 @@ mod tests {
     use kvm_ioctls::Cap;
     use std::time::SystemTime;
 
-    use crate::arch::KvmVmError;
     use crate::vstate::vm::VmState;
     use crate::vstate::vm::tests::{setup_vm, setup_vm_with_memory};
 
@@ -325,48 +364,100 @@ mod tests {
         vm.restore_state(&vm_state, false).unwrap();
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_vm_save_restore_state_kvm_clock_realtime() {
-        let vm = setup_vm_with_memory(0x1000);
-        vm.setup_irqchip().unwrap();
-
-        let clock_realtime_supported = vm
-            .kvm()
-            .fd
-            .check_extension_int(Cap::AdjustClock)
-            .cast_unsigned()
-            & KVM_CLOCK_REALTIME
-            != 0;
-
-        // mock a state without realtime information
-        let mut vm_state = vm.save_state().unwrap();
-        vm_state.clock.flags &= !KVM_CLOCK_REALTIME;
-
-        let mut vm = setup_vm_with_memory(0x1000);
-        vm.setup_irqchip().unwrap();
-
-        let res = vm.restore_state(&vm_state, true);
-        assert!(res == Err(KvmVmError::ClockRealtimeNotInState));
-
-        // mock a state with realtime information
-        vm_state.clock.flags |= KVM_CLOCK_REALTIME;
-        vm_state.clock.realtime = SystemTime::now()
+    fn now_ns() -> u64 {
+        SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
             .try_into()
-            .unwrap();
+            .unwrap()
+    }
 
-        let mut vm = setup_vm_with_memory(0x1000);
+    /// How long the states below pretend to have been stopped for.
+    const STOPPED_NS: u64 = 10_000_000_000;
+    /// How much a clock may move between a save and a restore in one test.
+    const SLACK_NS: u64 = 1_000_000_000;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vm_save_state_pairs_the_clock_with_the_wall_clock() {
+        let vm = setup_vm_with_memory(0x1000);
         vm.setup_irqchip().unwrap();
 
-        let res = vm.restore_state(&vm_state, true);
-        if clock_realtime_supported {
-            res.unwrap()
-        } else {
-            assert!(matches!(res, Err(KvmVmError::SetClock(err)) if err.errno() == libc::EINVAL))
-        }
+        let before = now_ns();
+        let vm_state = vm.save_state().unwrap();
+        let after = now_ns();
+        // KVM pairs them on a host whose clock is the TSC, and the save does
+        // anywhere else: either way the pairing is from inside the save.
+        assert_eq!(
+            vm_state.clock.flags & KVM_CLOCK_REALTIME,
+            KVM_CLOCK_REALTIME
+        );
+        assert!(
+            (before..=after).contains(&vm_state.clock.realtime),
+            "realtime {} is outside the save, {before}..={after}",
+            vm_state.clock.realtime
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vm_restore_state_moves_the_clock_on_by_the_time_stopped() {
+        let vm = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+        assert_ne!(
+            vm.kvm()
+                .fd
+                .check_extension_int(Cap::AdjustClock)
+                .cast_unsigned()
+                & KVM_CLOCK_REALTIME,
+            0,
+            "this host's KVM cannot move a clock on by the wall clock (Linux 5.16 or later)"
+        );
+
+        let mut vm_state = vm.save_state().unwrap();
+        vm_state.clock.realtime -= STOPPED_NS;
+        let saved = vm_state.clock.clock;
+
+        let mut moved = setup_vm_with_memory(0x1000);
+        moved.setup_irqchip().unwrap();
+        moved.restore_state(&vm_state, true).unwrap();
+        let advanced = moved.fd().get_clock().unwrap().clock - saved;
+        assert!(
+            (STOPPED_NS..STOPPED_NS + SLACK_NS).contains(&advanced),
+            "the clock moved on {advanced} ns, want the {STOPPED_NS} ns it was stopped"
+        );
+
+        let mut kept = setup_vm_with_memory(0x1000);
+        kept.setup_irqchip().unwrap();
+        kept.restore_state(&vm_state, false).unwrap();
+        let advanced = kept.fd().get_clock().unwrap().clock - saved;
+        assert!(
+            advanced < SLACK_NS,
+            "the clock moved on {advanced} ns without clock_realtime"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vm_restore_state_without_a_wall_clock_resumes_the_clock_where_it_stopped() {
+        let vm = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+
+        // A state an older build saved on a host without a TSC master clock.
+        let mut vm_state = vm.save_state().unwrap();
+        vm_state.clock.flags &= !KVM_CLOCK_REALTIME;
+        vm_state.clock.realtime -= STOPPED_NS;
+        let saved = vm_state.clock.clock;
+
+        let mut restored = setup_vm_with_memory(0x1000);
+        restored.setup_irqchip().unwrap();
+        restored.restore_state(&vm_state, true).unwrap();
+        let advanced = restored.fd().get_clock().unwrap().clock - saved;
+        assert!(
+            advanced < SLACK_NS,
+            "the clock moved on {advanced} ns with no wall clock to move it by"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
