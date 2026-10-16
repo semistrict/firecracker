@@ -351,6 +351,8 @@ impl Vmm {
         let mut net = Vec::new();
         let mut net_with_mmds = Vec::new();
         let mut pmem = Vec::new();
+        #[cfg_attr(not(feature = "fxdax"), allow(unused_mut))]
+        let mut extent = Vec::new();
         let mut balloon = None;
         let mut vsock = None;
         let mut entropy = None;
@@ -402,6 +404,15 @@ impl Vmm {
                         memory_hotplug = Some(MemoryHotplugConfig::from(m));
                     }
                 }
+                VirtioDeviceType::Extent => {
+                    #[cfg(feature = "fxdax")]
+                    if let Some(e) = device
+                        .as_any()
+                        .downcast_ref::<devices::virtio::extent::Extent>()
+                    {
+                        extent.push(e.config.clone());
+                    }
+                }
             });
 
         let mmds_config = mmds_ref.map(|mmds| {
@@ -430,6 +441,7 @@ impl Vmm {
             vsock,
             entropy,
             pmem_devices: pmem,
+            extent_devices: extent,
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,
@@ -446,6 +458,11 @@ impl Vmm {
                     && b.is_vhost_user()
                 {
                     tuples.push(("vhost-user-block", b.id().to_owned()));
+                }
+                // Its store and DAX window live in fxdax's extent daemon, which a snapshot
+                // doesn't hold.
+                if let VirtioDeviceType::Extent = device_type {
+                    tuples.push(("extent", device.id().to_owned()));
                 }
             });
         if tuples.is_empty() {

@@ -15,6 +15,8 @@ use crate::devices::virtio::net::TapError;
 pub mod balloon;
 pub mod block;
 pub mod device;
+#[cfg(feature = "fxdax")]
+pub mod extent;
 pub mod generated;
 mod iov_deque;
 pub mod iovec;
@@ -69,6 +71,8 @@ pub enum ActivateError {
     RequiredFeatureNotAcked(&'static str),
     /// Vsock backend: {0}
     VsockBackend(vsock::VsockError),
+    /// Extent device: {0}
+    Extent(String),
 }
 
 /// Trait that helps in upcasting an object to Any

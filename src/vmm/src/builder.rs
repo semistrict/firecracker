@@ -50,6 +50,7 @@ use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
     DEFAULT_KERNEL_CMDLINE, append_root_device_cmdline, build_cmdline,
 };
+use crate::vmm_config::extent::ExtentDeviceConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -79,6 +80,14 @@ pub enum StartMicrovmError {
     CreateNetDevice(crate::devices::virtio::net::NetError),
     /// Cannot create pmem device: {0}
     CreatePmemDevice(#[from] crate::devices::virtio::pmem::device::PmemError),
+    /// Cannot create extent-store device: {0}
+    #[cfg(feature = "fxdax")]
+    CreateExtentDevice(#[from] crate::devices::virtio::extent::ExtentError),
+    /// Cannot create the vCPU that maps extent-store devices' DAX windows for the guest: {0}
+    #[cfg(all(feature = "fxdax", target_arch = "x86_64"))]
+    ExtentPrefault(io::Error),
+    /// Extent-store devices need a Firecracker built with its `fxdax` feature, on the MMIO transport
+    ExtentDevicesUnsupported,
     /// Error creating legacy device: {0}
     #[cfg(target_arch = "x86_64")]
     CreateLegacyDevice(device_manager::legacy::LegacyDeviceError),
@@ -257,6 +266,15 @@ pub fn build_microvm_for_boot(
         &mut boot_cmdline,
         &vm_resources.pmem.configs,
         event_manager,
+    )?;
+    attach_extent_devices(
+        &mut device_manager,
+        &vm,
+        &mut boot_cmdline,
+        &vm_resources.extent.configs,
+        event_manager,
+        vm_resources.pci_enabled,
+        vm_resources.machine_config.vcpu_count,
     )?;
 
     if let Some(unix_vsock) = vm_resources.vsock.get() {
@@ -778,6 +796,70 @@ fn attach_pmem_devices(
         device_manager.attach_boot_virtio_device(vm, id, device, cmdline, event_manager, false)?;
     }
     Ok(())
+}
+
+/// Attaches the extent-store devices `configs` describes, with their DAX windows. On x86-64, KVM
+/// maps the windows' pages for the guest as the extent daemon maps them, with a vCPU of their
+/// own, whose ID follows the guest's `vcpu_count` vCPUs'.
+#[cfg(feature = "fxdax")]
+fn attach_extent_devices(
+    device_manager: &mut DeviceManager,
+    vm: &Vm,
+    cmdline: &mut LoaderKernelCmdline,
+    configs: &[ExtentDeviceConfig],
+    event_manager: &mut EventManager,
+    pci_enabled: bool,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused))] vcpu_count: u8,
+) -> Result<(), StartMicrovmError> {
+    use crate::devices::virtio::extent::Extent;
+
+    if configs.is_empty() {
+        return Ok(());
+    }
+    // The PCI transport has no shared memory regions, which DAX windows are.
+    if pci_enabled {
+        return Err(StartMicrovmError::ExtentDevicesUnsupported);
+    }
+    let kvm_vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
+    #[cfg(target_arch = "x86_64")]
+    let mut prefault = None;
+    for config in configs {
+        let id = config.id.clone();
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut extent = Extent::new(kvm_vm.clone(), config.clone())?;
+        #[cfg(target_arch = "x86_64")]
+        if config.dax_window_size.is_some() {
+            use crate::devices::virtio::extent::KvmPrefault;
+            if prefault.is_none() {
+                let made = KvmPrefault::new(kvm_vm, u64::from(vcpu_count))
+                    .map_err(StartMicrovmError::ExtentPrefault)?;
+                prefault = Some(made.map(Arc::new));
+            }
+            if let Some(Some(prefault)) = &prefault {
+                extent.set_prefault(prefault.clone());
+            }
+        }
+        let device = Arc::new(Mutex::new(extent));
+        device_manager.attach_boot_virtio_device(vm, id, device, cmdline, event_manager, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "fxdax"))]
+fn attach_extent_devices(
+    _device_manager: &mut DeviceManager,
+    _vm: &Vm,
+    _cmdline: &mut LoaderKernelCmdline,
+    configs: &[ExtentDeviceConfig],
+    _event_manager: &mut EventManager,
+    _pci_enabled: bool,
+    _vcpu_count: u8,
+) -> Result<(), StartMicrovmError> {
+    if configs.is_empty() {
+        Ok(())
+    } else {
+        Err(StartMicrovmError::ExtentDevicesUnsupported)
+    }
 }
 
 fn attach_unixsock_vsock_device(

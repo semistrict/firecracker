@@ -153,7 +153,7 @@ mod tests {
         assert_eq!(u32_mib_to_bytes(u32::MAX), (u32::MAX as u64) << 20);
         // The same value shifted as a usize MiB count would have wrapped; widening first
         // means every u32 input is representable.
-        assert!(u32_mib_to_bytes(u32::MAX) > u32::MAX.into());
+        assert!(u32_mib_to_bytes(u32::MAX) > u64::from(u32::MAX));
     }
 
     #[test]
