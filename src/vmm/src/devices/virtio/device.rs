@@ -54,20 +54,20 @@ impl DeviceState {
     }
 }
 
-/// Type of a virtio device
-/// Represent it as u8 to give it a known size.
-/// All used types fit in u8.
-#[allow(clippy::cast_possible_truncation)]
-#[repr(u8)]
+/// Type of a virtio device: its virtio device ID.
+/// Represent it as u32, the width of the ID's register, to give it a known size.
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VirtioDeviceType {
-    Net = virtio_ids::VIRTIO_ID_NET as u8,
-    Block = virtio_ids::VIRTIO_ID_BLOCK as u8,
-    Rng = virtio_ids::VIRTIO_ID_RNG as u8,
-    Balloon = virtio_ids::VIRTIO_ID_BALLOON as u8,
-    Vsock = virtio_ids::VIRTIO_ID_VSOCK as u8,
-    Mem = virtio_ids::VIRTIO_ID_MEM as u8,
-    Pmem = virtio_ids::VIRTIO_ID_PMEM as u8,
+    Net = virtio_ids::VIRTIO_ID_NET,
+    Block = virtio_ids::VIRTIO_ID_BLOCK,
+    Rng = virtio_ids::VIRTIO_ID_RNG,
+    Balloon = virtio_ids::VIRTIO_ID_BALLOON,
+    Vsock = virtio_ids::VIRTIO_ID_VSOCK,
+    Mem = virtio_ids::VIRTIO_ID_MEM,
+    Pmem = virtio_ids::VIRTIO_ID_PMEM,
+    /// fxdax's extent-store device: "FX", outside the IDs OASIS assigns.
+    Extent = 0x4658,
 }
 
 /// A shared memory region of a device (virtio 1.2, section 2.10): guest memory the device and

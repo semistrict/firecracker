@@ -345,6 +345,10 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                         device_info,
                     });
                 }
+                // Microvm::check_unsnapshottable_devices refuses to snapshot these.
+                VirtioDeviceType::Extent => {
+                    unreachable!("extent-store devices do not support snapshotting")
+                }
             };
 
             Ok(())

@@ -23,6 +23,7 @@ use crate::vmm_config::boot_source::{
 };
 use crate::vmm_config::drive::*;
 use crate::vmm_config::entropy::*;
+use crate::vmm_config::extent::{ExtentBuilder, ExtentConfigError, ExtentDeviceConfig};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{MemoryHotplugConfig, MemoryHotplugConfigError};
@@ -66,6 +67,8 @@ pub enum ResourcesError {
     EntropyConfig(#[from] EntropyDeviceError),
     /// Pmem device error: {0}
     PmemConfig(#[from] PmemConfigError),
+    /// Extent-store device error: {0}
+    ExtentConfig(#[from] ExtentConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
 }
@@ -97,6 +100,8 @@ pub struct VmmConfig {
     pub entropy: Option<EntropyDeviceConfig>,
     #[serde(default, rename = "pmem")]
     pub pmem_devices: Vec<PmemConfig>,
+    #[serde(default, rename = "extent", skip_serializing_if = "Vec::is_empty")]
+    pub extent_devices: Vec<ExtentDeviceConfig>,
     #[serde(skip)]
     pub serial_config: Option<SerialConfig>,
     pub memory_hotplug: Option<MemoryHotplugConfig>,
@@ -122,6 +127,8 @@ pub struct VmResources {
     pub entropy: EntropyDeviceBuilder,
     /// The pmem device configs.
     pub pmem: PmemBuilder,
+    /// The extent-store device configs.
+    pub extent: ExtentBuilder,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
     /// The optional Mmds data store.
@@ -228,6 +235,10 @@ impl VmResources {
 
         for pmem_config in vmm_config.pmem_devices.into_iter() {
             resources.build_pmem_device(pmem_config)?;
+        }
+
+        for extent_config in vmm_config.extent_devices.into_iter() {
+            resources.extent.insert(extent_config)?;
         }
 
         if let Some(serial_cfg) = vmm_config.serial_config {
@@ -550,6 +561,7 @@ impl From<&VmResources> for VmmConfig {
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
             pmem_devices: resources.pmem.configs.clone(),
+            extent_devices: resources.extent.configs.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
@@ -665,6 +677,7 @@ mod tests {
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             entropy: Default::default(),
             pmem: Default::default(),
+            extent: Default::default(),
             pci_enabled: false,
             serial_out_path: None,
             serial_rate_limiter_cfg: None,

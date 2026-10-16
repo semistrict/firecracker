@@ -19,6 +19,7 @@ bench = false
 tracing = ["log-instrument", "utils/tracing", "vmm/tracing"]
 fuzzing = ["vmm/fuzzing"]
 gdb = ["vmm/gdb"]
+fxdax = ["vmm/fxdax"]
 
 [dependencies]
 displaydoc = "0.2.5"
