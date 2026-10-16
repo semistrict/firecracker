@@ -57,6 +57,8 @@ pub struct MmioTransport {
     // The register where features page is selected.
     pub(crate) acked_features_select: u32,
     pub(crate) queue_select: u32,
+    // The shared memory region selected, by its ID.
+    pub(crate) shm_select: u32,
     pub(crate) device_status: u32,
     pub(crate) config_generation: u32,
     mem: GuestMemoryMmap,
@@ -77,6 +79,7 @@ impl MmioTransport {
             features_select: 0,
             acked_features_select: 0,
             queue_select: 0,
+            shm_select: 0,
             device_status: device_status::INIT,
             config_generation: 0,
             mem,
@@ -148,11 +151,22 @@ impl MmioTransport {
         self.features_select = 0;
         self.acked_features_select = 0;
         self.queue_select = 0;
+        self.shm_select = 0;
         self.interrupt.irq_status.store(0, Ordering::SeqCst);
         self.device_status = device_status::INIT;
         // . Keep interrupt_evt and queue_evts as is. There may be pending notifications in those
         //   eventfds, but nothing will happen other than supurious wakeups.
         // . Do not reset config_generation and keep it monotonically increasing
+    }
+
+    /// The shared memory region `shm_select` selects: its length and address, or a length of
+    /// -1 if the device has none of that ID (virtio 1.2, section 4.2.2).
+    fn selected_shm_region(&self) -> (u64, u64) {
+        self.locked_device()
+            .shm_regions()
+            .iter()
+            .find(|region| u32::from(region.id) == self.shm_select)
+            .map_or((u64::MAX, 0), |region| (region.len, region.guest_addr))
     }
 
     /// Update device status according to the state machine defined by VirtIO Spec 1.0.
@@ -226,6 +240,15 @@ impl MmioTransport {
 
 impl BusDevice for MmioTransport {
     fn read(&mut self, base: u64, offset: u64, data: &mut [u8]) {
+        #[allow(clippy::cast_possible_truncation)]
+        fn low(v: u64) -> u32 {
+            v as u32
+        }
+
+        fn high(v: u64) -> u32 {
+            low(v >> 32)
+        }
+
         match offset {
             0x00..=0xff if data.len() == 4 => {
                 let v = match offset {
@@ -269,6 +292,11 @@ impl BusDevice for MmioTransport {
                         }
                     }
                     0x70 => self.device_status,
+                    0xac => self.shm_select,
+                    0xb0 => low(self.selected_shm_region().0),
+                    0xb4 => high(self.selected_shm_region().0),
+                    0xb8 => low(self.selected_shm_region().1),
+                    0xbc => high(self.selected_shm_region().1),
                     0xfc => self.config_generation,
                     _ => {
                         warn!("unknown virtio mmio register read: {:#x}", offset);
@@ -333,6 +361,7 @@ impl BusDevice for MmioTransport {
                     0x94 => self.update_queue_field(|q| hi(&mut q.avail_ring_address, v)),
                     0xa0 => self.update_queue_field(|q| lo(&mut q.used_ring_address, v)),
                     0xa4 => self.update_queue_field(|q| hi(&mut q.used_ring_address, v)),
+                    0xac => self.shm_select = v,
                     _ => {
                         warn!("unknown virtio mmio register write: {:#x}", offset);
                     }
@@ -477,7 +506,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::devices::virtio::ActivateError;
-    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType, VirtioShmRegion};
     use crate::devices::virtio::device_status::DEVICE_NEEDS_RESET;
     use crate::impl_device_type;
     use crate::test_utils::single_region_mem;
@@ -496,6 +525,7 @@ pub(crate) mod tests {
         config_bytes: [u8; 0xeff],
         activate_should_error: bool,
         reset_should_fail: bool,
+        shm_regions: Vec<VirtioShmRegion>,
     }
 
     impl DummyDevice {
@@ -513,6 +543,7 @@ pub(crate) mod tests {
                 config_bytes: [0; 0xeff],
                 activate_should_error: false,
                 reset_should_fail: false,
+                shm_regions: Vec::new(),
             }
         }
 
@@ -572,6 +603,10 @@ pub(crate) mod tests {
             for (i, item) in data.iter().enumerate() {
                 self.config_bytes[u64_to_usize(offset) + i] = *item;
             }
+        }
+
+        fn shm_regions(&self) -> &[VirtioShmRegion] {
+            &self.shm_regions
         }
 
         fn activate(
@@ -731,6 +766,47 @@ pub(crate) mod tests {
         // Read from an invalid length in generic register range.
         d.read(0x0, 0xfc, &mut buf[..3]);
         assert_eq!(buf[..], buf_copy[..]);
+    }
+
+    #[test]
+    fn test_shm_regions() {
+        let m = single_region_mem(0x1000);
+        let interrupt = Arc::new(IrqTrigger::new());
+        let mut device = DummyDevice::new();
+        device.shm_regions = vec![VirtioShmRegion {
+            id: 2,
+            guest_addr: 0x0123_4567_89ab_c000,
+            len: 0x0000_0008_0000_0000,
+        }];
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(device)), false);
+        let read = |d: &mut MmioTransport, offset| {
+            let mut buf = [0; 4];
+            d.read(0x0, offset, &mut buf);
+            read_le_u32(&buf)
+        };
+        let select = |d: &mut MmioTransport, id| {
+            let mut buf = [0; 4];
+            write_le_u32(&mut buf, id);
+            d.write(0x0, 0xac, &buf);
+        };
+
+        // A region the device has: its length and address.
+        select(&mut d, 2);
+        assert_eq!(read(&mut d, 0xac), 2);
+        assert_eq!(read(&mut d, 0xb0), 0);
+        assert_eq!(read(&mut d, 0xb4), 0x8);
+        assert_eq!(read(&mut d, 0xb8), 0x89ab_c000);
+        assert_eq!(read(&mut d, 0xbc), 0x0123_4567);
+
+        // One it hasn't: a length of -1.
+        select(&mut d, 0);
+        assert_eq!(read(&mut d, 0xb0), u32::MAX);
+        assert_eq!(read(&mut d, 0xb4), u32::MAX);
+
+        // A reset selects region 0 again.
+        select(&mut d, 2);
+        d.reset();
+        assert_eq!(read(&mut d, 0xac), 0);
     }
 
     #[test]
