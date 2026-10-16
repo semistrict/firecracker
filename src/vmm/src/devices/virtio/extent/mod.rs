@@ -25,6 +25,8 @@ use crate::vstate::memory::ByteValued;
 pub const VIRTIO_EXTENT_F_DAX: u32 = 0;
 /// `MAP` maps open extents writably.
 pub const VIRTIO_EXTENT_F_DAX_WRITE: u32 = 1;
+/// `WRITE` takes `WRITE_COMMIT`: a commit follows the write, in one request.
+pub const VIRTIO_EXTENT_F_WRITE_COMMIT: u32 = 2;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -35,8 +37,33 @@ pub const VIRTIO_EXTENT_T_COMMIT: u32 = 6;
 pub const VIRTIO_EXTENT_T_ROOT: u32 = 7;
 pub const VIRTIO_EXTENT_T_INFO: u32 = 8;
 
-/// A `WRITE`'s flag: a barrier precedes it, as if a `COMMIT` did.
+/// A `WRITE`'s flags: a barrier precedes it, as if a `COMMIT` did; a `COMMIT` follows it (with
+/// `WRITE_COMMIT`); that commit completes once durable.
 pub const VIRTIO_EXTENT_WRITE_BARRIER: u32 = 1 << 0;
+pub const VIRTIO_EXTENT_WRITE_COMMIT: u32 = 1 << 1;
+pub const VIRTIO_EXTENT_WRITE_DURABLE: u32 = 1 << 2;
+
+/// The barriers a `WRITE`'s `flags` order it with, unless they are not a `WRITE`'s.
+pub fn write_barriers(flags: u32) -> Option<fxdax::WriteBarriers> {
+    let known =
+        VIRTIO_EXTENT_WRITE_BARRIER | VIRTIO_EXTENT_WRITE_COMMIT | VIRTIO_EXTENT_WRITE_DURABLE;
+    if flags & !known != 0
+        || (flags & VIRTIO_EXTENT_WRITE_DURABLE != 0 && flags & VIRTIO_EXTENT_WRITE_COMMIT == 0)
+    {
+        return None;
+    }
+    let after = (flags & VIRTIO_EXTENT_WRITE_COMMIT != 0).then_some(
+        if flags & VIRTIO_EXTENT_WRITE_DURABLE != 0 {
+            fxdax::Commit::Durable
+        } else {
+            fxdax::Commit::Ordered
+        },
+    );
+    Some(fxdax::WriteBarriers {
+        before: flags & VIRTIO_EXTENT_WRITE_BARRIER != 0,
+        after,
+    })
+}
 /// A `COMMIT`'s flags: it completes once durable; it sets the root.
 pub const VIRTIO_EXTENT_COMMIT_DURABLE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_ROOT: u32 = 1 << 1;

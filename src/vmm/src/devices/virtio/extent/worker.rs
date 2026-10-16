@@ -24,7 +24,7 @@ use super::{
     RootLen, UnmapArgs, VIRTIO_EXTENT_COMMIT_DURABLE, VIRTIO_EXTENT_COMMIT_ROOT,
     VIRTIO_EXTENT_MAP_WRITE, VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO,
     VIRTIO_EXTENT_T_MAP, VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP,
-    VIRTIO_EXTENT_T_WRITE, VIRTIO_EXTENT_WRITE_BARRIER,
+    VIRTIO_EXTENT_T_WRITE, write_barriers,
 };
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
@@ -483,11 +483,15 @@ fn serve(
                 return Err(Errno::EINVAL);
             }
             let data = reader.slices(len as usize)?;
-            if flags & VIRTIO_EXTENT_WRITE_BARRIER != 0 {
-                // A barrier, which orders, without waiting for durability (doc-4).
-                store.commit_ordered(None)?;
-            }
-            store.write(args.id.into(), u64::from_le(args.offset), &data)?;
+            // A barrier before orders, without waiting for durability (doc-4); one after, with
+            // WRITE_COMMIT, waits as a COMMIT does. One round trip to the daemon either way.
+            let barriers = write_barriers(flags).ok_or(Errno::EINVAL)?;
+            store.write_with_barriers(
+                args.id.into(),
+                u64::from_le(args.offset),
+                &data,
+                barriers,
+            )?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_FREE => {
@@ -576,6 +580,9 @@ mod tests {
 
     use fxdax::ExtentStore;
 
+    use super::super::{
+        VIRTIO_EXTENT_WRITE_BARRIER, VIRTIO_EXTENT_WRITE_COMMIT, VIRTIO_EXTENT_WRITE_DURABLE,
+    };
     use super::*;
     use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::devices::virtio::test_utils::VirtQueue;
@@ -778,6 +785,29 @@ mod tests {
             &data[..BLOCK],
         );
         assert_eq!(request(&store, &barrier, RESPONSE).1, 0);
+        // A commit after a write seals what it wrote, in one request: and only a WRITE's flags
+        // are a WRITE's.
+        let committed = bytes(
+            VIRTIO_EXTENT_T_WRITE,
+            VIRTIO_EXTENT_WRITE_COMMIT | VIRTIO_EXTENT_WRITE_DURABLE,
+            Some(io(&store, 5, 0, BLOCK)),
+            &data[..BLOCK],
+        );
+        assert_eq!(request(&store, &committed, RESPONSE).1, 0);
+        let after = bytes(
+            VIRTIO_EXTENT_T_WRITE,
+            0,
+            Some(io(&store, 5, BLOCK as u64, BLOCK)),
+            &data[..BLOCK],
+        );
+        assert_eq!(request(&store, &after, RESPONSE).1, errno(Errno::EPERM));
+        let unknown = bytes(
+            VIRTIO_EXTENT_T_WRITE,
+            VIRTIO_EXTENT_WRITE_DURABLE,
+            Some(io(&store, 6, 0, BLOCK)),
+            &data[..BLOCK],
+        );
+        assert_eq!(request(&store, &unknown, RESPONSE).1, errno(Errno::EINVAL));
 
         let free = bytes(
             VIRTIO_EXTENT_T_FREE,

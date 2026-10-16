@@ -15,7 +15,7 @@ use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefau
 use super::worker::Worker;
 use super::{
     ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
-    MAX_TRANSFER, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE,
+    MAX_TRANSFER, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
@@ -114,7 +114,7 @@ impl Extent {
         .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
         config_space.branch = store.branch().to_le();
 
-        let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
+        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT);
         let mut shm_regions = Vec::new();
         let window = match config.dax_window_size {
             Some(size) => {
