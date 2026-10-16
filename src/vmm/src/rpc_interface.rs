@@ -31,6 +31,7 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
+use crate::vmm_config::extent::{ExtentConfigError, ExtentDeviceConfig};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{
@@ -88,6 +89,9 @@ pub enum VmmAction {
     InsertPmemDevice(PmemConfig),
     /// Update an existing pmem device's rate limiter.
     UpdatePmemDevice(PmemDeviceUpdateConfig),
+    /// Add fxdax's extent-store device, or replace the one with its ID. This action can only be
+    /// called before the microVM has booted.
+    InsertExtentDevice(ExtentDeviceConfig),
     /// Add a new network interface config or update one that already exists using the
     /// `NetworkInterfaceConfig` as input. This action can only be called before the microVM has
     /// booted.
@@ -178,6 +182,8 @@ pub enum VmmActionError {
     EntropyConfig(#[from] EntropyDeviceError),
     /// Pmem config error: {0}
     PmemConfig(#[from] PmemConfigError),
+    /// Extent-store device config error: {0}
+    ExtentConfig(#[from] ExtentConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
     /// Memory hotplug update error: {0}
@@ -477,6 +483,7 @@ impl<'a> PrebootApiController<'a> {
             GetVmmVersion => Ok(VmmData::VmmVersion(self.instance_info.vmm_version.clone())),
             InsertBlockDevice(config) => self.insert_block_device(config),
             InsertPmemDevice(config) => self.insert_pmem_device(config),
+            InsertExtentDevice(config) => self.insert_extent_device(config),
             InsertNetworkDevice(config) => self.insert_net_device(config),
             LoadSnapshot(config) => self
                 .load_snapshot(&config)
@@ -549,6 +556,15 @@ impl<'a> PrebootApiController<'a> {
             .build_net_device(cfg)
             .map(|()| VmmData::Empty)
             .map_err(VmmActionError::NetworkConfig)
+    }
+
+    fn insert_extent_device(&mut self, cfg: ExtentDeviceConfig) -> Result<VmmData, VmmActionError> {
+        self.boot_path = true;
+        self.vm_resources
+            .extent
+            .insert(cfg)
+            .map(|()| VmmData::Empty)
+            .map_err(VmmActionError::ExtentConfig)
     }
 
     fn insert_pmem_device(&mut self, cfg: PmemConfig) -> Result<VmmData, VmmActionError> {
@@ -851,6 +867,7 @@ impl RuntimeApiController {
             | ConfigureLogger(_)
             | ConfigureMetrics(_)
             | ConfigureSerial(_)
+            | InsertExtentDevice(_)
             | LoadSnapshot(_)
             | PutCpuConfiguration(_)
             | SetBalloonDevice(_)
@@ -1282,6 +1299,16 @@ mod tests {
             );
         }
 
+        check_unsupported(runtime_request(VmmAction::InsertExtentDevice(
+            crate::vmm_config::extent::ExtentDeviceConfig {
+                id: String::new(),
+                tag: String::new(),
+                path_on_host: String::new(),
+                capacity: 0,
+                dax_window_size: None,
+                extentd_socket: String::new(),
+            },
+        )));
         check_unsupported(runtime_request(VmmAction::ConfigureBootSource(
             BootSourceConfig::default(),
         )));

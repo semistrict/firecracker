@@ -339,6 +339,38 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /extent/{id}:
+    put:
+      summary: Creates or updates an extent-store device. Pre-boot only.
+      description:
+        Creates fxdax's extent-store device with ID specified by id parameter, on an extent
+        store that fxdax's extent daemon serves, or replaces the one with that ID. Needs a
+        Firecracker built with its fxdax feature, and the MMIO transport.
+      operationId: putGuestExtentByID
+      parameters:
+        - name: id
+          in: path
+          description: The id of the guest extent-store device
+          required: true
+          type: string
+        - name: body
+          in: body
+          description: Guest extent-store device properties
+          required: true
+          schema:
+            $ref: "#/definitions/Extent"
+      responses:
+        204:
+          description: Extent-store device is created/updated
+        400:
+          description: Extent-store device cannot be created/updated due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
   /pmem/{id}:
     put:
       summary: Creates or updates a pmem device. Pre-boot only.
@@ -1301,6 +1333,41 @@ definitions:
       opt_io_size:
         type: integer
         description: Suggested optimal (maximum) I/O size, in units of logical blocks.
+
+  Extent:
+    type: object
+    required:
+      - id
+      - tag
+      - path_on_host
+      - capacity
+      - extentd_socket
+    properties:
+      id:
+        type: string
+        description:
+          Identificator for this device.
+      tag:
+        type: string
+        description:
+          The filesystem's name, at most 36 bytes, which the guest mounts it by.
+      path_on_host:
+        type: string
+        description:
+          The extent store's directory, created if it doesn't exist.
+      capacity:
+        type: integer
+        description:
+          The most bytes a store created holds.
+      dax_window_size:
+        type: integer
+        description:
+          The size in bytes of the DAX window, a multiple of 2 MiB, that the guest maps files'
+          data from. None without one.
+      extentd_socket:
+        type: string
+        description:
+          The socket of fxdax's extent daemon, which serves the store.
 
   Pmem:
     type: object

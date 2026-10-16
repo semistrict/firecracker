@@ -17,6 +17,7 @@ use super::request::boot_source::parse_put_boot_source;
 use super::request::cpu_configuration::parse_put_cpu_config;
 use super::request::drive::{parse_patch_drive, parse_put_drive};
 use super::request::entropy::parse_put_entropy;
+use super::request::extent::parse_put_extent;
 use super::request::instance_info::parse_get_instance_info;
 use super::request::logger::parse_put_logger;
 use super::request::machine_configuration::{
@@ -100,6 +101,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "cpu-config", Some(body)) => parse_put_cpu_config(body),
             (Method::Put, "drives", Some(body)) => parse_put_drive(body, path_tokens.next()),
             (Method::Put, "pmem", Some(body)) => parse_put_pmem(body, path_tokens.next()),
+            (Method::Put, "extent", Some(body)) => parse_put_extent(body, path_tokens.next()),
             (Method::Put, "logger", Some(body)) => parse_put_logger(body),
             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
             (Method::Put, "machine-config", Some(body)) => parse_put_machine_config(body),
