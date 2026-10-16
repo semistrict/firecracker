@@ -105,6 +105,41 @@ pub struct Vcpu {
     response_receiver: Option<Receiver<VcpuResponse>>,
     /// The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
+    /// The `KVM_RUN`s failing with `EFAULT` in a row, while fxdax changes a DAX window's mappings.
+    #[cfg(feature = "fxdax")]
+    efaults: Option<Efaults>,
+}
+
+/// `KVM_RUN`s failing with `EFAULT` in a row: when the first did, and the last.
+///
+/// fxdax replaces the host memory of an extent device's DAX window as it changes the window's
+/// mappings, and a guest's access to a page meanwhile fails with `EFAULT` (see fxdax's
+/// `dax::uffd`), which KVM reports without an address. The vCPU retries its access until the
+/// change is done, which takes a few system calls, and gives up if it keeps failing.
+#[cfg(feature = "fxdax")]
+#[derive(Debug)]
+struct Efaults {
+    first: std::time::Instant,
+    last: std::time::Instant,
+}
+
+#[cfg(feature = "fxdax")]
+impl Efaults {
+    /// How long a vCPU retries an access that keeps failing.
+    const PATIENCE: Duration = Duration::from_secs(1);
+    /// How soon after the last a failing `KVM_RUN` is the same access's.
+    const IN_A_ROW: Duration = Duration::from_millis(10);
+
+    /// Records a `KVM_RUN` failing with `EFAULT`, and returns whether to retry it.
+    fn retry(efaults: &mut Option<Efaults>) -> bool {
+        let now = std::time::Instant::now();
+        let first = match efaults {
+            Some(efaults) if now - efaults.last < Self::IN_A_ROW => efaults.first,
+            _ => now,
+        };
+        *efaults = Some(Efaults { first, last: now });
+        now - first < Self::PATIENCE
+    }
 }
 
 /// States of the vCPU thread's run loop.
@@ -151,6 +186,8 @@ impl Vcpu {
             response_sender,
             #[cfg(feature = "gdb")]
             gdb_event: None,
+            #[cfg(feature = "fxdax")]
+            efaults: None,
             kvm_vcpu,
         })
     }
@@ -410,6 +447,10 @@ impl Vcpu {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 // Notify that this KVM_RUN was interrupted.
                 Ok(VcpuEmulation::Interrupted)
+            }
+            #[cfg(feature = "fxdax")]
+            Err(ref err) if err.errno() == libc::EFAULT && Efaults::retry(&mut self.efaults) => {
+                Ok(VcpuEmulation::Handled)
             }
             #[cfg(feature = "gdb")]
             Ok(VcpuExit::Debug(_)) => {
