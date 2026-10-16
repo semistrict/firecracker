@@ -70,6 +70,18 @@ pub enum VirtioDeviceType {
     Pmem = virtio_ids::VIRTIO_ID_PMEM as u8,
 }
 
+/// A shared memory region of a device (virtio 1.2, section 2.10): guest memory the device and
+/// the driver share, which the transport tells the driver of by its ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioShmRegion {
+    /// The region's ID, which the driver selects it by.
+    pub id: u8,
+    /// The guest physical address the region starts at.
+    pub guest_addr: u64,
+    /// The region's length in bytes.
+    pub len: u64,
+}
+
 /// Unique identifier for a virtio device: its type and string ID.
 pub type VirtioDeviceId = (VirtioDeviceType, String);
 
@@ -167,6 +179,11 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
 
     /// Writes to this device configuration space at `offset`.
     fn write_config(&mut self, offset: u64, data: &[u8]);
+
+    /// The device's shared memory regions, which have distinct IDs.
+    fn shm_regions(&self) -> &[VirtioShmRegion] {
+        &[]
+    }
 
     /// Performs the formal activation for a device, which can be verified also with `is_activated`.
     fn activate(
