@@ -109,6 +109,54 @@ pub enum VmError {
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
     MemoryError(#[from] MemoryError),
+    /// No KVM memory slot is free
+    NoKvmSlotAvailable,
+}
+
+/// RAII wrapper for a KVM memory slot mapping host memory into the guest. Removes the slot on drop.
+#[derive(Debug)]
+pub struct KvmMemSlot {
+    vm: Arc<KvmVm>,
+    slot: u32,
+}
+
+impl KvmMemSlot {
+    /// Maps the `memory_size` bytes of host memory at `hva` into the guest at `gpa`.
+    pub fn new(
+        vm: Arc<KvmVm>,
+        gpa: u64,
+        memory_size: u64,
+        hva: u64,
+        flags: u32,
+    ) -> Result<Self, VmError> {
+        // FIXME: The KVM slot number itself is not returned. This is not an
+        // issue currently since there are at least 32K slots available. But we
+        // could improve this by implementing a slot allocator that allows us
+        // to free slot numbers.
+        let slot = vm.next_kvm_slot(1).ok_or(VmError::NoKvmSlotAvailable)?;
+        let region = kvm_userspace_memory_region {
+            slot,
+            guest_phys_addr: gpa,
+            memory_size,
+            userspace_addr: hva,
+            flags,
+        };
+        vm.set_user_memory_region(region)?;
+        Ok(Self { vm, slot })
+    }
+}
+
+impl Drop for KvmMemSlot {
+    fn drop(&mut self) {
+        let region = kvm_userspace_memory_region {
+            slot: self.slot,
+            guest_phys_addr: 0,
+            memory_size: 0,
+            userspace_addr: 0,
+            flags: 0,
+        };
+        _ = self.vm.set_user_memory_region(region);
+    }
 }
 
 /// VM abstraction: either a KVM-based VM or (in the future) a Nitro Enclave.
