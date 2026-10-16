@@ -6,7 +6,7 @@ use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-use kvm_bindings::{KVM_MEM_READONLY, kvm_userspace_memory_region};
+use kvm_bindings::KVM_MEM_READONLY;
 use serde::{Deserialize, Serialize};
 use vm_allocator::{AllocPolicy, RangeInclusive};
 use vm_memory::GuestMemoryError;
@@ -24,7 +24,7 @@ use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenType};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::pmem::PmemConfig;
 use crate::vstate::memory::{ByteValued, Bytes, GuestMemoryMmap};
-use crate::vstate::vm::{KvmVm, VmError};
+use crate::vstate::vm::{KvmMemSlot, KvmVm, VmError};
 use crate::{align_up, impl_device_type};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -118,52 +118,6 @@ impl Drop for GuestPmemRegion {
         .expect("Invalid config_space range");
         let mut alloc = self.vm.resource_allocator();
         _ = alloc.past_mmio64_memory.free(&range);
-    }
-}
-
-/// RAII wrapper for the KVM user memory region. Removes the region on drop.
-#[derive(Debug)]
-pub struct KvmMemSlot {
-    vm: Arc<KvmVm>,
-    slot: u32,
-}
-
-impl KvmMemSlot {
-    fn new(
-        vm: Arc<KvmVm>,
-        gpa: u64,
-        memory_size: u64,
-        hva: u64,
-        flags: u32,
-    ) -> Result<Self, PmemError> {
-        // FIXME: The KVM slot number itself is not returned. This is not an
-        // issue currently since there are at least 32K slots available. But we
-        // could improve this by implementing a slot allocator that allows us
-        // to free slot numbers.
-        let slot = vm.next_kvm_slot(1).ok_or(PmemError::NoKvmSlotAvailable)?;
-        let region = kvm_userspace_memory_region {
-            slot,
-            guest_phys_addr: gpa,
-            memory_size,
-            userspace_addr: hva,
-            flags,
-        };
-        vm.set_user_memory_region(region)
-            .map_err(PmemError::SetUserMemoryRegion)?;
-        Ok(Self { vm, slot })
-    }
-}
-
-impl Drop for KvmMemSlot {
-    fn drop(&mut self) {
-        let region = kvm_userspace_memory_region {
-            slot: self.slot,
-            guest_phys_addr: 0,
-            memory_size: 0,
-            userspace_addr: 0,
-            flags: 0,
-        };
-        _ = self.vm.set_user_memory_region(region);
     }
 }
 
@@ -329,7 +283,12 @@ impl Pmem {
         } else {
             0
         };
-        let kvm_mem_slot = KvmMemSlot::new(vm, cs.start, cs.size, mmap.mmap_ptr, flags)?;
+        let kvm_mem_slot = KvmMemSlot::new(vm, cs.start, cs.size, mmap.mmap_ptr, flags).map_err(
+            |err| match err {
+                VmError::NoKvmSlotAvailable => PmemError::NoKvmSlotAvailable,
+                err => PmemError::SetUserMemoryRegion(err),
+            },
+        )?;
 
         let rate_limiter = config
             .rate_limiter
