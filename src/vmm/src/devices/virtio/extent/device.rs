@@ -15,7 +15,8 @@ use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefau
 use super::worker::Worker;
 use super::{
     ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
-    MAX_TRANSFER, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_WRITE_COMMIT,
+    MAX_TRANSFER, Resizing, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_RESIZE,
+    VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
@@ -57,6 +58,8 @@ pub struct Extent {
     /// Maps the window's pages for the guest as the store maps them.
     prefault: Option<Arc<dyn PrefaultGuestMemory>>,
     config_space: ConfigSpace,
+    /// The store's capacity, as the daemon changes it.
+    resizing: Arc<Resizing>,
 
     // VirtIO fields
     avail_features: u64,
@@ -99,6 +102,8 @@ impl Extent {
             max_root: MAX_ROOT.to_le(),
             branch: 0,
             max_extent: MAX_EXTENT.to_le(),
+            capacity: 0,
+            asked: 0,
         };
         let tag = config.tag.as_bytes();
         if tag.len() > config_space.tag.len() {
@@ -113,8 +118,19 @@ impl Extent {
         )
         .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
         config_space.branch = store.branch().to_le();
+        let resizing = Arc::new(Resizing::default());
+        let info = store
+            .info()
+            .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err.into()))?;
+        resizing
+            .capacity
+            .store(info.capacity, std::sync::atomic::Ordering::Release);
+        let changes = resizing.clone();
+        store.on_capacity(move |capacity, ask| changes.changed(capacity, ask));
 
-        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT);
+        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT)
+            | (1 << VIRTIO_EXTENT_F_RESIZE);
         let mut shm_regions = Vec::new();
         let window = match config.dax_window_size {
             Some(size) => {
@@ -139,6 +155,7 @@ impl Extent {
             window_created: false,
             prefault: None,
             config_space,
+            resizing,
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
@@ -237,8 +254,15 @@ impl VirtioDevice for Extent {
             .as_ref()
     }
 
+    // fxdax: the store's capacity, and the shrink the guest is asked to take, as they are now.
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let config = self.config_space.as_slice();
+        use std::sync::atomic::Ordering;
+        let config = ConfigSpace {
+            capacity: self.resizing.capacity.load(Ordering::Acquire).to_le(),
+            asked: self.resizing.asked.load(Ordering::Acquire).to_le(),
+            ..self.config_space
+        };
+        let config = config.as_slice();
         let offset = usize::try_from(offset).unwrap_or(usize::MAX);
         if let Some(config_from_offset) = config.get(offset..) {
             let len = config_from_offset.len().min(data.len());
@@ -283,9 +307,11 @@ impl VirtioDevice for Extent {
             interrupt.clone(),
             mem.clone(),
             self.store.clone(),
+            self.resizing.clone(),
         )
         .map_err(|err| ActivateError::Extent(format!("starting the worker: {err}")))?;
         self.worker = Some(worker);
+        *self.resizing.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         Ok(())
     }
