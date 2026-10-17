@@ -162,6 +162,8 @@ pub struct Info {
     pub used: u64,
     pub available: u64,
     pub next_sequence: u64,
+    /// fxdax: the lowest sequence number the guest may mint from.
+    pub sequence_floor: u64,
 }
 
 /// The device's configuration space.
