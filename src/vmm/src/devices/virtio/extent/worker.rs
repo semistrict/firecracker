@@ -26,6 +26,7 @@ use super::{
     VIRTIO_EXTENT_T_MAP, VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP,
     VIRTIO_EXTENT_T_WRITE, write_barriers,
 };
+use super::{ResizedArgs, Resizing, VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_RESIZED};
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::{error, info};
@@ -39,20 +40,20 @@ const SERVERS: usize = 8;
 /// costs.
 #[derive(Default)]
 struct Served {
-    count: [AtomicU64; VIRTIO_EXTENT_T_INFO as usize + 1],
-    nanos: [AtomicU64; VIRTIO_EXTENT_T_INFO as usize + 1],
+    count: [AtomicU64; VIRTIO_EXTENT_T_RESIZED as usize + 1],
+    nanos: [AtomicU64; VIRTIO_EXTENT_T_RESIZED as usize + 1],
 }
 
 impl Served {
     fn add(&self, type_: Option<u32>, nanos: u64) {
-        if let Some(type_) = type_.filter(|t| *t <= VIRTIO_EXTENT_T_INFO) {
+        if let Some(type_) = type_.filter(|t| *t <= VIRTIO_EXTENT_T_RESIZED) {
             self.count[type_ as usize].fetch_add(1, Ordering::Relaxed);
             self.nanos[type_ as usize].fetch_add(nanos, Ordering::Relaxed);
         }
     }
 
     fn log(&self) {
-        for type_ in 0..=VIRTIO_EXTENT_T_INFO as usize {
+        for type_ in 0..=VIRTIO_EXTENT_T_RESIZED as usize {
             let count = self.count[type_].load(Ordering::Relaxed);
             if count > 0 {
                 #[allow(clippy::cast_precision_loss)]
@@ -72,6 +73,7 @@ struct Shared {
     interrupt: Arc<dyn VirtioInterrupt>,
     mem: GuestMemoryMmap,
     store: Arc<RemoteExtentStore>,
+    resizing: Arc<Resizing>,
     served: Served,
 }
 
@@ -87,7 +89,7 @@ impl Shared {
         let index = chain.index;
         let type_ = self.request_type(&chain);
         let start = Instant::now();
-        let len = handle(&self.store, &self.mem, chain);
+        let len = handle(&self.store, &self.resizing, &self.mem, chain);
         #[allow(clippy::cast_possible_truncation)]
         self.served.add(type_, start.elapsed().as_nanos() as u64);
         self.complete(index, len);
@@ -140,6 +142,7 @@ impl Worker {
         interrupt: Arc<dyn VirtioInterrupt>,
         mem: GuestMemoryMmap,
         store: Arc<RemoteExtentStore>,
+        resizing: Arc<Resizing>,
     ) -> io::Result<Self> {
         let stop = EventFd::new(libc::EFD_NONBLOCK)?;
         let stop_theirs = stop.try_clone()?;
@@ -148,6 +151,7 @@ impl Worker {
             interrupt,
             mem,
             store,
+            resizing,
             served: Served::default(),
         };
         let thread = thread::Builder::new()
@@ -410,6 +414,7 @@ impl Writer<'_> {
 /// to it: its writable buffers, whose last bytes hold the response.
 pub(super) fn handle(
     store: &RemoteExtentStore,
+    resizing: &Resizing,
     mem: &GuestMemoryMmap,
     chain: DescriptorChain,
 ) -> u32 {
@@ -433,7 +438,7 @@ pub(super) fn handle(
     let writer = Writer {
         segments: &buffers.writable,
     };
-    let (status, written) = match serve(store, &mut reader, &writer, room) {
+    let (status, written) = match serve(store, resizing, &mut reader, &writer, room) {
         Ok(written) => (0, written),
         Err(errno) => (errno.raw().cast_unsigned(), 0),
     };
@@ -451,6 +456,7 @@ pub(super) fn handle(
 /// bytes for it, and returns how many it wrote.
 fn serve(
     store: &RemoteExtentStore,
+    resizing: &Resizing,
     reader: &mut Reader,
     writer: &Writer,
     room: usize,
@@ -560,6 +566,14 @@ fn serve(
             };
             writer.write(0, info.as_slice());
             Ok(size_of::<Info>())
+        }
+        VIRTIO_EXTENT_T_RESIZED => {
+            let args: ResizedArgs = reader.obj()?;
+            let capacity = u64::from_le(args.capacity);
+            let took = flags & VIRTIO_EXTENT_RESIZED_TOOK != 0;
+            resizing.answered(capacity, took);
+            store.resized(capacity, took)?;
+            Ok(0)
         }
         _ => Err(Errno::EINVAL),
     }
@@ -673,7 +687,7 @@ mod tests {
         vq.avail.ring[0].set(0);
         vq.avail.idx.set(1);
         let chain = queue.pop().unwrap().unwrap();
-        let used = handle(store, &mem, chain) as usize;
+        let used = handle(store, &Resizing::default(), &mem, chain) as usize;
         assert_eq!(
             used, writable,
             "the device wrote {used} of {writable} bytes"
