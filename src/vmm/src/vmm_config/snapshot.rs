@@ -57,6 +57,18 @@ pub struct NetworkOverride {
     pub host_dev_name: String,
 }
 
+/// fxdax: has an extent-store device restored from a snapshot open the store at `path_on_host`,
+/// forked from the snapshot's point of its store if it doesn't exist, rather than the store the
+/// snapshotted VM had: a store of its own for each VM restored from one snapshot (TASK-39.1).
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtentOverride {
+    /// The ID of the extent-store device to modify.
+    pub id: String,
+    /// The store's directory.
+    pub path_on_host: String,
+}
+
 /// Allows for changing the host UDS of the vsock backend during snapshot restore
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub struct VsockOverride {
@@ -81,6 +93,8 @@ pub struct LoadSnapshotParams {
     pub network_overrides: Vec<NetworkOverride>,
     /// When set, the vsock backend UDS path will be overridden
     pub vsock_override: Option<VsockOverride>,
+    /// fxdax: the extent-store devices whose stores to override on load.
+    pub extent_overrides: Vec<ExtentOverride>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore,
     /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
     /// (default), kvmclock resumes from where it was at snapshot time.
@@ -117,6 +131,9 @@ pub struct LoadSnapshotConfig {
     /// Whether or not to override the vsock backend UDS path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
+    /// fxdax: the extent-store devices whose stores to override on load.
+    #[serde(default)]
+    pub extent_overrides: Vec<ExtentOverride>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
     #[serde(default)]
     pub clock_realtime: bool,

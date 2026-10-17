@@ -144,6 +144,11 @@ pub struct DeviceStates {
     pub pmem_devices: Vec<VirtioDeviceState<PmemState>>,
     /// Memory device state.
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
+    /// fxdax: extent-store device states (TASK-39.1).
+    #[cfg(feature = "fxdax")]
+    #[serde(default)]
+    pub extent_devices:
+        Vec<VirtioDeviceState<crate::devices::virtio::extent::persist::ExtentState>>,
 }
 
 pub struct MMIODevManagerConstructorArgs<'a> {
@@ -345,9 +350,25 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                         device_info,
                     });
                 }
-                // Microvm::check_unsnapshottable_devices refuses to snapshot these.
+                // Microvm::save_state has each take the snapshot of its store first.
+                #[cfg(feature = "fxdax")]
                 VirtioDeviceType::Extent => {
-                    unreachable!("extent-store devices do not support snapshotting")
+                    let extent = locked_device
+                        .as_mut_any()
+                        .downcast_mut::<crate::devices::virtio::extent::Extent>()
+                        .unwrap();
+                    let device_state = extent.save();
+                    states.extent_devices.push(VirtioDeviceState {
+                        device_id,
+                        device_state,
+                        transport_state,
+                        device_info,
+                    })
+                }
+                // Without the fxdax feature, there are none.
+                #[cfg(not(feature = "fxdax"))]
+                VirtioDeviceType::Extent => {
+                    unreachable!("extent-store devices need the fxdax feature")
                 }
             };
 
@@ -587,6 +608,55 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &pmem_state.device_info,
                 constructor_args.event_manager,
             )?;
+        }
+
+        #[cfg(feature = "fxdax")]
+        {
+            use crate::devices::virtio::extent::Extent;
+            use crate::devices::virtio::extent::persist::ExtentConstructorArgs;
+
+            // On x86-64, KVM maps the windows' pages for the guest as the extent daemon maps
+            // them, with a vCPU of their own, as the VM booted with.
+            #[cfg(target_arch = "x86_64")]
+            let prefault = if state
+                .extent_devices
+                .iter()
+                .any(|extent| extent.device_state.window_addr.is_some())
+            {
+                use crate::devices::virtio::extent::{KvmPrefault, PrefaultGuestMemory};
+                let id = u64::from(constructor_args.vm_resources.machine_config.vcpu_count);
+                KvmPrefault::new(vm, id)
+                    .map_err(DevicePersistError::ExtentPrefault)?
+                    .map(|prefault| -> Arc<dyn PrefaultGuestMemory> { Arc::new(prefault) })
+            } else {
+                None
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let prefault = None;
+            for extent_state in &state.extent_devices {
+                let device = Arc::new(Mutex::new(Extent::restore(
+                    ExtentConstructorArgs {
+                        mem,
+                        vm: vm.clone(),
+                        prefault: prefault.clone(),
+                    },
+                    &extent_state.device_state,
+                )?));
+                constructor_args
+                    .vm_resources
+                    .extent
+                    .configs
+                    .push((&extent_state.device_state.config).into());
+                restore_helper(
+                    device,
+                    extent_state.device_state.virtio_state.activated,
+                    false,
+                    &extent_state.device_id,
+                    &extent_state.transport_state,
+                    &extent_state.device_info,
+                    constructor_args.event_manager,
+                )?;
+            }
         }
 
         if let Some(memory_state) = &state.memory_device {

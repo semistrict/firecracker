@@ -1709,6 +1709,24 @@ definitions:
         type: string
         description:
           The new host device of the interface
+  ExtentOverride:
+    type: object
+    description:
+      fxdax's extent-store device restored from a snapshot opens the store at
+      path_on_host, forked from the snapshot's point of its store if it doesn't
+      exist, rather than the store the snapshotted VM had.
+    required:
+      - id
+      - path_on_host
+    properties:
+      id:
+        type: string
+        description:
+          The ID of the extent-store device to modify
+      path_on_host:
+        type: string
+        description:
+          The store's directory
   VsockOverride:
     type: object
     description:
@@ -1762,6 +1780,12 @@ definitions:
         description: Network host device names to override
         items:
           $ref: "#/definitions/NetworkOverride"
+      extent_overrides:
+        type: array
+        description:
+          fxdax's extent-store devices whose stores to override on snapshot restore
+        items:
+          $ref: "#/definitions/ExtentOverride"
       vsock_override:
         $ref: "#/definitions/VsockOverride"
         description:

@@ -37,6 +37,12 @@ impl GuestRange {
             .start();
         Ok(Self { vm, start, len })
     }
+
+    /// The range at `start`, which the VM's resource allocator, restored from a snapshot, holds
+    /// as allocated already.
+    fn restored(vm: Arc<KvmVm>, start: u64, len: u64) -> Self {
+        Self { vm, start, len }
+    }
 }
 
 impl Drop for GuestRange {
@@ -136,8 +142,22 @@ impl DaxWindow {
             return Err(DaxWindowError::Size(len));
         }
         let guest = GuestRange::allocate(vm.clone(), len)?;
-        let host = HostMemory::map(u64_to_usize(len))?;
-        let slot = KvmMemSlot::new(vm, guest.start, len, host.base.as_ptr() as u64, 0)?;
+        Self::in_range(vm, guest)
+    }
+
+    /// The window of `len` bytes at `guest_addr` in guest memory, where a snapshot the VM is
+    /// restored from had it, whose addresses the VM's resource allocator holds already.
+    pub(super) fn at(vm: Arc<KvmVm>, guest_addr: u64, len: u64) -> Result<Self, DaxWindowError> {
+        if len == 0 || !len.is_multiple_of(DAX_WINDOW_ALIGNMENT) {
+            return Err(DaxWindowError::Size(len));
+        }
+        let guest = GuestRange::restored(vm.clone(), guest_addr, len);
+        Self::in_range(vm, guest)
+    }
+
+    fn in_range(vm: Arc<KvmVm>, guest: GuestRange) -> Result<Self, DaxWindowError> {
+        let host = HostMemory::map(u64_to_usize(guest.len))?;
+        let slot = KvmMemSlot::new(vm, guest.start, guest.len, host.base.as_ptr() as u64, 0)?;
         Ok(Self {
             _slot: slot,
             host,

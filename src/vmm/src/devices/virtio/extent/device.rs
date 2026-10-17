@@ -5,7 +5,9 @@
 //! serves its requests once the driver activates it.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use fxdax::{ExtentStore, RemoteExtentStore};
@@ -15,8 +17,8 @@ use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefau
 use super::worker::Worker;
 use super::{
     ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
-    MAX_TRANSFER, Resizing, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_RESIZE,
-    VIRTIO_EXTENT_F_WRITE_COMMIT,
+    MAX_TRANSFER, Resizing, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_FREEZE,
+    VIRTIO_EXTENT_F_RESIZE, VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
@@ -26,7 +28,7 @@ use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
-use crate::logger::warn;
+use crate::logger::{error, warn};
 use crate::vmm_config::extent::ExtentDeviceConfig;
 use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 use crate::vstate::vm::KvmVm;
@@ -42,6 +44,36 @@ pub enum ExtentError {
     DaxWindow(#[from] DaxWindowError),
     /// Error with EventFd: {0}
     EventFd(std::io::Error),
+}
+
+/// Errors taking a snapshot of an extent-store device (TASK-39.1).
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum ExtentSnapshotError {
+    /// Extent device {0}: its guest's filesystem is not frozen (fsfreeze it before the snapshot, and thaw it after)
+    NotFrozen(String),
+    /// Extent device {0}: cannot fork its store to {1}: {2}
+    Fork(String, String, fxdax::Errno),
+    /// Extent device {0}: cannot list its DAX window's mappings: {1}
+    Mappings(String, fxdax::Errno),
+}
+
+/// What a snapshot of the device holds of its store (TASK-39.1): the point it was taken at, a fork
+/// of the store, which each VM restored from it forks again, and the window's mappings then, which
+/// the restored VM's window maps again.
+#[derive(Debug, Clone)]
+pub struct ExtentSnapshot {
+    pub point: PathBuf,
+    pub mappings: Vec<fxdax::WindowMapping>,
+}
+
+/// How a device is made: as its VM boots, or restored from a snapshot ([`ExtentSnapshot`]), its
+/// window where the snapshot had it in guest memory.
+pub(super) enum Making<'a> {
+    Boot,
+    Restore {
+        snapshot: &'a ExtentSnapshot,
+        window_addr: Option<u64>,
+    },
 }
 
 /// A virtio extent-store device, on an extent store that fxdax's extent daemon serves.
@@ -70,8 +102,17 @@ pub struct Extent {
     queues: Vec<Queue>,
     queue_events: Vec<EventFd>,
 
-    /// The worker serving the queue, while the device is activated.
+    /// The worker serving the queue, while the device is activated, and not paused for a snapshot
+    /// (`pause_worker`).
     worker: Option<Worker>,
+    /// fxdax: whether the guest's filesystem is frozen (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot
+    /// needs it.
+    frozen: Arc<AtomicBool>,
+    /// fxdax: the snapshot taken of the device's store, or restored from (TASK-39.1).
+    snapshot: Option<ExtentSnapshot>,
+    /// fxdax: the window's mappings to map again as the window is created: those of the snapshot
+    /// the device was restored from.
+    mappings: Vec<fxdax::WindowMapping>,
 }
 
 impl fmt::Debug for Extent {
@@ -88,6 +129,17 @@ impl Extent {
     /// A device as `config` describes, in `vm`, which opens its store, creating it if it doesn't
     /// exist, in the extent daemon, and maps its DAX window, if it has one, into the guest.
     pub fn new(vm: Arc<KvmVm>, config: ExtentDeviceConfig) -> Result<Self, ExtentError> {
+        Self::make(vm, config, Making::Boot)
+    }
+
+    /// A device as `config` describes, made as `making` says: its store opened, or, restored from
+    /// a snapshot, forked from the snapshot's point if it doesn't exist; its window in guest memory
+    /// where the snapshot had it.
+    pub(super) fn make(
+        vm: Arc<KvmVm>,
+        config: ExtentDeviceConfig,
+        making: Making<'_>,
+    ) -> Result<Self, ExtentError> {
         let mut config_space = ConfigSpace {
             tag: [0; 36],
             num_request_queues: u32::try_from(EXTENT_NUM_QUEUES)
@@ -111,11 +163,18 @@ impl Extent {
         }
         config_space.tag[..tag.len()].copy_from_slice(tag);
 
-        let store = RemoteExtentStore::connect(
-            &config.extentd_socket,
-            &config.path_on_host,
-            config.capacity,
-        )
+        let store = match &making {
+            Making::Boot => RemoteExtentStore::connect(
+                &config.extentd_socket,
+                &config.path_on_host,
+                config.capacity,
+            ),
+            Making::Restore { snapshot, .. } => RemoteExtentStore::connect_forked(
+                &config.extentd_socket,
+                &config.path_on_host,
+                &snapshot.point,
+            ),
+        }
         .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
         config_space.branch = store.branch().to_le();
         let resizing = Arc::new(Resizing::default());
@@ -130,11 +189,19 @@ impl Extent {
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT)
-            | (1 << VIRTIO_EXTENT_F_RESIZE);
+            | (1 << VIRTIO_EXTENT_F_RESIZE)
+            | (1 << VIRTIO_EXTENT_F_FREEZE);
         let mut shm_regions = Vec::new();
+        let window_addr = match making {
+            Making::Boot => None,
+            Making::Restore { window_addr, .. } => window_addr,
+        };
         let window = match config.dax_window_size {
             Some(size) => {
-                let window = DaxWindow::new(vm, size)?;
+                let window = match window_addr {
+                    Some(addr) => DaxWindow::at(vm, addr, size)?,
+                    None => DaxWindow::new(vm, size)?,
+                };
                 shm_regions.push(VirtioShmRegion {
                     id: DAX_WINDOW_SHM_ID,
                     guest_addr: window.guest_addr(),
@@ -162,6 +229,9 @@ impl Extent {
             queues: vec![Queue::new(EXTENT_QUEUE_SIZE)],
             queue_events: vec![EventFd::new(libc::EFD_NONBLOCK).map_err(ExtentError::EventFd)?],
             worker: None,
+            frozen: Arc::default(),
+            snapshot: None,
+            mappings: Vec::new(),
         })
     }
 
@@ -207,6 +277,111 @@ impl Extent {
             worker.stop();
         }
     }
+
+    /// Stops the worker, once the requests it took are served, and takes back its queue, as it
+    /// left it, for a snapshot: the VM is paused, and the worker starts again as it resumes
+    /// (`VirtioDevice::kick`).
+    fn pause_worker(&mut self) {
+        if let Some(queue) = self.worker.take().and_then(Worker::stop) {
+            self.queues[0] = queue;
+        }
+    }
+
+    /// Starts the worker again, if the device is activated and it is paused (`pause_worker`).
+    fn resume_worker(&mut self) -> Result<(), ActivateError> {
+        let DeviceState::Activated(ActiveState { mem, interrupt }) = &self.device_state else {
+            return Ok(());
+        };
+        if self.worker.is_some() {
+            return Ok(());
+        }
+        // The worker serves the queue from here on, notified through a copy of its event.
+        let queue_event = self.queue_events[0]
+            .try_clone()
+            .map_err(|_| ActivateError::EventFd)?;
+        let worker = Worker::spawn(
+            self.queues[0].clone(),
+            queue_event,
+            interrupt.clone(),
+            mem.clone(),
+            self.store.clone(),
+            self.resizing.clone(),
+            self.frozen.clone(),
+        )
+        .map_err(|err| ActivateError::Extent(format!("starting the worker: {err}")))?;
+        self.worker = Some(worker);
+        Ok(())
+    }
+
+    /// fxdax: takes a snapshot of the device's store, for a snapshot of the VM, paused, whose
+    /// guest's filesystem is frozen, with nothing open (TASK-39.1): forks the store to `point`,
+    /// and records the window's mappings, which [`Persist::save`](crate::snapshot::Persist) saves.
+    pub fn take_snapshot(&mut self, point: &Path) -> Result<(), ExtentSnapshotError> {
+        let id = self.config.id.clone();
+        if !self.frozen.load(Ordering::Acquire) {
+            return Err(ExtentSnapshotError::NotFrozen(id));
+        }
+        // No request is in progress, which could change the window meanwhile.
+        self.pause_worker();
+        let branch = rand_branch();
+        self.store.fork_quiescent(point, branch).map_err(|errno| {
+            ExtentSnapshotError::Fork(id.clone(), point.display().to_string(), errno)
+        })?;
+        let mappings = self
+            .store
+            .window_mappings()
+            .map_err(|errno| ExtentSnapshotError::Mappings(id, errno))?;
+        self.snapshot = Some(ExtentSnapshot {
+            point: point.to_owned(),
+            mappings,
+        });
+        Ok(())
+    }
+
+    /// The snapshot taken of the device's store ([`Extent::take_snapshot`]), or restored from.
+    pub fn snapshot(&self) -> Option<&ExtentSnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// Whether the guest's filesystem is frozen.
+    pub(super) fn frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    /// The window's address in guest memory, if the device has a window.
+    pub(super) fn window_addr(&self) -> Option<u64> {
+        self.window.as_ref().map(DaxWindow::guest_addr)
+    }
+
+    /// The device as restored from a snapshot: its queues, features and the guest's freezing as
+    /// they were, and the window's mappings to map again as it is activated.
+    pub(super) fn restored(
+        &mut self,
+        snapshot: ExtentSnapshot,
+        queues: Vec<Queue>,
+        acked_features: u64,
+        frozen: bool,
+    ) {
+        self.queues = queues;
+        self.acked_features = acked_features;
+        self.frozen.store(frozen, Ordering::Release);
+        self.mappings.clone_from(&snapshot.mappings);
+        self.snapshot = Some(snapshot);
+    }
+
+    /// Maps the window's mappings of the snapshot the device was restored from again.
+    fn map_again(&mut self) -> Result<(), fxdax::Errno> {
+        for mapping in std::mem::take(&mut self.mappings) {
+            self.store.map_again(&mapping)?;
+        }
+        Ok(())
+    }
+}
+
+/// A new branch's number, for a fork of the store.
+fn rand_branch() -> u64 {
+    let rng = vmm_sys_util::rand::xor_pseudo_rng_u32;
+    ((u64::from(rng()) << 32) | u64::from(rng())).max(1)
 }
 
 impl Drop for Extent {
@@ -297,27 +472,32 @@ impl VirtioDevice for Extent {
         }
         self.create_dax_window()
             .map_err(|err| ActivateError::Extent(format!("creating the DAX window: {err:#}")))?;
-        // The worker serves the queue from here on, notified through a copy of its event.
-        let queue_event = self.queue_events[0]
-            .try_clone()
-            .map_err(|_| ActivateError::EventFd)?;
-        let worker = Worker::spawn(
-            self.queues[0].clone(),
-            queue_event,
-            interrupt.clone(),
-            mem.clone(),
-            self.store.clone(),
-            self.resizing.clone(),
-        )
-        .map_err(|err| ActivateError::Extent(format!("starting the worker: {err}")))?;
-        self.worker = Some(worker);
+        self.map_again().map_err(|errno| {
+            ActivateError::Extent(format!("mapping the snapshot's window again: {errno}"))
+        })?;
         *self.resizing.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
-        Ok(())
+        self.resume_worker()
     }
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    // fxdax: the worker starts again as the VM resumes after a snapshot (`pause_worker`), and
+    // takes the requests queued meanwhile.
+    fn kick(&mut self) {
+        if let Err(err) = self.resume_worker() {
+            error!("extent device {}: {err}", self.config.id);
+        }
+        if self.is_activated() {
+            self.notify_queue_events();
+        }
+    }
+
+    // fxdax: the queue as the worker left it, which no request changes: the VM is paused.
+    fn prepare_save(&mut self) {
+        self.pause_worker();
     }
 
     // fxdax: the worker stops, and the device is as before the driver activated it.

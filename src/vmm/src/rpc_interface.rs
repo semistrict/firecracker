@@ -1357,6 +1357,7 @@ mod tests {
                 resume_vm: false,
                 network_overrides: vec![],
                 vsock_override: None,
+                extent_overrides: vec![],
                 clock_realtime: false,
             },
         )));

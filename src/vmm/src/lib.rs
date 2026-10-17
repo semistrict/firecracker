@@ -455,8 +455,18 @@ impl Vmm {
                 {
                     tuples.push(("vhost-user-block", b.id().to_owned()));
                 }
-                // Its store and DAX window live in fxdax's extent daemon, which a snapshot
-                // doesn't hold.
+                // fxdax: its store, in fxdax's extent daemon, is snapshotted first
+                // (`Vmm::take_extent_snapshots`).
+                #[cfg(feature = "fxdax")]
+                if let VirtioDeviceType::Extent = device_type
+                    && device
+                        .as_any()
+                        .downcast_ref::<devices::virtio::extent::Extent>()
+                        .is_none_or(|extent| extent.snapshot().is_none())
+                {
+                    tuples.push(("extent", device.id().to_owned()));
+                }
+                #[cfg(not(feature = "fxdax"))]
                 if let VirtioDeviceType::Extent = device_type {
                     tuples.push(("extent", device.id().to_owned()));
                 }
@@ -473,6 +483,41 @@ impl Vmm {
                 "Devices without snapshot support are present: {msg}"
             )))
         }
+    }
+
+    /// fxdax: takes the snapshots of the extent-store devices' stores, for a snapshot of the VM,
+    /// paused, at `snapshot_path`: each forks its store to `<snapshot_path>.extent-<id>`, the
+    /// point a VM restored from the snapshot forks its own from (TASK-39.1). The guests'
+    /// filesystems must be frozen.
+    #[cfg(feature = "fxdax")]
+    pub fn take_extent_snapshots(
+        &mut self,
+        snapshot_path: &std::path::Path,
+    ) -> Result<(), MicrovmStateError> {
+        let snapshot_path = std::path::absolute(snapshot_path).map_err(|err| {
+            MicrovmStateError::NotAllowed(format!(
+                "the snapshot's path {}: {err}",
+                snapshot_path.display()
+            ))
+        })?;
+        let mut ids = Vec::new();
+        self.device_manager
+            .for_each_virtio_device(|device_type, device| {
+                if let VirtioDeviceType::Extent = device_type {
+                    ids.push(device.id().to_owned());
+                }
+            });
+        for id in ids {
+            let mut point = snapshot_path.clone().into_os_string();
+            point.push(format!(".extent-{id}"));
+            self.device_manager
+                .with_virtio_device(&id, |extent: &mut devices::virtio::extent::Extent| {
+                    extent.take_snapshot(std::path::Path::new(&point))
+                })
+                .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))?
+                .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Sends a resume command to the vCPUs.

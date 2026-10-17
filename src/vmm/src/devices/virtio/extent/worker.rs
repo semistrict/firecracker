@@ -8,7 +8,7 @@
 
 use std::io;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
@@ -26,7 +26,11 @@ use super::{
     VIRTIO_EXTENT_T_MAP, VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP,
     VIRTIO_EXTENT_T_WRITE, write_barriers,
 };
-use super::{ResizedArgs, Resizing, VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_RESIZED};
+use super::{
+    INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREEZE_FROZEN,
+    VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST,
+    VIRTIO_EXTENT_T_RESIZED,
+};
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::{error, info};
@@ -40,20 +44,20 @@ const SERVERS: usize = 8;
 /// costs.
 #[derive(Default)]
 struct Served {
-    count: [AtomicU64; VIRTIO_EXTENT_T_RESIZED as usize + 1],
-    nanos: [AtomicU64; VIRTIO_EXTENT_T_RESIZED as usize + 1],
+    count: [AtomicU64; VIRTIO_EXTENT_T_LAST as usize + 1],
+    nanos: [AtomicU64; VIRTIO_EXTENT_T_LAST as usize + 1],
 }
 
 impl Served {
     fn add(&self, type_: Option<u32>, nanos: u64) {
-        if let Some(type_) = type_.filter(|t| *t <= VIRTIO_EXTENT_T_RESIZED) {
+        if let Some(type_) = type_.filter(|t| *t <= VIRTIO_EXTENT_T_LAST) {
             self.count[type_ as usize].fetch_add(1, Ordering::Relaxed);
             self.nanos[type_ as usize].fetch_add(nanos, Ordering::Relaxed);
         }
     }
 
     fn log(&self) {
-        for type_ in 0..=VIRTIO_EXTENT_T_RESIZED as usize {
+        for type_ in 0..=VIRTIO_EXTENT_T_LAST as usize {
             let count = self.count[type_].load(Ordering::Relaxed);
             if count > 0 {
                 #[allow(clippy::cast_precision_loss)]
@@ -74,6 +78,8 @@ struct Shared {
     mem: GuestMemoryMmap,
     store: Arc<RemoteExtentStore>,
     resizing: Arc<Resizing>,
+    /// Whether the guest's filesystem is frozen (`VIRTIO_EXTENT_T_FREEZE`).
+    frozen: Arc<AtomicBool>,
     served: Served,
 }
 
@@ -89,7 +95,7 @@ impl Shared {
         let index = chain.index;
         let type_ = self.request_type(&chain);
         let start = Instant::now();
-        let len = handle(&self.store, &self.resizing, &self.mem, chain);
+        let len = handle(&self.store, &self.resizing, &self.frozen, &self.mem, chain);
         #[allow(clippy::cast_possible_truncation)]
         self.served.add(type_, start.elapsed().as_nanos() as u64);
         self.complete(index, len);
@@ -129,7 +135,8 @@ fn quick(type_: Option<u32>) -> bool {
 /// The worker's thread, once spawned, which stops when told to.
 #[derive(Debug)]
 pub(super) struct Worker {
-    thread: thread::JoinHandle<()>,
+    /// Returns the queue, as the worker left it.
+    thread: thread::JoinHandle<Queue>,
     stop: EventFd,
 }
 
@@ -143,6 +150,7 @@ impl Worker {
         mem: GuestMemoryMmap,
         store: Arc<RemoteExtentStore>,
         resizing: Arc<Resizing>,
+        frozen: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let stop = EventFd::new(libc::EFD_NONBLOCK)?;
         let stop_theirs = stop.try_clone()?;
@@ -152,6 +160,7 @@ impl Worker {
             mem,
             store,
             resizing,
+            frozen,
             served: Served::default(),
         };
         let thread = thread::Builder::new()
@@ -160,14 +169,17 @@ impl Worker {
         Ok(Self { thread, stop })
     }
 
-    /// Stops the worker once the requests it took are served.
-    pub(super) fn stop(self) {
+    /// Stops the worker once the requests it took are served, and returns the queue, as it left
+    /// it: none if it panicked.
+    pub(super) fn stop(self) -> Option<Queue> {
         if let Err(err) = self.stop.write(1) {
             error!("extent device: stopping the worker: {err}");
         }
-        if self.thread.join().is_err() {
+        let stopped = self.thread.join();
+        if stopped.is_err() {
             error!("extent device: the worker panicked");
         }
+        stopped.ok()
     }
 }
 
@@ -179,7 +191,7 @@ struct Request(DescriptorChain);
 // goes, runs. Each chain is served by one server at a time.
 unsafe impl Send for Request {}
 
-fn work(shared: Shared, queue_event: EventFd, stop: EventFd) {
+fn work(shared: Shared, queue_event: EventFd, stop: EventFd) -> Queue {
     let (requests, received) = mpsc::channel::<Request>();
     let received = Mutex::new(received);
     thread::scope(|scope| {
@@ -204,6 +216,7 @@ fn work(shared: Shared, queue_event: EventFd, stop: EventFd) {
         take_requests(&shared, &queue_event, &stop, requests);
     });
     shared.served.log();
+    shared.queue.into_inner().expect("Poisoned lock")
 }
 
 /// Takes the requests off the queue as the driver notifies `queue_event`, and sends them to
@@ -271,7 +284,9 @@ fn take_requests(
             }
             for chain in taken {
                 // The servers outlive this sender.
-                requests.send(Request(chain)).expect("the extent servers stopped");
+                requests
+                    .send(Request(chain))
+                    .expect("the extent servers stopped");
             }
         }
     }
@@ -423,6 +438,7 @@ impl Writer<'_> {
 pub(super) fn handle(
     store: &RemoteExtentStore,
     resizing: &Resizing,
+    frozen: &AtomicBool,
     mem: &GuestMemoryMmap,
     chain: DescriptorChain,
 ) -> u32 {
@@ -446,7 +462,7 @@ pub(super) fn handle(
     let writer = Writer {
         segments: &buffers.writable,
     };
-    let (status, written) = match serve(store, resizing, &mut reader, &writer, room) {
+    let (status, written) = match serve(store, resizing, frozen, &mut reader, &writer, room) {
         Ok(written) => (0, written),
         Err(errno) => (errno.raw().cast_unsigned(), 0),
     };
@@ -465,6 +481,7 @@ pub(super) fn handle(
 fn serve(
     store: &RemoteExtentStore,
     resizing: &Resizing,
+    frozen: &AtomicBool,
     reader: &mut Reader,
     writer: &Writer,
     room: usize,
@@ -561,7 +578,8 @@ fn serve(
             Ok(returned)
         }
         VIRTIO_EXTENT_T_INFO => {
-            if room < size_of::<Info>() {
+            // A driver without VIRTIO_EXTENT_F_FREEZE has no room for the branch.
+            if room < INFO_LEN_WITHOUT_BRANCH {
                 return Err(Errno::EINVAL);
             }
             let info = store.info()?;
@@ -571,9 +589,15 @@ fn serve(
                 available: info.available.to_le(),
                 next_sequence: info.next_sequence.to_le(),
                 sequence_floor: info.sequence_floor.to_le(),
+                branch: store.branch().to_le(),
             };
-            writer.write(0, info.as_slice());
-            Ok(size_of::<Info>())
+            let len = room.min(size_of::<Info>());
+            writer.write(0, &info.as_slice()[..len]);
+            Ok(len)
+        }
+        VIRTIO_EXTENT_T_FREEZE => {
+            frozen.store(flags & VIRTIO_EXTENT_FREEZE_FROZEN != 0, Ordering::Release);
+            Ok(0)
         }
         VIRTIO_EXTENT_T_RESIZED => {
             let args: ResizedArgs = reader.obj()?;
@@ -695,7 +719,13 @@ mod tests {
         vq.avail.ring[0].set(0);
         vq.avail.idx.set(1);
         let chain = queue.pop().unwrap().unwrap();
-        let used = handle(store, &Resizing::default(), &mem, chain) as usize;
+        let used = handle(
+            store,
+            &Resizing::default(),
+            &AtomicBool::new(false),
+            &mem,
+            chain,
+        ) as usize;
         assert_eq!(
             used, writable,
             "the device wrote {used} of {writable} bytes"
@@ -885,9 +915,14 @@ mod tests {
                 used: 0,
                 available: 1 << 20,
                 next_sequence: 0,
-                sequence_floor: 0
+                sequence_floor: 0,
+                branch: store.branch(),
             }
         );
+        // A driver without VIRTIO_EXTENT_F_FREEZE has room for what comes before the branch.
+        let (written, status) = request(&store, &info, INFO_LEN_WITHOUT_BRANCH + RESPONSE);
+        assert_eq!(status, 0);
+        assert_eq!(written.len(), INFO_LEN_WITHOUT_BRANCH);
     }
 
     #[test]

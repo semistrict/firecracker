@@ -11,6 +11,7 @@
 //! host's VMs share.
 
 pub mod device;
+pub mod persist;
 mod window;
 mod worker;
 
@@ -35,6 +36,10 @@ pub const VIRTIO_EXTENT_F_WRITE_COMMIT: u32 = 2;
 /// runs, telling it with a configuration change; a shrink the guest is asked to take it answers
 /// (`VIRTIO_EXTENT_T_RESIZED`).
 pub const VIRTIO_EXTENT_F_RESIZE: u32 = 3;
+/// fxdax: `VIRTIO_EXTENT_T_FREEZE` tells the device the guest's filesystem is frozen, or thawed,
+/// and `INFO` says the branch: a snapshot of the VM is taken frozen, and a VM restored from it,
+/// with a store of its own, learns its branch as its filesystem thaws (TASK-39.1).
+pub const VIRTIO_EXTENT_F_FREEZE: u32 = 4;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -48,6 +53,12 @@ pub const VIRTIO_EXTENT_T_INFO: u32 = 8;
 /// took it, `VIRTIO_EXTENT_RESIZED_TOOK`.
 pub const VIRTIO_EXTENT_T_RESIZED: u32 = 9;
 pub const VIRTIO_EXTENT_RESIZED_TOOK: u32 = 1 << 0;
+/// fxdax: the guest's filesystem is frozen, with `VIRTIO_EXTENT_FREEZE_FROZEN`, nothing open and
+/// nothing written until it thaws; or thawed, without.
+pub const VIRTIO_EXTENT_T_FREEZE: u32 = 10;
+pub const VIRTIO_EXTENT_FREEZE_FROZEN: u32 = 1 << 0;
+/// The last request type.
+pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_FREEZE;
 
 /// A `WRITE`'s flags: a barrier precedes it, as if a `COMMIT` did; a `COMMIT` follows it (with
 /// `WRITE_COMMIT`); that commit completes once durable.
@@ -176,7 +187,13 @@ pub struct Info {
     pub next_sequence: u64,
     /// fxdax: the lowest sequence number the guest may mint from.
     pub sequence_floor: u64,
+    /// fxdax (`VIRTIO_EXTENT_F_FREEZE`): the branch the guest mints extents of.
+    pub branch: u64,
 }
+
+/// The length of what `INFO` writes for a driver without `VIRTIO_EXTENT_F_FREEZE`: the fields
+/// before `Info::branch`.
+pub const INFO_LEN_WITHOUT_BRANCH: usize = std::mem::offset_of!(Info, branch);
 
 /// `VIRTIO_EXTENT_T_RESIZED`'s arguments: the capacity the guest was asked to shrink to.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
