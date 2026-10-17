@@ -1727,6 +1727,15 @@ definitions:
         type: string
         description:
           The store's directory
+      point_on_host:
+        type: string
+        description:
+          The snapshot's point of the store, if not where the snapshot was taken,
+          which the extent daemon takes from its bucket if it doesn't exist
+      extentd_socket:
+        type: string
+        description:
+          The extent daemon's socket, if not the snapshotted VM's
   VsockOverride:
     type: object
     description:

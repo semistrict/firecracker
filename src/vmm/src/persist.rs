@@ -427,7 +427,15 @@ pub fn restore_from_snapshot(
             .iter_mut()
             .map(|device| &mut device.device_state)
             .find(|state| state.config.id == entry.id)
-            .map(|state| state.config.path_on_host.clone_from(&entry.path_on_host))
+            .map(|state| {
+                state.config.path_on_host.clone_from(&entry.path_on_host);
+                if let Some(point) = &entry.point_on_host {
+                    state.point = point.into();
+                }
+                if let Some(socket) = &entry.extentd_socket {
+                    state.config.extentd_socket.clone_from(socket);
+                }
+            })
             .ok_or_else(|| SnapshotStateFromFileError::UnknownExtentDevice(entry.id.clone()))?;
     }
     #[cfg(not(feature = "fxdax"))]

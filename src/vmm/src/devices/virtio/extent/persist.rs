@@ -35,6 +35,8 @@ pub struct ExtentState {
     pub window_addr: Option<u64>,
     /// The point the snapshot holds of the store: a fork of it.
     pub point: PathBuf,
+    /// The point's branch, which a restore on another host takes from the extent daemon's bucket.
+    pub point_branch: u64,
     /// The window's mappings.
     pub mappings: Vec<MappingState>,
     /// Whether the guest's filesystem was frozen: it is, as a snapshot is taken.
@@ -176,6 +178,7 @@ impl<'a> Persist<'a> for Extent {
             config: ExtentConfigState::from(&self.config),
             window_addr: self.window_addr(),
             point: snapshot.point.clone(),
+            point_branch: snapshot.point_branch,
             mappings: snapshot.mappings.iter().map(MappingState::from).collect(),
             frozen: self.frozen(),
         }
@@ -193,6 +196,7 @@ impl<'a> Persist<'a> for Extent {
         )?;
         let snapshot = ExtentSnapshot {
             point: state.point.clone(),
+            point_branch: state.point_branch,
             mappings: state
                 .mappings
                 .iter()

@@ -63,6 +63,8 @@ pub enum ExtentSnapshotError {
 #[derive(Debug, Clone)]
 pub struct ExtentSnapshot {
     pub point: PathBuf,
+    /// The point's branch: a restore on another host takes it from the extent daemon's bucket.
+    pub point_branch: u64,
     pub mappings: Vec<fxdax::WindowMapping>,
 }
 
@@ -173,6 +175,8 @@ impl Extent {
                 &config.extentd_socket,
                 &config.path_on_host,
                 &snapshot.point,
+                snapshot.point_branch,
+                config.capacity,
             ),
         }
         .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
@@ -333,6 +337,7 @@ impl Extent {
             .map_err(|errno| ExtentSnapshotError::Mappings(id, errno))?;
         self.snapshot = Some(ExtentSnapshot {
             point: point.to_owned(),
+            point_branch: branch,
             mappings,
         });
         Ok(())

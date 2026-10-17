@@ -59,7 +59,9 @@ pub struct NetworkOverride {
 
 /// fxdax: has an extent-store device restored from a snapshot open the store at `path_on_host`,
 /// forked from the snapshot's point of its store if it doesn't exist, rather than the store the
-/// snapshotted VM had: a store of its own for each VM restored from one snapshot (TASK-39.1).
+/// snapshotted VM had: a store of its own for each VM restored from one snapshot (TASK-39.1). On
+/// another host, the point is at `point_on_host`, which the extent daemon at `extentd_socket` takes
+/// from its bucket if it doesn't exist.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtentOverride {
@@ -67,6 +69,12 @@ pub struct ExtentOverride {
     pub id: String,
     /// The store's directory.
     pub path_on_host: String,
+    /// The snapshot's point of the store, if not where the snapshot was taken.
+    #[serde(default)]
+    pub point_on_host: Option<String>,
+    /// The extent daemon's socket, if not the snapshotted VM's.
+    #[serde(default)]
+    pub extentd_socket: Option<String>,
 }
 
 /// Allows for changing the host UDS of the vsock backend during snapshot restore
