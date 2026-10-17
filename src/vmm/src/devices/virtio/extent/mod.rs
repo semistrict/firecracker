@@ -19,6 +19,10 @@ pub use self::device::{Extent, ExtentError};
 pub use self::window::KvmPrefault;
 pub use self::window::{DaxWindowError, PrefaultGuestMemory};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::vstate::memory::ByteValued;
 
 /// Shared memory region 0 is a DAX window, and `MAP`/`UNMAP` work.
@@ -27,6 +31,10 @@ pub const VIRTIO_EXTENT_F_DAX: u32 = 0;
 pub const VIRTIO_EXTENT_F_DAX_WRITE: u32 = 1;
 /// `WRITE` takes `WRITE_COMMIT`: a commit follows the write, in one request.
 pub const VIRTIO_EXTENT_F_WRITE_COMMIT: u32 = 2;
+/// fxdax: the configuration holds the store's capacity, which the host changes while the guest
+/// runs, telling it with a configuration change; a shrink the guest is asked to take it answers
+/// (`VIRTIO_EXTENT_T_RESIZED`).
+pub const VIRTIO_EXTENT_F_RESIZE: u32 = 3;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -36,6 +44,10 @@ pub const VIRTIO_EXTENT_T_UNMAP: u32 = 5;
 pub const VIRTIO_EXTENT_T_COMMIT: u32 = 6;
 pub const VIRTIO_EXTENT_T_ROOT: u32 = 7;
 pub const VIRTIO_EXTENT_T_INFO: u32 = 8;
+/// fxdax: the guest's answer to a shrink it was asked to take (`ConfigSpace::asked`): whether it
+/// took it, `VIRTIO_EXTENT_RESIZED_TOOK`.
+pub const VIRTIO_EXTENT_T_RESIZED: u32 = 9;
+pub const VIRTIO_EXTENT_RESIZED_TOOK: u32 = 1 << 0;
 
 /// A `WRITE`'s flags: a barrier precedes it, as if a `COMMIT` did; a `COMMIT` follows it (with
 /// `WRITE_COMMIT`); that commit completes once durable.
@@ -164,6 +176,59 @@ pub struct Info {
     pub next_sequence: u64,
 }
 
+/// `VIRTIO_EXTENT_T_RESIZED`'s arguments: the capacity the guest was asked to shrink to.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct ResizedArgs {
+    pub capacity: u64,
+}
+
+/// fxdax: what the device knows of its store's capacity, which the daemon changes
+/// (`RemoteExtentStore::on_capacity`): the capacity, the shrink the guest is asked to take, if any
+/// (0 if none), and how the guest is told, once the driver activates the device.
+#[derive(Default)]
+pub struct Resizing {
+    pub capacity: AtomicU64,
+    pub asked: AtomicU64,
+    pub interrupt: Mutex<Option<Arc<dyn VirtioInterrupt>>>,
+}
+
+impl std::fmt::Debug for Resizing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resizing")
+            .field("capacity", &self.capacity)
+            .field("asked", &self.asked)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Resizing {
+    /// The daemon set the store's capacity to `capacity` bytes, or, if `ask`, asks the guest to
+    /// shrink to it: the guest is told, with a configuration change.
+    pub fn changed(&self, capacity: u64, ask: bool) {
+        if ask {
+            self.asked.store(capacity, Ordering::Release);
+        } else {
+            self.capacity.store(capacity, Ordering::Release);
+            self.asked.store(0, Ordering::Release);
+        }
+        if let Some(interrupt) = &*self.interrupt.lock().expect("Poisoned lock")
+            && let Err(err) = interrupt.trigger(VirtioInterruptType::Config)
+        {
+            crate::logger::error!("extent device: signalling a configuration change: {err:?}");
+        }
+    }
+
+    /// The guest answered the shrink to `capacity` bytes it was asked to take: it took it, if
+    /// `took`.
+    pub fn answered(&self, capacity: u64, took: bool) {
+        self.asked.store(0, Ordering::Release);
+        if took {
+            self.capacity.store(capacity, Ordering::Release);
+        }
+    }
+}
+
 /// The device's configuration space.
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
@@ -178,6 +243,10 @@ pub struct ConfigSpace {
     pub max_root: u32,
     pub branch: u64,
     pub max_extent: u64,
+    /// fxdax: the store's capacity, and the shrink the guest is asked to take, if any, 0 if none
+    /// (`VIRTIO_EXTENT_F_RESIZE`).
+    pub capacity: u64,
+    pub asked: u64,
 }
 
 // SAFETY: They are plain data, with no implicit padding.
@@ -186,6 +255,8 @@ unsafe impl ByteValued for ExtentIdLe {}
 unsafe impl ByteValued for RequestHeader {}
 // SAFETY: As above.
 unsafe impl ByteValued for Response {}
+// SAFETY: As above.
+unsafe impl ByteValued for ResizedArgs {}
 // SAFETY: As above.
 unsafe impl ByteValued for IoArgs {}
 // SAFETY: As above.
