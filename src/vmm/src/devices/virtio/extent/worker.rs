@@ -656,7 +656,9 @@ mod tests {
         }
     }
 
-    /// A store of 1 MiB, which an extent daemon of the test's serves.
+    /// A store of 1 MiB, which an extent daemon of the test's serves: a host's, which keeps its
+    /// stores' branches in the bucket FXDAX_EXTENTD_REMOTE names (memory:///NAME, in tests), as
+    /// of placement FXDAX_EXTENTD_TOKEN (1), which the tests' environment sets.
     fn store() -> (RemoteExtentStore, TestDir) {
         let dir = TestDir::new();
         let socket = dir.0.join("extentd.sock");
@@ -915,7 +917,9 @@ mod tests {
                 used: 0,
                 available: 1 << 20,
                 next_sequence: 0,
-                sequence_floor: 0,
+                // The store's branch is kept in the daemon's bucket: its writer mints from its
+                // range, its first lease's (fxdax's doc-7, Fencing).
+                sequence_floor: 1 << 40,
                 branch: store.branch(),
             }
         );
