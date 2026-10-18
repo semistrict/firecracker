@@ -1301,6 +1301,7 @@ mod tests {
                 capacity: 0,
                 dax_window_size: None,
                 extentd_socket: String::new(),
+                read_only: false,
             },
         )));
         check_unsupported(runtime_request(VmmAction::ConfigureBootSource(

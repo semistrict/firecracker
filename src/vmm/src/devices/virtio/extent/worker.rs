@@ -27,9 +27,10 @@ use super::{
     VIRTIO_EXTENT_T_WRITE, write_barriers,
 };
 use super::{
-    INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREEZE_FROZEN,
-    VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST,
-    VIRTIO_EXTENT_T_RESIZED,
+    Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREEZE_FROZEN,
+    VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_ADVANCE, VIRTIO_EXTENT_T_FREEZE,
+    VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO, VIRTIO_EXTENT_T_PIN, VIRTIO_EXTENT_T_RESIZED,
+    VIRTIO_EXTENT_T_UNPIN,
 };
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
@@ -128,6 +129,10 @@ fn quick(type_: Option<u32>) -> bool {
                 | VIRTIO_EXTENT_T_FREE
                 | VIRTIO_EXTENT_T_ROOT
                 | VIRTIO_EXTENT_T_INFO
+                | VIRTIO_EXTENT_T_ADVANCE
+                | VIRTIO_EXTENT_T_LET_GO
+                | VIRTIO_EXTENT_T_PIN
+                | VIRTIO_EXTENT_T_UNPIN
         )
     )
 }
@@ -607,6 +612,33 @@ fn serve(
             store.resized(capacity, took)?;
             Ok(0)
         }
+        // fxdax: a follower's (doc-4's F_READ_ONLY); a writer's store refuses them (EINVAL).
+        VIRTIO_EXTENT_T_ADVANCE => {
+            if room < size_of::<Epoch>() {
+                return Err(Errno::EINVAL);
+            }
+            let epoch = Epoch {
+                epoch: store.advance()?.to_le(),
+                reserved: 0,
+            };
+            writer.write(0, epoch.as_slice());
+            Ok(size_of::<Epoch>())
+        }
+        VIRTIO_EXTENT_T_LET_GO => {
+            let epoch: Epoch = reader.obj()?;
+            store.let_go(u64::from_le(epoch.epoch))?;
+            Ok(0)
+        }
+        VIRTIO_EXTENT_T_PIN => {
+            let id: ExtentIdLe = reader.obj()?;
+            store.pin(id.into())?;
+            Ok(0)
+        }
+        VIRTIO_EXTENT_T_UNPIN => {
+            let id: ExtentIdLe = reader.obj()?;
+            store.unpin(id.into())?;
+            Ok(0)
+        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -927,6 +959,81 @@ mod tests {
         let (written, status) = request(&store, &info, INFO_LEN_WITHOUT_BRANCH + RESPONSE);
         assert_eq!(status, 0);
         assert_eq!(written.len(), INFO_LEN_WITHOUT_BRANCH);
+    }
+
+    /// fxdax: a follower's device reads its writer's store as of its view's commit, advances to
+    /// the writer's latest, lets go of the commits before and pins extents; what the writer wrote
+    /// since it reads as ENOENT, and what would write, it refuses (EROFS). A writer's device
+    /// refuses a follower's requests (EINVAL).
+    #[test]
+    fn test_follows_a_writer() {
+        let (store, dir) = store();
+        let follower =
+            RemoteExtentStore::connect_read_only(dir.0.join("extentd.sock"), dir.0.join("store"))
+                .unwrap();
+        let (heard, commits) = mpsc::channel();
+        follower.on_committed(move |epoch| {
+            // Unheard once the test stops listening.
+            let _ = heard.send(epoch);
+        });
+        let data = vec![7; BLOCK];
+        store
+            .write(
+                fxdax::ExtentId {
+                    branch: store.branch(),
+                    sequence: 1,
+                },
+                0,
+                &[fxdax::VolatileSlice::from(&data[..])],
+            )
+            .unwrap();
+        store.commit(None).unwrap();
+        let epoch = commits.recv().unwrap();
+        let read = bytes(VIRTIO_EXTENT_T_READ, 0, Some(io(&store, 1, 0, BLOCK)), &[]);
+        assert_eq!(
+            request(&follower, &read, BLOCK + RESPONSE),
+            (vec![0; BLOCK], errno(Errno::ENOENT))
+        );
+        let advance = bytes::<Epoch>(VIRTIO_EXTENT_T_ADVANCE, 0, None, &[]);
+        let (written, status) = request(&follower, &advance, size_of::<Epoch>() + RESPONSE);
+        assert_eq!(status, 0);
+        assert_eq!(
+            *Epoch::from_slice(&written).unwrap(),
+            Epoch { epoch, reserved: 0 }
+        );
+        assert_eq!(
+            request(&follower, &read, BLOCK + RESPONSE),
+            (data.clone(), 0)
+        );
+        let let_go = bytes(
+            VIRTIO_EXTENT_T_LET_GO,
+            0,
+            Some(Epoch { epoch, reserved: 0 }),
+            &[],
+        );
+        assert_eq!(request(&follower, &let_go, RESPONSE), (vec![], 0));
+        let id = ExtentIdLe {
+            branch: store.branch(),
+            sequence: 1,
+        };
+        for type_ in [VIRTIO_EXTENT_T_PIN, VIRTIO_EXTENT_T_UNPIN] {
+            let pin = bytes(type_, 0, Some(id), &[]);
+            assert_eq!(request(&follower, &pin, RESPONSE), (vec![], 0));
+            assert_eq!(request(&store, &pin, RESPONSE).1, errno(Errno::EINVAL));
+        }
+        let write = bytes(
+            VIRTIO_EXTENT_T_WRITE,
+            0,
+            Some(io(&store, 2, 0, BLOCK)),
+            &data,
+        );
+        assert_eq!(request(&follower, &write, RESPONSE).1, errno(Errno::EROFS));
+        let commit = bytes(VIRTIO_EXTENT_T_COMMIT, 0, Some(CommitArgs::default()), &[]);
+        assert_eq!(request(&follower, &commit, RESPONSE).1, errno(Errno::EROFS));
+        assert_eq!(
+            request(&store, &advance, size_of::<Epoch>() + RESPONSE).1,
+            errno(Errno::EINVAL)
+        );
     }
 
     #[test]

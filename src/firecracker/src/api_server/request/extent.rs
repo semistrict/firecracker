@@ -49,6 +49,7 @@ mod tests {
             capacity: 1 << 30,
             dax_window_size: Some(64 << 20),
             extentd_socket: "/extentd.sock".into(),
+            read_only: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_extent(&Body::new(BODY), Some("extents")).unwrap()),

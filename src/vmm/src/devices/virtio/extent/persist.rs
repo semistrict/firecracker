@@ -67,6 +67,8 @@ impl From<&ExtentDeviceConfig> for ExtentConfigState {
     }
 }
 
+// fxdax: a follower's device takes no snapshot (`ExtentSnapshotError::ReadOnly`): a snapshot's
+// is a writer's.
 impl From<&ExtentConfigState> for ExtentDeviceConfig {
     fn from(config: &ExtentConfigState) -> Self {
         Self {
@@ -76,6 +78,7 @@ impl From<&ExtentConfigState> for ExtentDeviceConfig {
             capacity: config.capacity,
             dax_window_size: config.dax_window_size,
             extentd_socket: config.extentd_socket.clone(),
+            read_only: false,
         }
     }
 }

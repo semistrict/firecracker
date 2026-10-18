@@ -20,6 +20,7 @@ use super::{
     MAX_TRANSFER, Resizing, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_FREEZE,
     VIRTIO_EXTENT_F_RESIZE, VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
+use super::{Following, VIRTIO_EXTENT_F_READ_ONLY};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
     ActiveState, DeviceState, VirtioDevice, VirtioDeviceType, VirtioShmRegion,
@@ -38,6 +39,8 @@ use crate::vstate::vm::KvmVm;
 pub enum ExtentError {
     /// Cannot open the extent store {0}: {1}
     Store(String, fxdax::Error),
+    /// The read-only extent device {0} is restored from no snapshot: it takes none
+    ReadOnlyRestored(String),
     /// The tag {0:?} is longer than 36 bytes
     TagTooLong(String),
     /// Cannot make the DAX window: {0}
@@ -51,6 +54,8 @@ pub enum ExtentError {
 pub enum ExtentSnapshotError {
     /// Extent device {0}: its guest's filesystem is not frozen (fsfreeze it before the snapshot, and thaw it after)
     NotFrozen(String),
+    /// Extent device {0}: it follows a store read-only, which a snapshot doesn't hold
+    ReadOnly(String),
     /// Extent device {0}: cannot fork its store to {1}: {2}
     Fork(String, String, fxdax::Errno),
     /// Extent device {0}: cannot list its DAX window's mappings: {1}
@@ -94,6 +99,11 @@ pub struct Extent {
     config_space: ConfigSpace,
     /// The store's capacity, as the daemon changes it.
     resizing: Arc<Resizing>,
+    /// fxdax: a follower's writer's commits, as the daemon tells of them.
+    following: Arc<Following>,
+    /// fxdax: whether a follower's device was reset since its store was opened: it opens it
+    /// anew as the driver activates it again, its guest remounting on a new view (doc-4).
+    reopen: bool,
 
     // VirtIO fields
     avail_features: u64,
@@ -158,6 +168,7 @@ impl Extent {
             max_extent: MAX_EXTENT.to_le(),
             capacity: 0,
             asked: 0,
+            committed: 0,
         };
         let tag = config.tag.as_bytes();
         if tag.len() > config_space.tag.len() {
@@ -166,6 +177,12 @@ impl Extent {
         config_space.tag[..tag.len()].copy_from_slice(tag);
 
         let store = match &making {
+            Making::Boot if config.read_only => {
+                RemoteExtentStore::connect_read_only(&config.extentd_socket, &config.path_on_host)
+            }
+            Making::Restore { .. } if config.read_only => {
+                return Err(ExtentError::ReadOnlyRestored(config.id.clone()));
+            }
             Making::Boot => RemoteExtentStore::connect(
                 &config.extentd_socket,
                 &config.path_on_host,
@@ -190,11 +207,20 @@ impl Extent {
             .store(info.capacity, std::sync::atomic::Ordering::Release);
         let changes = resizing.clone();
         store.on_capacity(move |capacity, ask| changes.changed(capacity, ask));
+        let following = Arc::new(Following::default());
+        hear_commits(&store, &following);
 
-        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
-            | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT)
-            | (1 << VIRTIO_EXTENT_F_RESIZE)
-            | (1 << VIRTIO_EXTENT_F_FREEZE);
+        // A follower's device writes nothing (doc-4's F_READ_ONLY).
+        let mut avail_features = if config.read_only {
+            (1u64 << VIRTIO_F_VERSION_1)
+                | (1 << VIRTIO_EXTENT_F_FREEZE)
+                | (1 << VIRTIO_EXTENT_F_READ_ONLY)
+        } else {
+            (1u64 << VIRTIO_F_VERSION_1)
+                | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT)
+                | (1 << VIRTIO_EXTENT_F_RESIZE)
+                | (1 << VIRTIO_EXTENT_F_FREEZE)
+        };
         let mut shm_regions = Vec::new();
         let window_addr = match making {
             Making::Boot => None,
@@ -211,8 +237,11 @@ impl Extent {
                     guest_addr: window.guest_addr(),
                     len: window.len(),
                 });
-                // The store maps open extents writably too (doc-4's DAX_WRITE).
-                avail_features |= (1 << VIRTIO_EXTENT_F_DAX) | (1 << VIRTIO_EXTENT_F_DAX_WRITE);
+                avail_features |= 1 << VIRTIO_EXTENT_F_DAX;
+                // The store maps open extents writably too (doc-4's DAX_WRITE): a writer's.
+                if !config.read_only {
+                    avail_features |= 1 << VIRTIO_EXTENT_F_DAX_WRITE;
+                }
                 Some(window)
             }
             None => None,
@@ -227,6 +256,8 @@ impl Extent {
             prefault: None,
             config_space,
             resizing,
+            following,
+            reopen: false,
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
@@ -276,6 +307,25 @@ impl Extent {
         Ok(())
     }
 
+    /// fxdax: opens a follower's store anew, as of its writer's latest commit, with a window of
+    /// its own, created as the driver activates the device: after a reset, its guest remounting
+    /// on a new view, as it does once it was cut off (`ESTALE`).
+    fn reopen(&mut self) -> Result<(), fxdax::Error> {
+        let store = RemoteExtentStore::connect_read_only(
+            &self.config.extentd_socket,
+            &self.config.path_on_host,
+        )?;
+        self.following = Arc::new(Following::default());
+        hear_commits(&store, &self.following);
+        self.config_space.branch = store.branch().to_le();
+        // The old connection goes, with its window's faults, before the new one creates its
+        // window in the same memory.
+        self.store = Arc::new(store);
+        self.window_created = false;
+        self.reopen = false;
+        Ok(())
+    }
+
     fn stop_worker(&mut self) {
         if let Some(worker) = self.worker.take() {
             worker.stop();
@@ -322,6 +372,9 @@ impl Extent {
     /// and records the window's mappings, which [`Persist::save`](crate::snapshot::Persist) saves.
     pub fn take_snapshot(&mut self, point: &Path) -> Result<(), ExtentSnapshotError> {
         let id = self.config.id.clone();
+        if self.config.read_only {
+            return Err(ExtentSnapshotError::ReadOnly(id));
+        }
         if !self.frozen.load(Ordering::Acquire) {
             return Err(ExtentSnapshotError::NotFrozen(id));
         }
@@ -383,6 +436,14 @@ impl Extent {
     }
 }
 
+/// fxdax: has `following` hear of the commits of the writer of `store`, a follower's, from the
+/// one its view is as of.
+fn hear_commits(store: &RemoteExtentStore, following: &Arc<Following>) {
+    let heard = following.clone();
+    store.on_committed(move |epoch| heard.committed(epoch));
+    following.committed(store.committed());
+}
+
 /// A new branch's number, for a fork of the store.
 fn rand_branch() -> u64 {
     let rng = vmm_sys_util::rand::xor_pseudo_rng_u32;
@@ -434,12 +495,14 @@ impl VirtioDevice for Extent {
             .as_ref()
     }
 
-    // fxdax: the store's capacity, and the shrink the guest is asked to take, as they are now.
+    // fxdax: the store's capacity, and the shrink the guest is asked to take, as they are now;
+    // and a follower's writer's latest commit.
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         use std::sync::atomic::Ordering;
         let config = ConfigSpace {
             capacity: self.resizing.capacity.load(Ordering::Acquire).to_le(),
             asked: self.resizing.asked.load(Ordering::Acquire).to_le(),
+            committed: self.following.committed.load(Ordering::Acquire).to_le(),
             ..self.config_space
         };
         let config = config.as_slice();
@@ -470,6 +533,10 @@ impl VirtioDevice for Extent {
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
         assert!(!self.is_activated());
+        if self.reopen {
+            self.reopen()
+                .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
+        }
         for queue in self.queues.iter_mut() {
             queue
                 .initialize(&mem)
@@ -481,6 +548,7 @@ impl VirtioDevice for Extent {
             ActivateError::Extent(format!("mapping the snapshot's window again: {errno}"))
         })?;
         *self.resizing.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
+        *self.following.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         self.resume_worker()
     }
@@ -505,9 +573,11 @@ impl VirtioDevice for Extent {
         self.pause_worker();
     }
 
-    // fxdax: the worker stops, and the device is as before the driver activated it.
+    // fxdax: the worker stops, and the device is as before the driver activated it: a
+    // follower's, its store opened anew as it is activated again.
     fn reset(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
         self.stop_worker();
+        self.reopen = self.config.read_only;
         let DeviceState::Activated(ActiveState { interrupt, .. }) =
             std::mem::replace(&mut self.device_state, DeviceState::Inactive)
         else {

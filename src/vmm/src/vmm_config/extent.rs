@@ -37,6 +37,10 @@ pub struct ExtentDeviceConfig {
     pub dax_window_size: Option<u64>,
     /// The socket of fxdax's extent daemon, which serves the store.
     pub extentd_socket: String,
+    /// fxdax: whether the device follows the store, read-only, as another VM writes it (fxdax's
+    /// backlog doc-8): the store must exist, and the guest mounts it read-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 /// The extent-store devices' configs.
@@ -77,6 +81,7 @@ mod tests {
             capacity: 1 << 30,
             dax_window_size: Some(64 << 20),
             extentd_socket: "/extentd.sock".into(),
+            read_only: false,
         }
     }
 
@@ -125,6 +130,10 @@ mod tests {
         let parsed: ExtentDeviceConfig = serde_json::from_str(json).unwrap();
         let mut expected = config("extents");
         expected.capacity = 1 << 30;
+        assert_eq!(parsed, expected);
+        let read_only = json.replace("}", r#", "read_only": true }"#);
+        let parsed: ExtentDeviceConfig = serde_json::from_str(&read_only).unwrap();
+        expected.read_only = true;
         assert_eq!(parsed, expected);
     }
 }

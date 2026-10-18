@@ -40,6 +40,10 @@ pub const VIRTIO_EXTENT_F_RESIZE: u32 = 3;
 /// and `INFO` says the branch: a snapshot of the VM is taken frozen, and a VM restored from it,
 /// with a store of its own, learns its branch as its filesystem thaws (TASK-39.1).
 pub const VIRTIO_EXTENT_F_FREEZE: u32 = 4;
+/// fxdax: the device follows a store another VM writes, read-only (backlog doc-8): `ADVANCE`,
+/// `LET_GO`, `PIN` and `UNPIN` work, and the configuration's `committed` changes as the writer
+/// commits, telling the guest with a configuration change (TASK-42.3).
+pub const VIRTIO_EXTENT_F_READ_ONLY: u32 = 5;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -57,8 +61,17 @@ pub const VIRTIO_EXTENT_RESIZED_TOOK: u32 = 1 << 0;
 /// nothing written until it thaws; or thawed, without.
 pub const VIRTIO_EXTENT_T_FREEZE: u32 = 10;
 pub const VIRTIO_EXTENT_FREEZE_FROZEN: u32 = 1 << 0;
+/// fxdax (`VIRTIO_EXTENT_F_READ_ONLY`): moves the follower's view to its writer's latest commit,
+/// holding what the commits between held until `LET_GO`, and writes its epoch (`Epoch`).
+pub const VIRTIO_EXTENT_T_ADVANCE: u32 = 11;
+/// fxdax: lets go of what the follower's view held of the commits before the one an `Epoch`
+/// names, which an `ADVANCE` wrote: served after the next `ADVANCE`, it lets go of no more.
+pub const VIRTIO_EXTENT_T_LET_GO: u32 = 12;
+/// fxdax: keeps an extent the view holds, whatever commit it advances to, until `UNPIN`.
+pub const VIRTIO_EXTENT_T_PIN: u32 = 13;
+pub const VIRTIO_EXTENT_T_UNPIN: u32 = 14;
 /// The last request type.
-pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_FREEZE;
+pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_UNPIN;
 
 /// A `WRITE`'s flags: a barrier precedes it, as if a `COMMIT` did; a `COMMIT` follows it (with
 /// `WRITE_COMMIT`); that commit completes once durable.
@@ -191,6 +204,15 @@ pub struct Info {
     pub branch: u64,
 }
 
+/// What `ADVANCE` writes, the epoch of the commit the follower's view is as of now, and `LET_GO`
+/// reads.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct Epoch {
+    pub epoch: u64,
+    pub reserved: u64,
+}
+
 /// The length of what `INFO` writes for a driver without `VIRTIO_EXTENT_F_FREEZE`: the fields
 /// before `Info::branch`.
 pub const INFO_LEN_WITHOUT_BRANCH: usize = std::mem::offset_of!(Info, branch);
@@ -248,6 +270,38 @@ impl Resizing {
     }
 }
 
+/// fxdax: what a follower's device knows of its writer's commits (`VIRTIO_EXTENT_F_READ_ONLY`,
+/// `RemoteExtentStore::on_committed`): the latest commit's epoch, and how the guest is told, once
+/// the driver activates the device.
+#[derive(Default)]
+pub struct Following {
+    pub committed: AtomicU64,
+    pub interrupt: Mutex<Option<Arc<dyn VirtioInterrupt>>>,
+}
+
+impl std::fmt::Debug for Following {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Following")
+            .field("committed", &self.committed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Following {
+    /// The writer made commit `epoch`: the guest is told, with a configuration change, if it is
+    /// after what it was told before.
+    pub fn committed(&self, epoch: u64) {
+        if self.committed.fetch_max(epoch, Ordering::AcqRel) >= epoch {
+            return;
+        }
+        if let Some(interrupt) = &*self.interrupt.lock().expect("Poisoned lock")
+            && let Err(err) = interrupt.trigger(VirtioInterruptType::Config)
+        {
+            crate::logger::error!("extent device: signalling a configuration change: {err:?}");
+        }
+    }
+}
+
 /// The device's configuration space.
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
@@ -266,6 +320,8 @@ pub struct ConfigSpace {
     /// (`VIRTIO_EXTENT_F_RESIZE`).
     pub capacity: u64,
     pub asked: u64,
+    /// fxdax: the epoch of the latest commit of a follower's writer (`VIRTIO_EXTENT_F_READ_ONLY`).
+    pub committed: u64,
 }
 
 // SAFETY: They are plain data, with no implicit padding.
@@ -288,6 +344,8 @@ unsafe impl ByteValued for CommitArgs {}
 unsafe impl ByteValued for RootLen {}
 // SAFETY: As above.
 unsafe impl ByteValued for Info {}
+// SAFETY: As above.
+unsafe impl ByteValued for Epoch {}
 // SAFETY: As above.
 unsafe impl ByteValued for ConfigSpace {}
 

@@ -1327,6 +1327,11 @@ definitions:
         type: string
         description:
           The socket of fxdax's extent daemon, which serves the store.
+      read_only:
+        type: boolean
+        description:
+          Whether the device follows the store, read-only, as another VM writes it. The store must
+          exist, and the guest mounts it read-only.
 
   Pmem:
     type: object
