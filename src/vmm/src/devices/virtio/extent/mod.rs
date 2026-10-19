@@ -106,8 +106,9 @@ pub const VIRTIO_EXTENT_COMMIT_ROOT: u32 = 1 << 1;
 /// A `MAP`'s flag: writable, which needs `DAX_WRITE`.
 pub const VIRTIO_EXTENT_MAP_WRITE: u32 = 1 << 0;
 
-/// The device's queues, and their size.
-pub const EXTENT_NUM_QUEUES: usize = 1;
+/// The device's queues, and their size: request queues, interchangeable, which a driver may use one
+/// per CPU of (fxdax TASK-26.18.5).
+pub const EXTENT_NUM_QUEUES: usize = 4;
 pub const EXTENT_QUEUE_SIZE: u16 = 256;
 
 /// The ID of the DAX window's shared memory region.

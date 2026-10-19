@@ -114,9 +114,9 @@ pub struct Extent {
     queues: Vec<Queue>,
     queue_events: Vec<EventFd>,
 
-    /// The worker serving the queue, while the device is activated, and not paused for a snapshot
-    /// (`pause_worker`).
-    worker: Option<Worker>,
+    /// The workers serving the queues the driver set up, by index, while the device is activated,
+    /// and not paused for a snapshot (`pause_worker`).
+    workers: Vec<(usize, Worker)>,
     /// fxdax: whether the guest's filesystem is frozen (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot
     /// needs it.
     frozen: Arc<AtomicBool>,
@@ -261,9 +261,13 @@ impl Extent {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
-            queues: vec![Queue::new(EXTENT_QUEUE_SIZE)],
-            queue_events: vec![EventFd::new(libc::EFD_NONBLOCK).map_err(ExtentError::EventFd)?],
-            worker: None,
+            queues: (0..EXTENT_NUM_QUEUES)
+                .map(|_| Queue::new(EXTENT_QUEUE_SIZE))
+                .collect(),
+            queue_events: (0..EXTENT_NUM_QUEUES)
+                .map(|_| EventFd::new(libc::EFD_NONBLOCK).map_err(ExtentError::EventFd))
+                .collect::<Result<_, _>>()?,
+            workers: Vec::new(),
             frozen: Arc::default(),
             snapshot: None,
             mappings: Vec::new(),
@@ -327,43 +331,55 @@ impl Extent {
     }
 
     fn stop_worker(&mut self) {
-        if let Some(worker) = self.worker.take() {
+        for (_, worker) in self.workers.drain(..) {
             worker.stop();
         }
     }
 
-    /// Stops the worker, once the requests it took are served, and takes back its queue, as it
-    /// left it, for a snapshot: the VM is paused, and the worker starts again as it resumes
+    /// Stops the workers, once the requests they took are served, and takes back their queues, as
+    /// they left them, for a snapshot: the VM is paused, and the workers start again as it resumes
     /// (`VirtioDevice::kick`).
     fn pause_worker(&mut self) {
-        if let Some(queue) = self.worker.take().and_then(Worker::stop) {
-            self.queues[0] = queue;
+        for (index, worker) in std::mem::take(&mut self.workers) {
+            if let Some(queue) = worker.stop() {
+                self.queues[index] = queue;
+            }
         }
     }
 
-    /// Starts the worker again, if the device is activated and it is paused (`pause_worker`).
+    /// Starts the workers again, if the device is activated and they are paused (`pause_worker`):
+    /// one for each queue the driver set up.
     fn resume_worker(&mut self) -> Result<(), ActivateError> {
         let DeviceState::Activated(ActiveState { mem, interrupt }) = &self.device_state else {
             return Ok(());
         };
-        if self.worker.is_some() {
+        if !self.workers.is_empty() {
             return Ok(());
         }
-        // The worker serves the queue from here on, notified through a copy of its event.
-        let queue_event = self.queue_events[0]
-            .try_clone()
-            .map_err(|_| ActivateError::EventFd)?;
-        let worker = Worker::spawn(
-            self.queues[0].clone(),
-            queue_event,
-            interrupt.clone(),
-            mem.clone(),
-            self.store.clone(),
-            self.resizing.clone(),
-            self.frozen.clone(),
-        )
-        .map_err(|err| ActivateError::Extent(format!("starting the worker: {err}")))?;
-        self.worker = Some(worker);
+        let ready: Vec<usize> = (0..self.queues.len())
+            .filter(|index| self.queues[*index].ready)
+            .collect();
+        let mut workers = Vec::with_capacity(ready.len());
+        for &index in &ready {
+            // The worker serves the queue from here on, notified through a copy of its event.
+            let queue_event = self.queue_events[index]
+                .try_clone()
+                .map_err(|_| ActivateError::EventFd)?;
+            let worker = Worker::spawn(
+                self.queues[index].clone(),
+                u16::try_from(index).expect("the queues are few"),
+                ready.len(),
+                queue_event,
+                interrupt.clone(),
+                mem.clone(),
+                self.store.clone(),
+                self.resizing.clone(),
+                self.frozen.clone(),
+            )
+            .map_err(|err| ActivateError::Extent(format!("starting a worker: {err}")))?;
+            workers.push((index, worker));
+        }
+        self.workers = workers;
         Ok(())
     }
 
@@ -537,7 +553,8 @@ impl VirtioDevice for Extent {
             self.reopen()
                 .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
         }
-        for queue in self.queues.iter_mut() {
+        // fxdax: those the driver set up, one per CPU of the guest's, up to the device's.
+        for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
             queue
                 .initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
@@ -555,6 +572,17 @@ impl VirtioDevice for Extent {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    // fxdax: the queues the driver set up alone: the others it never made ready.
+    fn mark_queue_memory_dirty(
+        &mut self,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), crate::devices::virtio::queue::QueueError> {
+        for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
+            queue.initialize(mem)?;
+        }
+        Ok(())
     }
 
     // fxdax: the worker starts again as the VM resumes after a snapshot (`pause_worker`), and

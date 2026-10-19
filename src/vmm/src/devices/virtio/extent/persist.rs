@@ -191,12 +191,25 @@ impl<'a> Persist<'a> for Extent {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let queues = state.virtio_state.build_queues_checked(
+        // fxdax: built as a device's not activated are, then those the driver set up initialized:
+        // it may have set up fewer than the device has, one per CPU of the guest's.
+        let unactivated = VirtioDeviceState {
+            activated: false,
+            ..state.virtio_state.clone()
+        };
+        let mut queues = unactivated.build_queues_checked(
             constructor_args.mem,
             VirtioDeviceType::Extent,
             EXTENT_NUM_QUEUES,
             EXTENT_QUEUE_SIZE,
         )?;
+        if state.virtio_state.activated {
+            for queue in queues.iter_mut().filter(|queue| queue.ready) {
+                queue
+                    .initialize(constructor_args.mem)
+                    .map_err(VirtioStateError::QueueConstruction)?;
+            }
+        }
         let snapshot = ExtentSnapshot {
             point: state.point.clone(),
             point_branch: state.point_branch,

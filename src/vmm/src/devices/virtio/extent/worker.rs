@@ -37,7 +37,8 @@ use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::{error, info};
 use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 
-/// How many requests the worker serves at once: as many as the daemon does for a connection.
+/// How many requests the device's workers serve at once, all of its queues': as many as the daemon
+/// does for a connection.
 const SERVERS: usize = 8;
 
 /// The requests served, and the time serving them took, by type, logged as the worker stops:
@@ -75,6 +76,8 @@ impl Served {
 /// What the worker shares with the threads serving requests.
 struct Shared {
     queue: Mutex<Queue>,
+    /// The queue's index among the device's.
+    index: u16,
     interrupt: Arc<dyn VirtioInterrupt>,
     mem: GuestMemoryMmap,
     store: Arc<RemoteExtentStore>,
@@ -111,7 +114,9 @@ impl Shared {
         }
         queue.advance_used_ring_idx();
         if queue.prepare_kick()
-            && let Err(err) = self.interrupt.trigger(VirtioInterruptType::Queue(0))
+            && let Err(err) = self
+                .interrupt
+                .trigger(VirtioInterruptType::Queue(self.index))
         {
             error!("extent worker: signalling the queue: {err}");
         }
@@ -146,10 +151,14 @@ pub(super) struct Worker {
 }
 
 impl Worker {
-    /// Spawns the worker for `queue`, which the driver notifies through `queue_event`, serving
-    /// the requests with `store`.
+    /// Spawns the worker for `queue`, the device's queue `index` of `queues`, which the driver
+    /// notifies through `queue_event`, serving the requests with `store`: its share of the
+    /// device's servers.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn(
         queue: Queue,
+        index: u16,
+        queues: usize,
         queue_event: EventFd,
         interrupt: Arc<dyn VirtioInterrupt>,
         mem: GuestMemoryMmap,
@@ -161,6 +170,7 @@ impl Worker {
         let stop_theirs = stop.try_clone()?;
         let shared = Shared {
             queue: Mutex::new(queue),
+            index,
             interrupt,
             mem,
             store,
@@ -168,9 +178,10 @@ impl Worker {
             frozen,
             served: Served::default(),
         };
+        let servers = (SERVERS / queues.max(1)).max(2);
         let thread = thread::Builder::new()
-            .name("fc_extent".into())
-            .spawn(move || work(shared, queue_event, stop_theirs))?;
+            .name(format!("fc_extent_q{index}"))
+            .spawn(move || work(shared, servers, queue_event, stop_theirs))?;
         Ok(Self { thread, stop })
     }
 
@@ -196,14 +207,14 @@ struct Request(DescriptorChain);
 // goes, runs. Each chain is served by one server at a time.
 unsafe impl Send for Request {}
 
-fn work(shared: Shared, queue_event: EventFd, stop: EventFd) -> Queue {
+fn work(shared: Shared, servers: usize, queue_event: EventFd, stop: EventFd) -> Queue {
     let (requests, received) = mpsc::channel::<Request>();
     let received = Mutex::new(received);
     thread::scope(|scope| {
-        for server in 0..SERVERS {
+        for server in 0..servers {
             let (shared, received) = (&shared, &received);
             let spawned = thread::Builder::new()
-                .name(format!("fc_extent_{server}"))
+                .name(format!("fc_extent_{}_{server}", shared.index))
                 .spawn_scoped(scope, move || {
                     loop {
                         let chain = received.lock().expect("Poisoned lock").recv();
