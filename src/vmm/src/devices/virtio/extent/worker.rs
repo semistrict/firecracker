@@ -27,7 +27,8 @@ use super::{
     VIRTIO_EXTENT_T_WRITE, write_barriers,
 };
 use super::{
-    Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREEZE_FROZEN,
+    Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREE_MANY,
+    VIRTIO_EXTENT_FREEZE_FROZEN,
     VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_ADVANCE, VIRTIO_EXTENT_T_FREEZE,
     VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO, VIRTIO_EXTENT_T_PIN, VIRTIO_EXTENT_T_RESIZED,
     VIRTIO_EXTENT_T_UNPIN,
@@ -285,8 +286,10 @@ fn take_requests(
             let mut taken = Vec::new();
             {
                 let mut queue = shared.queue.lock().expect("Poisoned lock");
+                // fxdax: with EVENT_IDX, the driver notifies again only once the queue is taken
+                // empty, which this rechecks after asking to be notified.
                 loop {
-                    match queue.pop() {
+                    match queue.pop_or_enable_notification() {
                         Ok(Some(chain)) => taken.push(chain),
                         Ok(None) => break,
                         Err(err) => {
@@ -402,6 +405,12 @@ impl Reader<'_> {
             at += slice.copy_to(&mut bytes[at..]);
         }
         Ok(bytes)
+    }
+
+    /// How many bytes are left to read.
+    fn available(&self) -> usize {
+        let len: usize = self.segments.iter().map(|segment| segment.len).sum();
+        len.saturating_sub(self.offset)
     }
 
     /// The next object, copied.
@@ -536,8 +545,19 @@ fn serve(
             Ok(0)
         }
         VIRTIO_EXTENT_T_FREE => {
+            if flags & !VIRTIO_EXTENT_FREE_MANY != 0 {
+                return Err(Errno::EINVAL);
+            }
             let id: ExtentIdLe = reader.obj()?;
             store.free(id.into())?;
+            // fxdax: the rest of a flush's dead extents, each freed as it would be alone: the
+            // first error fails the request, the extents before it freed (`F_FREE_MANY`).
+            if flags & VIRTIO_EXTENT_FREE_MANY != 0 {
+                while reader.available() > 0 {
+                    let id: ExtentIdLe = reader.obj()?;
+                    store.free(id.into())?;
+                }
+            }
             Ok(0)
         }
         VIRTIO_EXTENT_T_MAP => {

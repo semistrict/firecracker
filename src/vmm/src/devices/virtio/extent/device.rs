@@ -20,12 +20,13 @@ use super::{
     MAX_TRANSFER, Resizing, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_FREEZE,
     VIRTIO_EXTENT_F_RESIZE, VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
-use super::{Following, VIRTIO_EXTENT_F_READ_ONLY};
+use super::{Following, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_READ_ONLY};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
     ActiveState, DeviceState, VirtioDevice, VirtioDeviceType, VirtioShmRegion,
 };
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
+use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
@@ -217,16 +218,22 @@ impl Extent {
         let following = Arc::new(Following::default());
         hear_commits(&store, &following);
 
-        // A follower's device writes nothing (doc-4's F_READ_ONLY).
+        // A follower's device writes nothing (doc-4's F_READ_ONLY). fxdax: notifications are
+        // suppressed while the device takes the requests queued, and interrupts while the driver
+        // takes the ones done (EVENT_IDX): each costs an exit, which nested virtualization makes
+        // dear (TASK-41).
         let mut avail_features = if config.read_only {
             (1u64 << VIRTIO_F_VERSION_1)
+                | (1u64 << VIRTIO_RING_F_EVENT_IDX)
                 | (1 << VIRTIO_EXTENT_F_FREEZE)
                 | (1 << VIRTIO_EXTENT_F_READ_ONLY)
         } else {
             (1u64 << VIRTIO_F_VERSION_1)
+                | (1u64 << VIRTIO_RING_F_EVENT_IDX)
                 | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT)
                 | (1 << VIRTIO_EXTENT_F_RESIZE)
                 | (1 << VIRTIO_EXTENT_F_FREEZE)
+                | (1 << VIRTIO_EXTENT_F_FREE_MANY)
         };
         let mut shm_regions = Vec::new();
         let window_addr = match making {
@@ -404,10 +411,14 @@ impl Extent {
                 .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
         }
         // fxdax: those the driver set up, one per CPU of the guest's, up to the device's.
+        let event_idx = self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
             queue
                 .initialize(&mem)
                 .map_err(ActivateError::QueueMemoryError)?;
+            if event_idx {
+                queue.enable_notif_suppression();
+            }
         }
         self.create_dax_window()
             .map_err(|err| ActivateError::Extent(format!("creating the DAX window: {err:#}")))?;

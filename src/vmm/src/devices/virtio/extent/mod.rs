@@ -44,6 +44,9 @@ pub const VIRTIO_EXTENT_F_FREEZE: u32 = 4;
 /// `LET_GO`, `PIN` and `UNPIN` work, and the configuration's `committed` changes as the writer
 /// commits, telling the guest with a configuration change (TASK-42.3).
 pub const VIRTIO_EXTENT_F_READ_ONLY: u32 = 5;
+/// fxdax: `FREE` frees, with `FREE_MANY`, the extents its data names too, after the one its
+/// arguments do: a flush's dead extents in one request rather than one each (TASK-41).
+pub const VIRTIO_EXTENT_F_FREE_MANY: u32 = 6;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -100,6 +103,10 @@ pub fn write_barriers(flags: u32) -> Option<fxdax::WriteBarriers> {
         after,
     })
 }
+/// fxdax: a `FREE`'s flags: its data names more extents to free, each a `virtio_extent_id`
+/// (`F_FREE_MANY`).
+pub const VIRTIO_EXTENT_FREE_MANY: u32 = 1 << 0;
+
 /// A `COMMIT`'s flags: it completes once durable; it sets the root.
 pub const VIRTIO_EXTENT_COMMIT_DURABLE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_ROOT: u32 = 1 << 1;
