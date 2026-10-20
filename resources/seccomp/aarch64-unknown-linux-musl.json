@@ -3,6 +3,223 @@
         "default_action": "trap",
         "filter_action": "allow",
         "filter": [
+                {
+                    "syscall": "clone",
+                    "comment": "fxdax: starting extent devices' threads, from their spawner (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 0,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 8195840,
+                            "comment": "CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED, as musl's pthread_create makes a thread"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "prctl",
+                    "comment": "fxdax: naming extent devices' threads (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 0,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 15,
+                            "comment": "libc::PR_SET_NAME"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "mmap",
+                    "comment": "fxdax: the alternate signal stack Rust's stdlib maps for each of extent devices' threads as it starts (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 3,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 131106,
+                            "comment": "libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK"
+                        },
+                        {
+                            "index": 2,
+                            "type": "dword",
+                            "op": {
+                                "masked_eq": 4
+                            },
+                            "val": 0,
+                            "comment": "Ensure PROT_EXEC is not set"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "mmap",
+                    "comment": "fxdax: a DAX window's pages, the extent daemon's memory, mapped where the window maps them (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 3,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 17,
+                            "comment": "libc::MAP_SHARED | libc::MAP_FIXED"
+                        },
+                        {
+                            "index": 2,
+                            "type": "dword",
+                            "op": {
+                                "masked_eq": 4
+                            },
+                            "val": 0,
+                            "comment": "Ensure PROT_EXEC is not set"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "mmap",
+                    "comment": "fxdax: a DAX window's pages of public bases, the extent daemon's memory this process holds read-only (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 3,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 18,
+                            "comment": "libc::MAP_PRIVATE | libc::MAP_FIXED"
+                        },
+                        {
+                            "index": 2,
+                            "type": "dword",
+                            "op": {
+                                "masked_eq": 4
+                            },
+                            "val": 0,
+                            "comment": "Ensure PROT_EXEC is not set"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "mmap",
+                    "comment": "fxdax: a DAX window's pages unmapped, memory registered for userfaultfd's missing faults (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 3,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 16434,
+                            "comment": "libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED"
+                        },
+                        {
+                            "index": 2,
+                            "type": "dword",
+                            "op": {
+                                "masked_eq": 4
+                            },
+                            "val": 0,
+                            "comment": "Ensure PROT_EXEC is not set"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "epoll_create1",
+                    "comment": "fxdax: each extent device queue's worker waits on its queue's event (TASK-50.1)"
+                },
+                {
+                    "syscall": "shutdown",
+                    "comment": "fxdax: an extent device's connection to its daemon, shut down as the VM goes (TASK-50.1)"
+                },
+                {
+                    "syscall": "ppoll",
+                    "comment": "fxdax: a DAX window's faults, read from its userfaultfd (TASK-50.1)"
+                },
+                {
+                    "syscall": "fcntl",
+                    "comment": "fxdax: whether a memory the extent daemon gave is read-only (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 3,
+                            "comment": "libc::F_GETFL"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "fcntl",
+                    "comment": "fxdax: an extent device's descriptors duplicated, its connection's and its queues' events (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 1030,
+                            "comment": "libc::F_DUPFD_CLOEXEC"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "ioctl",
+                    "comment": "fxdax: a DAX window's userfaultfd, from /dev/userfaultfd (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 43520,
+                            "comment": "USERFAULTFD_IOC_NEW"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "ioctl",
+                    "comment": "fxdax: a DAX window's userfaultfd's features (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 3222841919,
+                            "comment": "UFFDIO_API"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "ioctl",
+                    "comment": "fxdax: a DAX window's pages registered with its userfaultfd (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 3223366144,
+                            "comment": "UFFDIO_REGISTER"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "ioctl",
+                    "comment": "fxdax: threads faulting on a DAX window's pages woken (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 2148575746,
+                            "comment": "UFFDIO_WAKE"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "ioctl",
+                    "comment": "fxdax: a DAX window's pages write-protected, to track stores (TASK-50.1)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 3222841862,
+                            "comment": "UFFDIO_WRITEPROTECT"
+                        }
+                    ]
+                },
             {
                 "syscall": "newfstatat",
                 "comment": "Used when creating snapshots in vmm:persist::snapshot_memory_to_file through std::fs::File::metadata"

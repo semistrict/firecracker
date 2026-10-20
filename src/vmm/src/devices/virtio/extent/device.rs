@@ -390,6 +390,36 @@ impl Extent {
         Ok(())
     }
 
+    /// Activates the device (`VirtioDevice::activate`), on a thread under the VMM's seccomp filter:
+    /// opens the store anew if a snapshot left it, initializes the queues the driver set up, makes
+    /// the DAX window, and starts the workers.
+    fn activate_confined(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: Arc<dyn VirtioInterrupt>,
+    ) -> Result<(), ActivateError> {
+        assert!(!self.is_activated());
+        if self.reopen {
+            self.reopen()
+                .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
+        }
+        // fxdax: those the driver set up, one per CPU of the guest's, up to the device's.
+        for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
+            queue
+                .initialize(&mem)
+                .map_err(ActivateError::QueueMemoryError)?;
+        }
+        self.create_dax_window()
+            .map_err(|err| ActivateError::Extent(format!("creating the DAX window: {err:#}")))?;
+        self.map_again().map_err(|errno| {
+            ActivateError::Extent(format!("mapping the snapshot's window again: {errno}"))
+        })?;
+        *self.resizing.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
+        *self.following.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
+        self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
+        self.resume_worker()
+    }
+
     /// fxdax: takes a snapshot of the device's store, for a snapshot of the VM, paused, whose
     /// guest's filesystem is frozen, with nothing open (TASK-39.1): forks the store to `point`,
     /// and records the window's mappings, which [`Persist::save`](crate::snapshot::Persist) saves.
@@ -555,31 +585,20 @@ impl VirtioDevice for Extent {
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
-        assert!(!self.is_activated());
-        if self.reopen {
-            self.reopen()
-                .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
-        }
-        // fxdax: those the driver set up, one per CPU of the guest's, up to the device's.
-        for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
-            queue
-                .initialize(&mem)
-                .map_err(ActivateError::QueueMemoryError)?;
-        }
-        self.create_dax_window()
-            .map_err(|err| ActivateError::Extent(format!("creating the DAX window: {err:#}")))?;
-        self.map_again().map_err(|errno| {
-            ActivateError::Extent(format!("mapping the snapshot's window again: {errno}"))
-        })?;
-        *self.resizing.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
-        *self.following.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
-        self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
-        self.resume_worker()
+        // fxdax: on a thread of the extent threads' spawner, under the VMM thread's seccomp
+        // filter, as the vCPU whose MMIO write activates the device waits: its work, opening the
+        // DAX window's userfaultfd and the like, is the VMM's, not a vCPU's (TASK-50.1).
+        let activated = fxdax::thread::run("fc_extent_activate", || {
+            self.activate_confined(mem, interrupt)
+        });
+        activated.map_err(|err| ActivateError::Extent(format!("starting its activation: {err}")))?
     }
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+
 
     // fxdax: the queues the driver set up alone: the others it never made ready.
     fn mark_queue_memory_dirty(
@@ -611,6 +630,19 @@ impl VirtioDevice for Extent {
     // fxdax: the worker stops, and the device is as before the driver activated it: a
     // follower's, its store opened anew as it is activated again.
     fn reset(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
+        // fxdax: as activation, on a thread under the VMM's seccomp filter, rather than the vCPU's
+        // whose MMIO write resets the device (TASK-50.1).
+        let reset = fxdax::thread::run("fc_extent_reset", || self.reset_confined());
+        reset.unwrap_or_else(|err| {
+            error!("extent device {}: starting its reset: {err}", self.config.id);
+            None
+        })
+    }
+}
+
+impl Extent {
+    /// Resets the device (`VirtioDevice::reset`), on a thread under the VMM's seccomp filter.
+    fn reset_confined(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
         self.stop_worker();
         self.reopen = self.config.read_only;
         let DeviceState::Activated(ActiveState { interrupt, .. }) =

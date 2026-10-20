@@ -146,7 +146,7 @@ fn quick(type_: Option<u32>) -> bool {
 #[derive(Debug)]
 pub(super) struct Worker {
     /// Returns the queue, as the worker left it.
-    thread: thread::JoinHandle<Queue>,
+    thread: fxdax::thread::Thread<Queue>,
     stop: EventFd,
 }
 
@@ -179,9 +179,11 @@ impl Worker {
             served: Served::default(),
         };
         let servers = (SERVERS / queues.max(1)).max(2);
-        let thread = thread::Builder::new()
-            .name(format!("fc_extent_q{index}"))
-            .spawn(move || work(shared, servers, queue_event, stop_theirs))?;
+        // fxdax: from the extent threads' spawner, under the VMM's seccomp filter, rather than
+        // the vCPU's that activates the device (TASK-50.1).
+        let thread = fxdax::thread::spawn(format!("fc_extent_q{index}"), move || {
+            work(shared, servers, queue_event, stop_theirs)
+        })?;
         Ok(Self { thread, stop })
     }
 

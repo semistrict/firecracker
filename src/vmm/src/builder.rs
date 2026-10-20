@@ -88,6 +88,9 @@ pub enum StartMicrovmError {
     ExtentPrefault(io::Error),
     /// Extent-store devices need a Firecracker built with its `fxdax` feature, on the MMIO transport
     ExtentDevicesUnsupported,
+    /// Cannot start the thread that starts extent-store devices' threads: {0}
+    #[cfg(feature = "fxdax")]
+    ExtentThreads(io::Error),
     /// Error creating legacy device: {0}
     #[cfg(target_arch = "x86_64")]
     CreateLegacyDevice(device_manager::legacy::LegacyDeviceError),
@@ -159,6 +162,8 @@ pub fn build_microvm_for_boot(
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
+    #[cfg(feature = "fxdax")]
+    confine_extent_threads(seccomp_filters)?;
 
     let boot_config = vm_resources
         .boot_source
@@ -465,6 +470,8 @@ pub fn build_microvm_from_snapshot(
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
+    #[cfg(feature = "fxdax")]
+    confine_extent_threads(seccomp_filters)?;
 
     let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
         .map_err(StartMicrovmError::Kvm)?;
@@ -772,6 +779,52 @@ fn attach_pmem_devices(
         device_manager.attach_virtio_device(vm, id, device, cmdline, event_manager, false)?;
     }
     Ok(())
+}
+
+/// fxdax: starts the threads of extent devices, and those fxdax starts for them, under the VMM
+/// thread's seccomp filter, and that alone (TASK-50.1): from a thread of their own, started here,
+/// before any filter is installed, which installs the VMM's, rather than from the thread that asks
+/// for them, as a vCPU's does as the guest activates a device, whose filter they would inherit
+/// for good. The store's client's thread, which receives its daemon's replies, starts as the
+/// device is made, before the VMM thread installs its filter; the DAX window's and the device's
+/// workers' as the guest activates it.
+#[cfg(feature = "fxdax")]
+fn confine_extent_threads(seccomp_filters: &BpfThreadMap) -> Result<(), StartMicrovmError> {
+    use std::sync::mpsc;
+
+    type Start = (String, Box<dyn FnOnce() + Send>, mpsc::SyncSender<std::io::Result<()>>);
+
+    /// Asks the spawning thread to start a thread.
+    struct Spawner(Mutex<mpsc::Sender<Start>>);
+
+    impl fxdax::thread::Spawn for Spawner {
+        fn spawn(&self, name: String, run: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+            let (started, start) = mpsc::sync_channel(1);
+            let gone = || std::io::Error::other("the extent threads' spawner is gone");
+            (self.0.lock().expect("Poisoned lock").send((name, run, started))).map_err(|_| gone())?;
+            start.recv().map_err(|_| gone())?
+        }
+    }
+
+    static CONFINED: std::sync::Once = std::sync::Once::new();
+    let filter = seccomp_filters
+        .get("vmm")
+        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+        .clone();
+    let mut spawned = Ok(());
+    CONFINED.call_once(|| {
+        let (asks, asked) = mpsc::channel::<Start>();
+        let spawning = std::thread::Builder::new().name("fc_extent_spawn".into()).spawn(move || {
+            if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                panic!("Failed to set the VMM's seccomp filter on the extent spawner: {err}");
+            }
+            while let Ok((name, run, started)) = asked.recv() {
+                let _ = started.send(std::thread::Builder::new().name(name).spawn(run).map(drop));
+            }
+        });
+        spawned = spawning.map(|_| fxdax::thread::set_spawner(Spawner(Mutex::new(asks))));
+    });
+    spawned.map_err(StartMicrovmError::ExtentThreads)
 }
 
 /// Attaches the extent-store devices `configs` describes, with their DAX windows. On x86-64, KVM
