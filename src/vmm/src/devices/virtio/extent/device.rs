@@ -197,6 +197,13 @@ impl Extent {
             ),
         }
         .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
+        // fxdax: with the daemon gone, the guest's disk is gone: the VM stops at once, its exit
+        // status saying why, rather than going on with every request failing (TASK-50.2).
+        let id = config.id.clone();
+        store.on_daemon_lost(move || {
+            error!("extent device {id}: the extent daemon went; stopping the VM");
+            std::process::exit(crate::FcExitCode::ExtentdLost as i32);
+        });
         config_space.branch = store.branch().to_le();
         let resizing = Arc::new(Resizing::default());
         let info = store

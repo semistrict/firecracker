@@ -201,6 +201,9 @@ pub enum FcExitCode {
     BadConfiguration = 152,
     /// Command line arguments parsing error.
     ArgParsing = 153,
+    /// fxdax: the extent daemon serving an extent device went, and the VM can't go on: nothing
+    /// its store asks is served any more, nor its DAX window's faults (TASK-50.2).
+    ExtentdLost = 158,
 }
 
 /// Timeout used in recv_timeout, when waiting for a vcpu response on
