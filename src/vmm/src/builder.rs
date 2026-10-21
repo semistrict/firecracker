@@ -792,7 +792,11 @@ fn attach_pmem_devices(
 fn confine_extent_threads(seccomp_filters: &BpfThreadMap) -> Result<(), StartMicrovmError> {
     use std::sync::mpsc;
 
-    type Start = (String, Box<dyn FnOnce() + Send>, mpsc::SyncSender<std::io::Result<()>>);
+    type Start = (
+        String,
+        Box<dyn FnOnce() + Send>,
+        mpsc::SyncSender<std::io::Result<()>>,
+    );
 
     /// Asks the spawning thread to start a thread.
     struct Spawner(Mutex<mpsc::Sender<Start>>);
@@ -801,7 +805,12 @@ fn confine_extent_threads(seccomp_filters: &BpfThreadMap) -> Result<(), StartMic
         fn spawn(&self, name: String, run: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
             let (started, start) = mpsc::sync_channel(1);
             let gone = || std::io::Error::other("the extent threads' spawner is gone");
-            (self.0.lock().expect("Poisoned lock").send((name, run, started))).map_err(|_| gone())?;
+            (self
+                .0
+                .lock()
+                .expect("Poisoned lock")
+                .send((name, run, started)))
+            .map_err(|_| gone())?;
             start.recv().map_err(|_| gone())?
         }
     }
@@ -814,14 +823,17 @@ fn confine_extent_threads(seccomp_filters: &BpfThreadMap) -> Result<(), StartMic
     let mut spawned = Ok(());
     CONFINED.call_once(|| {
         let (asks, asked) = mpsc::channel::<Start>();
-        let spawning = std::thread::Builder::new().name("fc_extent_spawn".into()).spawn(move || {
-            if let Err(err) = crate::seccomp::apply_filter(&filter) {
-                panic!("Failed to set the VMM's seccomp filter on the extent spawner: {err}");
-            }
-            while let Ok((name, run, started)) = asked.recv() {
-                let _ = started.send(std::thread::Builder::new().name(name).spawn(run).map(drop));
-            }
-        });
+        let spawning = std::thread::Builder::new()
+            .name("fc_extent_spawn".into())
+            .spawn(move || {
+                if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                    panic!("Failed to set the VMM's seccomp filter on the extent spawner: {err}");
+                }
+                while let Ok((name, run, started)) = asked.recv() {
+                    let _ =
+                        started.send(std::thread::Builder::new().name(name).spawn(run).map(drop));
+                }
+            });
         spawned = spawning.map(|_| fxdax::thread::set_spawner(Spawner(Mutex::new(asks))));
     });
     spawned.map_err(StartMicrovmError::ExtentThreads)
