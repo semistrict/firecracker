@@ -382,7 +382,6 @@ impl Extent {
             let worker = Worker::spawn(
                 self.queues[index].clone(),
                 u16::try_from(index).expect("the queues are few"),
-                ready.len(),
                 queue_event,
                 interrupt.clone(),
                 mem.clone(),
@@ -609,8 +608,6 @@ impl VirtioDevice for Extent {
         self.device_state.is_activated()
     }
 
-
-
     // fxdax: the queues the driver set up alone: the others it never made ready.
     fn mark_queue_memory_dirty(
         &mut self,
@@ -645,7 +642,10 @@ impl VirtioDevice for Extent {
         // whose MMIO write resets the device (TASK-50.1).
         let reset = fxdax::thread::run("fc_extent_reset", || self.reset_confined());
         reset.unwrap_or_else(|err| {
-            error!("extent device {}: starting its reset: {err}", self.config.id);
+            error!(
+                "extent device {}: starting its reset: {err}",
+                self.config.id
+            );
             None
         })
     }

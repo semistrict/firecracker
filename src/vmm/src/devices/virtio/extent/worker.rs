@@ -1,19 +1,20 @@
 // Copyright 2026 fxdax authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The extent device's worker: a thread that takes the requests off the queue, and threads that
-//! serve them, blocking on the store's I/O, several at once: the device applies requests in any
-//! order but across barriers (doc-4), so a guest's `MAP` doesn't wait for the writes and durable
-//! commits queued before it.
+//! The extent device's worker: a thread that takes the requests off the queue and sends them to
+//! the store's daemon, several at once: the device applies requests in any order but across
+//! barriers (doc-4), so a guest's `MAP` doesn't wait for the writes and durable commits queued
+//! before it. fxdax: each is served as a future, which the thread receiving the daemon's reply
+//! goes on with, completing the request (`fxdax::extentd::spawn_on_replies`): no thread is woken
+//! between the reply and the guest's interrupt, nor waits for the store's I/O (TASK-41).
 
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use fxdax::{Errno, RemoteExtentStore};
+use fxdax::{Commit, Errno, RemoteExtentStore};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{GuestMemory, GuestMemoryError};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -28,19 +29,14 @@ use super::{
 };
 use super::{
     Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREE_MANY,
-    VIRTIO_EXTENT_FREEZE_FROZEN,
-    VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_ADVANCE, VIRTIO_EXTENT_T_FREEZE,
-    VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO, VIRTIO_EXTENT_T_PIN, VIRTIO_EXTENT_T_RESIZED,
-    VIRTIO_EXTENT_T_UNPIN,
+    VIRTIO_EXTENT_FREEZE_FROZEN, VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_ADVANCE,
+    VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO, VIRTIO_EXTENT_T_PIN,
+    VIRTIO_EXTENT_T_RESIZED, VIRTIO_EXTENT_T_UNPIN,
 };
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::{error, info};
 use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
-
-/// How many requests the device's workers serve at once, all of its queues': as many as the daemon
-/// does for a connection.
-const SERVERS: usize = 8;
 
 /// The requests served, and the time serving them took, by type, logged as the worker stops:
 /// against what the guest waits for a request (its driver's request_ns), what the transport
@@ -74,7 +70,7 @@ impl Served {
     }
 }
 
-/// What the worker shares with the threads serving requests.
+/// What the worker shares with the requests it serves.
 struct Shared {
     queue: Mutex<Queue>,
     /// The queue's index among the device's.
@@ -86,6 +82,10 @@ struct Shared {
     /// Whether the guest's filesystem is frozen (`VIRTIO_EXTENT_T_FREEZE`).
     frozen: Arc<AtomicBool>,
     served: Served,
+    /// The requests taken off the queue and not yet returned to the driver.
+    serving: Mutex<usize>,
+    /// Notified as the last of them is returned.
+    idle: Condvar,
 }
 
 impl Shared {
@@ -95,15 +95,44 @@ impl Shared {
         self.mem.read_obj::<u32>(chain.addr).ok().map(u32::from_le)
     }
 
-    /// Serves the request in `chain` and returns it to the driver.
-    fn serve_one(&self, chain: DescriptorChain) {
-        let index = chain.index;
-        let type_ = self.request_type(&chain);
+    /// Serves the request in `chain`, and returns it to the driver, on this thread until it
+    /// waits for the daemon, and then on the thread receiving the daemon's reply.
+    fn serve(self: &Arc<Self>, chain: DescriptorChain) {
+        *self.serving.lock().expect("Poisoned lock") += 1;
+        let shared = self.clone();
+        let (index, type_) = (chain.index, self.request_type(&chain));
         let start = Instant::now();
-        let len = handle(&self.store, &self.resizing, &self.frozen, &self.mem, chain);
-        #[allow(clippy::cast_possible_truncation)]
-        self.served.add(type_, start.elapsed().as_nanos() as u64);
-        self.complete(index, len);
+        // Its descriptors read now, the future holds its buffers alone.
+        let buffers = Buffers::new(&self.mem, chain);
+        fxdax::extentd::spawn_on_replies(async move {
+            let len = match buffers {
+                Ok(buffers) => {
+                    handle(&shared.store, &shared.resizing, &shared.frozen, buffers).await
+                }
+                Err(err) => {
+                    error!("extent device: a descriptor chain is not guest memory: {err}");
+                    0
+                }
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            shared.served.add(type_, start.elapsed().as_nanos() as u64);
+            shared.complete(index, len);
+            let mut serving = shared.serving.lock().expect("Poisoned lock");
+            *serving -= 1;
+            if *serving == 0 {
+                shared.idle.notify_all();
+            }
+        });
+    }
+
+    /// Waits until the requests taken off the queue are returned to the driver.
+    fn wait_idle(&self) {
+        let serving = self.serving.lock().expect("Poisoned lock");
+        drop(
+            self.idle
+                .wait_while(serving, |serving| *serving > 0)
+                .expect("Poisoned lock"),
+        );
     }
 
     /// Returns the request at `index` to the driver, with `len` bytes written to it.
@@ -124,25 +153,6 @@ impl Shared {
     }
 }
 
-/// Whether a request of `type_` is quick to serve: the thread taking it off the queue serves it
-/// itself when it is alone, rather than handing it to a server, a thread's wake-up more.
-fn quick(type_: Option<u32>) -> bool {
-    matches!(
-        type_,
-        Some(
-            VIRTIO_EXTENT_T_MAP
-                | VIRTIO_EXTENT_T_UNMAP
-                | VIRTIO_EXTENT_T_FREE
-                | VIRTIO_EXTENT_T_ROOT
-                | VIRTIO_EXTENT_T_INFO
-                | VIRTIO_EXTENT_T_ADVANCE
-                | VIRTIO_EXTENT_T_LET_GO
-                | VIRTIO_EXTENT_T_PIN
-                | VIRTIO_EXTENT_T_UNPIN
-        )
-    )
-}
-
 /// The worker's thread, once spawned, which stops when told to.
 #[derive(Debug)]
 pub(super) struct Worker {
@@ -152,14 +162,12 @@ pub(super) struct Worker {
 }
 
 impl Worker {
-    /// Spawns the worker for `queue`, the device's queue `index` of `queues`, which the driver
-    /// notifies through `queue_event`, serving the requests with `store`: its share of the
-    /// device's servers.
+    /// Spawns the worker for `queue`, the device's queue `index`, which the driver notifies
+    /// through `queue_event`, serving the requests with `store`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn(
         queue: Queue,
         index: u16,
-        queues: usize,
         queue_event: EventFd,
         interrupt: Arc<dyn VirtioInterrupt>,
         mem: GuestMemoryMmap,
@@ -169,7 +177,7 @@ impl Worker {
     ) -> io::Result<Self> {
         let stop = EventFd::new(libc::EFD_NONBLOCK)?;
         let stop_theirs = stop.try_clone()?;
-        let shared = Shared {
+        let shared = Arc::new(Shared {
             queue: Mutex::new(queue),
             index,
             interrupt,
@@ -178,12 +186,13 @@ impl Worker {
             resizing,
             frozen,
             served: Served::default(),
-        };
-        let servers = (SERVERS / queues.max(1)).max(2);
+            serving: Mutex::new(0),
+            idle: Condvar::new(),
+        });
         // fxdax: from the extent threads' spawner, under the VMM's seccomp filter, rather than
         // the vCPU's that activates the device (TASK-50.1).
         let thread = fxdax::thread::spawn(format!("fc_extent_q{index}"), move || {
-            work(shared, servers, queue_event, stop_theirs)
+            work(&shared, &queue_event, &stop_theirs)
         })?;
         Ok(Self { thread, stop })
     }
@@ -202,50 +211,18 @@ impl Worker {
     }
 }
 
-/// A request taken off the queue, which a server serves.
-struct Request(DescriptorChain);
-
-// SAFETY: The chain reads its descriptors from the queue's table in guest memory, which stays
-// mapped while the device is active, and so while the worker, which the device stops before it
-// goes, runs. Each chain is served by one server at a time.
-unsafe impl Send for Request {}
-
-fn work(shared: Shared, servers: usize, queue_event: EventFd, stop: EventFd) -> Queue {
-    let (requests, received) = mpsc::channel::<Request>();
-    let received = Mutex::new(received);
-    thread::scope(|scope| {
-        for server in 0..servers {
-            let (shared, received) = (&shared, &received);
-            let spawned = thread::Builder::new()
-                .name(format!("fc_extent_{}_{server}", shared.index))
-                .spawn_scoped(scope, move || {
-                    loop {
-                        let chain = received.lock().expect("Poisoned lock").recv();
-                        let Ok(Request(chain)) = chain else {
-                            return;
-                        };
-                        shared.serve_one(chain);
-                    }
-                });
-            if let Err(err) = spawned {
-                error!("extent worker: spawning a server: {err}");
-            }
-        }
-        // Once stopped, the servers finish what they took and return as the channel closes.
-        take_requests(&shared, &queue_event, &stop, requests);
-    });
+/// Serves the queue until `stop` is written, then waits for the requests it took to be returned
+/// to the driver, and returns the queue as they left it.
+fn work(shared: &Arc<Shared>, queue_event: &EventFd, stop: &EventFd) -> Queue {
+    take_requests(shared, queue_event, stop);
+    shared.wait_idle();
     shared.served.log();
-    shared.queue.into_inner().expect("Poisoned lock")
+    shared.queue.lock().expect("Poisoned lock").clone()
 }
 
-/// Takes the requests off the queue as the driver notifies `queue_event`, and sends them to
-/// `requests`, until `stop` is written: but serves one quick request alone itself.
-fn take_requests(
-    shared: &Shared,
-    queue_event: &EventFd,
-    stop: &EventFd,
-    requests: mpsc::Sender<Request>,
-) {
+/// Takes the requests off the queue as the driver notifies `queue_event`, and serves them, until
+/// `stop` is written.
+fn take_requests(shared: &Arc<Shared>, queue_event: &EventFd, stop: &EventFd) {
     let epoll = match Epoll::new() {
         Ok(epoll) => epoll,
         Err(err) => {
@@ -299,15 +276,8 @@ fn take_requests(
                     }
                 }
             }
-            if taken.len() == 1 && quick(shared.request_type(&taken[0])) {
-                shared.serve_one(taken[0]);
-                continue;
-            }
             for chain in taken {
-                // The servers outlive this sender.
-                requests
-                    .send(Request(chain))
-                    .expect("the extent servers stopped");
+                shared.serve(chain);
             }
         }
     }
@@ -320,9 +290,14 @@ struct Segment {
     len: usize,
 }
 
+// SAFETY: Guest memory, mapped while the device is active, and so while the requests the worker
+// took are served (`work`); each request's buffers are its future's alone.
+unsafe impl Send for Segment {}
+unsafe impl Sync for Segment {}
+
 /// A request's buffers: those the driver wrote, and those it gave the device to write, whose last
 /// bytes are the response.
-struct Buffers {
+pub(super) struct Buffers {
     readable: Vec<Segment>,
     writable: Vec<Segment>,
 }
@@ -330,7 +305,10 @@ struct Buffers {
 impl Buffers {
     /// The buffers of the request in `chain`, all in `mem`. The writable ones are marked dirty,
     /// as the device writes them whole.
-    fn new(mem: &GuestMemoryMmap, chain: DescriptorChain) -> Result<Self, GuestMemoryError> {
+    pub(super) fn new(
+        mem: &GuestMemoryMmap,
+        chain: DescriptorChain,
+    ) -> Result<Self, GuestMemoryError> {
         let mut buffers = Self {
             readable: Vec::new(),
             writable: Vec::new(),
@@ -460,22 +438,15 @@ impl Writer<'_> {
     }
 }
 
-/// Serves the request in `chain` with `store`, and returns the length of what the device writes
-/// to it: its writable buffers, whose last bytes hold the response.
-pub(super) fn handle(
+/// Serves the request whose buffers are `buffers` ([`Buffers::new`]) with `store`, and returns the
+/// length of what the device writes to it: its writable buffers, whose last bytes hold the
+/// response.
+pub(super) async fn handle(
     store: &RemoteExtentStore,
     resizing: &Resizing,
     frozen: &AtomicBool,
-    mem: &GuestMemoryMmap,
-    chain: DescriptorChain,
+    buffers: Buffers,
 ) -> u32 {
-    let buffers = match Buffers::new(mem, chain) {
-        Ok(buffers) => buffers,
-        Err(err) => {
-            error!("extent device: a descriptor chain is not guest memory: {err}");
-            return 0;
-        }
-    };
     // The response is the chain's last bytes, after what the request returns.
     let writable = buffers.writable_len();
     let Some(room) = writable.checked_sub(size_of::<Response>()) else {
@@ -489,7 +460,7 @@ pub(super) fn handle(
     let writer = Writer {
         segments: &buffers.writable,
     };
-    let (status, written) = match serve(store, resizing, frozen, &mut reader, &writer, room) {
+    let (status, written) = match serve(store, resizing, frozen, &mut reader, &writer, room).await {
         Ok(written) => (0, written),
         Err(errno) => (errno.raw().cast_unsigned(), 0),
     };
@@ -505,12 +476,12 @@ pub(super) fn handle(
 
 /// Serves the request `reader` holds, writing what it returns with `writer`, which has `room`
 /// bytes for it, and returns how many it wrote.
-fn serve(
+async fn serve(
     store: &RemoteExtentStore,
     resizing: &Resizing,
     frozen: &AtomicBool,
-    reader: &mut Reader,
-    writer: &Writer,
+    reader: &mut Reader<'_>,
+    writer: &Writer<'_>,
     room: usize,
 ) -> Result<usize, Errno> {
     let header: RequestHeader = reader.obj()?;
@@ -523,7 +494,9 @@ fn serve(
                 return Err(Errno::EINVAL);
             }
             let mut slices = writer.slices(0, len as usize).ok_or(Errno::EINVAL)?;
-            store.read(args.id.into(), u64::from_le(args.offset), &mut slices)?;
+            store
+                .read_async(args.id.into(), u64::from_le(args.offset), &mut slices)
+                .await?;
             Ok(len as usize)
         }
         VIRTIO_EXTENT_T_WRITE => {
@@ -536,12 +509,14 @@ fn serve(
             // A barrier before orders, without waiting for durability (doc-4); one after, with
             // WRITE_COMMIT, waits as a COMMIT does. One round trip to the daemon either way.
             let barriers = write_barriers(flags).ok_or(Errno::EINVAL)?;
-            store.write_with_barriers(
-                args.id.into(),
-                u64::from_le(args.offset),
-                &data,
-                barriers,
-            )?;
+            store
+                .write_with_barriers_async(
+                    args.id.into(),
+                    u64::from_le(args.offset),
+                    &data,
+                    barriers,
+                )
+                .await?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_FREE => {
@@ -549,13 +524,13 @@ fn serve(
                 return Err(Errno::EINVAL);
             }
             let id: ExtentIdLe = reader.obj()?;
-            store.free(id.into())?;
+            store.free_async(id.into()).await?;
             // fxdax: the rest of a flush's dead extents, each freed as it would be alone: the
             // first error fails the request, the extents before it freed (`F_FREE_MANY`).
             if flags & VIRTIO_EXTENT_FREE_MANY != 0 {
                 while reader.available() > 0 {
                     let id: ExtentIdLe = reader.obj()?;
-                    store.free(id.into())?;
+                    store.free_async(id.into()).await?;
                 }
             }
             Ok(0)
@@ -565,18 +540,22 @@ fn serve(
             if flags & !VIRTIO_EXTENT_MAP_WRITE != 0 {
                 return Err(Errno::EINVAL);
             }
-            store.map(
-                args.id.into(),
-                u64::from_le(args.offset),
-                u64::from_le(args.len),
-                u64::from_le(args.window_offset),
-                flags & VIRTIO_EXTENT_MAP_WRITE != 0,
-            )?;
+            store
+                .map_async(
+                    args.id.into(),
+                    u64::from_le(args.offset),
+                    u64::from_le(args.len),
+                    u64::from_le(args.window_offset),
+                    flags & VIRTIO_EXTENT_MAP_WRITE != 0,
+                )
+                .await?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_UNMAP => {
             let args: UnmapArgs = reader.obj()?;
-            store.unmap(u64::from_le(args.window_offset), u64::from_le(args.len))?;
+            store
+                .unmap_async(u64::from_le(args.window_offset), u64::from_le(args.len))
+                .await?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_COMMIT => {
@@ -591,16 +570,17 @@ fn serve(
             }
             // Without COMMIT_DURABLE, the commit completes once ordered: the daemon makes it
             // durable soon after (doc-4).
-            if flags & VIRTIO_EXTENT_COMMIT_DURABLE != 0 {
-                store.commit(root.as_deref())?;
+            let commit = if flags & VIRTIO_EXTENT_COMMIT_DURABLE != 0 {
+                Commit::Durable
             } else {
-                store.commit_ordered(root.as_deref())?;
-            }
+                Commit::Ordered
+            };
+            store.commit_async(root.as_deref(), commit).await?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_ROOT => {
             let returned = MAX_ROOT as usize + size_of::<RootLen>();
-            let root = store.root()?;
+            let root = store.root_async().await?;
             if room < returned || root.len() > MAX_ROOT as usize {
                 return Err(Errno::EINVAL);
             }
@@ -620,7 +600,7 @@ fn serve(
             if room < INFO_LEN_WITHOUT_BRANCH {
                 return Err(Errno::EINVAL);
             }
-            let info = store.info()?;
+            let info = store.info_async().await?;
             let info = Info {
                 capacity: info.capacity.to_le(),
                 used: info.used.to_le(),
@@ -642,7 +622,7 @@ fn serve(
             let capacity = u64::from_le(args.capacity);
             let took = flags & VIRTIO_EXTENT_RESIZED_TOOK != 0;
             resizing.answered(capacity, took);
-            store.resized(capacity, took)?;
+            store.resized_async(capacity, took).await?;
             Ok(0)
         }
         // fxdax: a follower's (doc-4's F_READ_ONLY); a writer's store refuses them (EINVAL).
@@ -651,7 +631,7 @@ fn serve(
                 return Err(Errno::EINVAL);
             }
             let epoch = Epoch {
-                epoch: store.advance()?.to_le(),
+                epoch: store.advance_async().await?.to_le(),
                 reserved: 0,
             };
             writer.write(0, epoch.as_slice());
@@ -659,17 +639,17 @@ fn serve(
         }
         VIRTIO_EXTENT_T_LET_GO => {
             let epoch: Epoch = reader.obj()?;
-            store.let_go(u64::from_le(epoch.epoch))?;
+            store.let_go_async(u64::from_le(epoch.epoch)).await?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_PIN => {
             let id: ExtentIdLe = reader.obj()?;
-            store.pin(id.into())?;
+            store.pin_async(id.into()).await?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_UNPIN => {
             let id: ExtentIdLe = reader.obj()?;
-            store.unpin(id.into())?;
+            store.unpin_async(id.into()).await?;
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
@@ -681,6 +661,8 @@ fn serve(
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc;
+    use std::thread;
 
     use fxdax::ExtentStore;
 
@@ -786,13 +768,13 @@ mod tests {
         vq.avail.ring[0].set(0);
         vq.avail.idx.set(1);
         let chain = queue.pop().unwrap().unwrap();
-        let used = handle(
+        let buffers = Buffers::new(&mem, chain).unwrap();
+        let used = futures::executor::block_on(handle(
             store,
             &Resizing::default(),
             &AtomicBool::new(false),
-            &mem,
-            chain,
-        ) as usize;
+            buffers,
+        )) as usize;
         assert_eq!(
             used, writable,
             "the device wrote {used} of {writable} bytes"
