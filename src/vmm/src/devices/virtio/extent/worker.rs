@@ -524,15 +524,17 @@ async fn serve(
                 return Err(Errno::EINVAL);
             }
             let id: ExtentIdLe = reader.obj()?;
-            store.free_async(id.into()).await?;
-            // fxdax: the rest of a flush's dead extents, each freed as it would be alone: the
-            // first error fails the request, the extents before it freed (`F_FREE_MANY`).
+            let mut extents = vec![id.into()];
+            // fxdax: the rest of a flush's dead extents, each freed as it would be alone, in one
+            // request of the daemon's, not one each (TASK-92.13): the first error fails the
+            // request, the extents before it freed (`F_FREE_MANY`).
             if flags & VIRTIO_EXTENT_FREE_MANY != 0 {
                 while reader.available() > 0 {
                     let id: ExtentIdLe = reader.obj()?;
-                    store.free_async(id.into()).await?;
+                    extents.push(id.into());
                 }
             }
+            store.free_many_async(&extents).await?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_MAP => {
@@ -724,12 +726,31 @@ mod tests {
     /// stores' branches in the bucket FXDAX_EXTENTD_REMOTE names (memory:///NAME, in tests), as
     /// of placement FXDAX_EXTENTD_TOKEN (1), which the tests' environment sets.
     fn store() -> (RemoteExtentStore, TestDir) {
+        store_of(1 << 20)
+    }
+
+    /// A store of `capacity` bytes, as [`store`] makes one.
+    fn store_of(capacity: u64) -> (RemoteExtentStore, TestDir) {
         let dir = TestDir::new();
         let socket = dir.0.join("extentd.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         thread::spawn(move || fxdax::extentd::serve(listener));
-        let store = RemoteExtentStore::connect(&socket, dir.0.join("store"), 1 << 20).unwrap();
+        let store = RemoteExtentStore::connect(&socket, dir.0.join("store"), capacity).unwrap();
         (store, dir)
+    }
+
+    /// fxdax: held by the tests whose daemons free extents, one at a time: the daemons' metrics
+    /// are the process's, which a test counting the FREE requests they served then counts its own
+    /// alone in ([`frees_served`]).
+    static FREEING: Mutex<()> = Mutex::new(());
+
+    /// fxdax: the FREE requests the daemons of this process have served (their metrics).
+    fn frees_served() -> u64 {
+        let metrics = fxdax::extentd::metrics::render();
+        let line = (metrics.lines())
+            .find_map(|line| line.strip_prefix("fxdax_extentd_requests_total{kind=\"free\"} "))
+            .unwrap_or_else(|| panic!("no FREE requests counted in {metrics}"));
+        line.parse().unwrap()
     }
 
     /// The bytes of a request's header and arguments, followed by `data`.
@@ -826,6 +847,9 @@ mod tests {
 
     #[test]
     fn test_writes_and_reads() {
+        let _freeing = FREEING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (store, _dir) = store();
         let data: Vec<u8> = (0..2 * BLOCK).map(|i| i as u8).collect();
         let write = bytes(
@@ -934,6 +958,65 @@ mod tests {
             request(&store, &read, data.len() + RESPONSE).1,
             errno(Errno::ENOENT)
         );
+    }
+
+    /// fxdax: a FREE with FREE_MANY, of a flush's dead extents, as many as the guest's Fxfs names
+    /// in one (257), frees them in one request of the daemon's, not one each, each a round trip
+    /// to it (TASK-92.13).
+    #[test]
+    fn test_frees_many_in_one_request() {
+        const EXTENTS: u64 = 257;
+        let _freeing = FREEING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (store, _dir) = store_of(4 << 20);
+        let data = vec![7; BLOCK];
+        let ids: Vec<ExtentIdLe> = (1..=EXTENTS)
+            .map(|sequence| {
+                let id = fxdax::ExtentId {
+                    branch: store.branch(),
+                    sequence,
+                };
+                store
+                    .write(id, 0, &[fxdax::VolatileSlice::from(&data[..])])
+                    .unwrap();
+                ExtentIdLe {
+                    branch: store.branch(),
+                    sequence,
+                }
+            })
+            .collect();
+        store.commit(None).unwrap();
+        let rest: Vec<u8> = ids[1..]
+            .iter()
+            .flat_map(|id| id.as_slice().to_vec())
+            .collect();
+        let free = bytes(
+            VIRTIO_EXTENT_T_FREE,
+            VIRTIO_EXTENT_FREE_MANY,
+            Some(ids[0]),
+            &rest,
+        );
+        let before = frees_served();
+        let start = Instant::now();
+        assert_eq!(request(&store, &free, RESPONSE), (vec![], 0));
+        let took = start.elapsed();
+        let served = frees_served() - before;
+        println!("{EXTENTS} extents freed in {took:?}, in {served} of the daemon's requests");
+        assert_eq!(served, 1);
+        for sequence in [1, EXTENTS / 2, EXTENTS] {
+            let read = bytes(
+                VIRTIO_EXTENT_T_READ,
+                0,
+                Some(io(&store, sequence, 0, BLOCK)),
+                &[],
+            );
+            assert_eq!(
+                request(&store, &read, BLOCK + RESPONSE).1,
+                errno(Errno::ENOENT),
+                "extent {sequence} is still there"
+            );
+        }
     }
 
     #[test]
