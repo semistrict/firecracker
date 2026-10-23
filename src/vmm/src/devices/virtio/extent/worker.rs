@@ -21,9 +21,9 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{
-    CommitArgs, ExtentIdLe, Info, IoArgs, MAX_ROOT, MAX_TRANSFER, MapArgs, RequestHeader, Response,
-    RootLen, UnmapArgs, VIRTIO_EXTENT_COMMIT_DURABLE, VIRTIO_EXTENT_COMMIT_ROOT,
-    VIRTIO_EXTENT_MAP_WRITE, VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO,
+    CommitArgs, ExtentIdLe, Info, IoArgs, MAX_ROOT, MAX_TRANSFER, MapArgs, MapEntry, RequestHeader,
+    Response, RootLen, UnmapArgs, VIRTIO_EXTENT_COMMIT_DURABLE, VIRTIO_EXTENT_COMMIT_ROOT,
+    VIRTIO_EXTENT_MAP_MANY, VIRTIO_EXTENT_MAP_WRITE, VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO,
     VIRTIO_EXTENT_T_MAP, VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP,
     VIRTIO_EXTENT_T_WRITE, write_barriers,
 };
@@ -537,18 +537,35 @@ async fn serve(
         }
         VIRTIO_EXTENT_T_MAP => {
             let args: MapArgs = reader.obj()?;
-            if flags & !VIRTIO_EXTENT_MAP_WRITE != 0 {
+            if flags & !(VIRTIO_EXTENT_MAP_WRITE | VIRTIO_EXTENT_MAP_MANY) != 0 {
                 return Err(Errno::EINVAL);
             }
-            store
-                .map_async(
+            let mut maps = vec![(args, flags & VIRTIO_EXTENT_MAP_WRITE != 0)];
+            // fxdax: the rest of a chunk's pieces (`F_MAP_MANY`), each with its own flags.
+            if flags & VIRTIO_EXTENT_MAP_MANY != 0 {
+                while reader.available() > 0 {
+                    let entry: MapEntry = reader.obj()?;
+                    if u32::from_le(entry.flags) & !VIRTIO_EXTENT_MAP_WRITE != 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    maps.push((
+                        entry.map,
+                        u32::from_le(entry.flags) & VIRTIO_EXTENT_MAP_WRITE != 0,
+                    ));
+                }
+            }
+            // Sent to the daemon at once, each as it would be alone: the first error fails the
+            // request, whichever others it mapped (`F_MAP_MANY`).
+            futures::future::try_join_all(maps.iter().map(|(args, writable)| {
+                store.map_async(
                     args.id.into(),
                     u64::from_le(args.offset),
                     u64::from_le(args.len),
                     u64::from_le(args.window_offset),
-                    flags & VIRTIO_EXTENT_MAP_WRITE != 0,
+                    *writable,
                 )
-                .await?;
+            }))
+            .await?;
             Ok(0)
         }
         VIRTIO_EXTENT_T_UNMAP => {
@@ -1076,12 +1093,39 @@ mod tests {
             &[1; 100],
         );
         assert_eq!(request(&store, &short, RESPONSE).1, errno(Errno::EINVAL));
-        // Without a DAX window, writable or not; and a MAP flag the device doesn't know.
+        // Without a DAX window, writable or not, one map or many; and a MAP flag the device
+        // doesn't know, of the request or of one of its maps (`F_MAP_MANY`).
+        let entries = |flags: &[u32]| -> Vec<u8> {
+            (flags.iter())
+                .flat_map(|flags| {
+                    let entry = MapEntry {
+                        flags: flags.to_le(),
+                        ..MapEntry::default()
+                    };
+                    entry.as_slice().to_vec()
+                })
+                .collect()
+        };
+        let many = entries(&[VIRTIO_EXTENT_MAP_WRITE, 0]);
         for flags in [0, VIRTIO_EXTENT_MAP_WRITE] {
             let map = bytes(VIRTIO_EXTENT_T_MAP, flags, Some(MapArgs::default()), &[]);
             assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::ENOSYS));
+            let map = bytes(
+                VIRTIO_EXTENT_T_MAP,
+                flags | VIRTIO_EXTENT_MAP_MANY,
+                Some(MapArgs::default()),
+                &many,
+            );
+            assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::ENOSYS));
         }
-        let map = bytes(VIRTIO_EXTENT_T_MAP, 1 << 1, Some(MapArgs::default()), &[]);
+        let map = bytes(VIRTIO_EXTENT_T_MAP, 1 << 2, Some(MapArgs::default()), &[]);
+        assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::EINVAL));
+        let map = bytes(
+            VIRTIO_EXTENT_T_MAP,
+            VIRTIO_EXTENT_MAP_MANY,
+            Some(MapArgs::default()),
+            &entries(&[1 << 1]),
+        );
         assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::EINVAL));
     }
 }

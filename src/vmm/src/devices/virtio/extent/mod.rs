@@ -47,6 +47,10 @@ pub const VIRTIO_EXTENT_F_READ_ONLY: u32 = 5;
 /// fxdax: `FREE` frees, with `FREE_MANY`, the extents its data names too, after the one its
 /// arguments do: a flush's dead extents in one request rather than one each (TASK-41).
 pub const VIRTIO_EXTENT_F_FREE_MANY: u32 = 6;
+/// fxdax: `MAP` maps, with `MAP_MANY`, the maps its data holds too, each a `MapEntry`, after the
+/// one its arguments say: the pieces of a file's chunk in one request rather than one each
+/// (TASK-91.4).
+pub const VIRTIO_EXTENT_F_MAP_MANY: u32 = 7;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -110,8 +114,10 @@ pub const VIRTIO_EXTENT_FREE_MANY: u32 = 1 << 0;
 /// A `COMMIT`'s flags: it completes once durable; it sets the root.
 pub const VIRTIO_EXTENT_COMMIT_DURABLE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_ROOT: u32 = 1 << 1;
-/// A `MAP`'s flag: writable, which needs `DAX_WRITE`.
+/// A `MAP`'s flag: writable, which needs `DAX_WRITE`. fxdax: and its data holds more maps
+/// (`F_MAP_MANY`).
 pub const VIRTIO_EXTENT_MAP_WRITE: u32 = 1 << 0;
+pub const VIRTIO_EXTENT_MAP_MANY: u32 = 1 << 1;
 
 /// The device's queues, and their size: request queues, interchangeable, which a driver may use one
 /// per CPU of (fxdax TASK-26.18.5).
@@ -172,6 +178,15 @@ pub struct MapArgs {
     pub offset: u64,
     pub len: u64,
     pub window_offset: u64,
+}
+
+/// fxdax: one of a `MAP_MANY`'s further maps, its flags `MAP_WRITE` alone (`F_MAP_MANY`).
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct MapEntry {
+    pub map: MapArgs,
+    pub flags: u32,
+    pub reserved: u32,
 }
 
 /// `UNMAP`'s arguments.
@@ -344,6 +359,8 @@ unsafe impl ByteValued for ResizedArgs {}
 unsafe impl ByteValued for IoArgs {}
 // SAFETY: As above.
 unsafe impl ByteValued for MapArgs {}
+// SAFETY: plain old data, with no padding.
+unsafe impl ByteValued for MapEntry {}
 // SAFETY: As above.
 unsafe impl ByteValued for UnmapArgs {}
 // SAFETY: As above.
