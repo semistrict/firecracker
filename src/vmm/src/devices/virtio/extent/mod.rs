@@ -249,12 +249,15 @@ pub struct ResizedArgs {
 
 /// fxdax: what the device knows of its store's capacity, which the daemon changes
 /// (`RemoteExtentStore::on_capacity`): the capacity, the shrink the guest is asked to take, if any
-/// (0 if none), and how the guest is told, once the driver activates the device.
+/// (0 if none), and how the guest is told, once the driver activates the device. The daemon's
+/// changes and the guest's answers are made one at a time (`changing`), so that an answer to a
+/// shrink no longer asked changes nothing (TASK-79.41); the driver reads the fields as they are.
 #[derive(Default)]
 pub struct Resizing {
     pub capacity: AtomicU64,
     pub asked: AtomicU64,
     pub interrupt: Mutex<Option<Arc<dyn VirtioInterrupt>>>,
+    changing: Mutex<()>,
 }
 
 impl std::fmt::Debug for Resizing {
@@ -270,6 +273,7 @@ impl Resizing {
     /// The daemon set the store's capacity to `capacity` bytes, or, if `ask`, asks the guest to
     /// shrink to it: the guest is told, with a configuration change.
     pub fn changed(&self, capacity: u64, ask: bool) {
+        let _changing = self.changing.lock().expect("Poisoned lock");
         if ask {
             self.asked.store(capacity, Ordering::Release);
         } else {
@@ -284,8 +288,13 @@ impl Resizing {
     }
 
     /// The guest answered the shrink to `capacity` bytes it was asked to take: it took it, if
-    /// `took`.
+    /// `took`. An answer to a shrink no longer asked, the daemon having asked another since, or
+    /// told the capacity it kept, changes nothing.
     pub fn answered(&self, capacity: u64, took: bool) {
+        let _changing = self.changing.lock().expect("Poisoned lock");
+        if self.asked.load(Ordering::Acquire) != capacity {
+            return;
+        }
         self.asked.store(0, Ordering::Release);
         if took {
             self.capacity.store(capacity, Ordering::Release);
@@ -380,5 +389,35 @@ impl From<ExtentIdLe> for fxdax::ExtentId {
             branch: u64::from_le(id.branch),
             sequence: u64::from_le(id.sequence),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the device knows of its store's capacity: the capacity, and the shrink asked.
+    fn known(resizing: &Resizing) -> (u64, u64) {
+        (resizing.capacity.load(Ordering::Acquire), resizing.asked.load(Ordering::Acquire))
+    }
+
+    /// fxdax TASK-79.41: the guest's answer to a shrink it was asked to take, once a newer shrink
+    /// was asked, is that of a shrink no longer asked: the newer stays asked, and the capacity is
+    /// the daemon's; the answer to the shrink asked last takes it.
+    #[test]
+    fn answers_to_shrinks_no_longer_asked_change_nothing() {
+        let resizing = Resizing::default();
+        resizing.changed(8, false);
+        resizing.changed(6, true);
+        resizing.changed(4, true);
+        resizing.answered(6, true);
+        assert_eq!(known(&resizing), (8, 4));
+        resizing.answered(4, true);
+        assert_eq!(known(&resizing), (4, 0));
+        // The daemon told the capacity it kept, as for a shrink no answer came for in time.
+        resizing.changed(2, true);
+        resizing.changed(4, false);
+        resizing.answered(2, true);
+        assert_eq!(known(&resizing), (4, 0));
     }
 }
