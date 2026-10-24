@@ -744,13 +744,18 @@ mod tests {
     /// alone in ([`frees_served`]).
     static FREEING: Mutex<()> = Mutex::new(());
 
-    /// fxdax: the FREE requests the daemons of this process have served (their metrics).
+    /// fxdax: the requests freeing extents the daemons of this process have served (their
+    /// metrics): their FREEs, of one, and FREE_MANYs, of many, a request of its own, which a daemon
+    /// without it refuses (fxdax TASK-92.13).
     fn frees_served() -> u64 {
         let metrics = fxdax::extentd::metrics::render();
-        let line = (metrics.lines())
-            .find_map(|line| line.strip_prefix("fxdax_extentd_requests_total{kind=\"free\"} "))
-            .unwrap_or_else(|| panic!("no FREE requests counted in {metrics}"));
-        line.parse().unwrap()
+        let served = |kind: &str| -> u64 {
+            let name = format!("fxdax_extentd_requests_total{{kind=\"{kind}\"}} ");
+            let line = (metrics.lines()).find_map(|line| line.strip_prefix(&name));
+            let line = line.unwrap_or_else(|| panic!("no {kind} requests counted in {metrics}"));
+            line.parse().unwrap()
+        };
+        served("free") + served("free_many")
     }
 
     /// The bytes of a request's header and arguments, followed by `data`.
