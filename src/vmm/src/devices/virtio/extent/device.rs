@@ -63,6 +63,8 @@ pub enum ExtentSnapshotError {
     Fork(String, String, fxdax::Errno),
     /// Extent device {0}: cannot list its DAX window's mappings: {1}
     Mappings(String, fxdax::Errno),
+    /// Extent device {0}: cannot name the snapshot's branch: {1}
+    Branch(String, std::io::Error),
 }
 
 /// What a snapshot of the device holds of its store (TASK-39.1): the point it was taken at, a fork
@@ -446,7 +448,7 @@ impl Extent {
         }
         // No request is in progress, which could change the window meanwhile.
         self.pause_worker();
-        let branch = rand_branch();
+        let branch = rand_branch().map_err(|err| ExtentSnapshotError::Branch(id.clone(), err))?;
         self.store.fork_quiescent(point, branch).map_err(|errno| {
             ExtentSnapshotError::Fork(id.clone(), point.display().to_string(), errno)
         })?;
@@ -510,10 +512,30 @@ fn hear_commits(store: &RemoteExtentStore, following: &Arc<Following>) {
     following.committed(store.committed());
 }
 
-/// A new branch's number, for a fork of the store.
-fn rand_branch() -> u64 {
-    let rng = vmm_sys_util::rand::xor_pseudo_rng_u32;
-    ((u64::from(rng()) << 32) | u64::from(rng())).max(1)
+/// A new branch's number, for a fork of the store, which names it in the extent daemon's bucket,
+/// which hosts share: 64 bits of the kernel's random numbers (getrandom(2)), none 0. fxdax
+/// TASK-79.26: not the clock's, whose xorshift gave about 38 bits, which two hosts' snapshots
+/// could share: the second's uploads refused, or one tenant's filesystem restored for another.
+fn rand_branch() -> std::io::Result<u64> {
+    loop {
+        let mut bytes = [0u8; 8];
+        // SAFETY: getrandom(2) writes at most `bytes.len()` bytes, to `bytes`.
+        let read = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+        match usize::try_from(read) {
+            // 8 bytes come whole from the kernel's pool once it is ready, which it waits for.
+            Ok(8) => match u64::from_ne_bytes(bytes) {
+                0 => continue,
+                branch => return Ok(branch),
+            },
+            Ok(read) => unreachable!("getrandom(2) gave {read} bytes of 8"),
+            Err(_) => {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
 }
 
 impl Drop for Extent {
@@ -675,4 +697,53 @@ impl MutEventSubscriber for Extent {
     fn init(&mut self, _ops: &mut EventOps) {}
 
     fn process(&mut self, _events: Events, _ops: &mut EventOps) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The value `xorshift32` (13, 17, 5) gave `value`, as vmm-sys-util's `xor_pseudo_rng_u32`
+    /// does the clock's, which is a bijection.
+    fn unxorshift(value: u32) -> u32 {
+        let unshift_left = |y: u32, by: u32| (0..32 / by).fold(y, |x, _| y ^ (x << by));
+        let unshift_right = |y: u32, by: u32| (0..32 / by).fold(y, |x, _| y ^ (x >> by));
+        unshift_left(unshift_right(unshift_left(value, 5), 17), 13)
+    }
+
+    /// fxdax TASK-79.26: a branch's halves aren't the clock's, through a xorshift, as they were:
+    /// undone, neither is a reading of the clock (`timestamp_cycles`) between those taken before
+    /// and after the branch was named, which a name from the kernel's random numbers is but by a
+    /// chance of the clock's few ticks meanwhile in 2^32.
+    #[test]
+    fn branches_are_not_the_clocks() {
+        use vmm_sys_util::rand::timestamp_cycles;
+
+        for _ in 0..16 {
+            let before = timestamp_cycles() as u32;
+            let branch = rand_branch().unwrap();
+            let after = timestamp_cycles() as u32;
+            for half in [(branch >> 32) as u32, branch as u32] {
+                let clock = unxorshift(half);
+                assert!(
+                    clock.wrapping_sub(before) > after.wrapping_sub(before),
+                    "branch {branch:#x}: its half {half:#x} is the clock's {clock:#x}, read between \
+                     {before:#x} and {after:#x}"
+                );
+            }
+        }
+    }
+
+    /// The test's undoing of the xorshift undoes vmm-sys-util's.
+    #[test]
+    fn unxorshift_undoes_the_clocks_xorshift() {
+        let shifted = |mut t: u32| {
+            t ^= t << 13;
+            t ^= t >> 17;
+            t ^ (t << 5)
+        };
+        for value in [0, 1, 0x8000_0000, 0xdead_beef, u32::MAX] {
+            assert_eq!(unxorshift(shifted(value)), value);
+        }
+    }
 }

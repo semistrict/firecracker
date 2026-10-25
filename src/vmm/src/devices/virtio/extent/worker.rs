@@ -110,7 +110,7 @@ impl Shared {
                     handle(&shared.store, &shared.resizing, &shared.frozen, buffers).await
                 }
                 Err(err) => {
-                    error!("extent device: a descriptor chain is not guest memory: {err}");
+                    error!("extent device: {err}");
                     0
                 }
             };
@@ -295,6 +295,15 @@ struct Segment {
 unsafe impl Send for Segment {}
 unsafe impl Sync for Segment {}
 
+/// Why a descriptor chain is no request's buffers.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub(super) enum BuffersError {
+    /// a descriptor chain is not guest memory: {0}
+    Memory(#[from] GuestMemoryError),
+    /// a descriptor chain gives the device {0} bytes to write, more than its used length holds
+    TooLong(u64),
+}
+
 /// A request's buffers: those the driver wrote, and those it gave the device to write, whose last
 /// bytes are the response.
 pub(super) struct Buffers {
@@ -304,16 +313,22 @@ pub(super) struct Buffers {
 
 impl Buffers {
     /// The buffers of the request in `chain`, all in `mem`. The writable ones are marked dirty,
-    /// as the device writes them whole.
-    pub(super) fn new(
-        mem: &GuestMemoryMmap,
-        chain: DescriptorChain,
-    ) -> Result<Self, GuestMemoryError> {
+    /// as the device writes them whole. fxdax TASK-79.25: refused if they take more bytes than the
+    /// used ring's length holds, a u32, as a chain of descriptors naming the same memory again
+    /// may: the device writes them whole, and says how much it wrote there.
+    pub(super) fn new(mem: &GuestMemoryMmap, chain: DescriptorChain) -> Result<Self, BuffersError> {
         let mut buffers = Self {
             readable: Vec::new(),
             writable: Vec::new(),
         };
+        let mut writable = 0u64;
         for descriptor in chain {
+            if descriptor.is_write_only() {
+                writable += u64::from(descriptor.len);
+                if writable > u64::from(u32::MAX) {
+                    return Err(BuffersError::TooLong(writable));
+                }
+            }
             let len = descriptor.len as usize;
             let slice = mem.get_slice(descriptor.addr, len)?;
             let segment = Segment {
@@ -471,7 +486,7 @@ pub(super) async fn handle(
         reserved: 0,
     };
     writer.write(room, response.as_slice());
-    u32::try_from(writable).expect("a descriptor chain's length fits in u32")
+    u32::try_from(writable).expect("a request's buffers' writable length fits in u32 (Buffers::new)")
 }
 
 /// Serves the request `reader` holds, writing what it returns with `writer`, which has `room`
@@ -832,6 +847,30 @@ mod tests {
 
     fn request(store: &RemoteExtentStore, readable: &[u8], writable: usize) -> (Vec<u8>, u32) {
         request_split(store, readable, writable, usize::MAX)
+    }
+
+    /// fxdax TASK-79.25: a chain whose descriptors give the device more bytes to write than a
+    /// u32 holds, naming the same memory again and again, is refused, not served: its used
+    /// length couldn't say what the device wrote, which aborted the VMM.
+    #[test]
+    fn chains_writing_past_u32_are_refused() {
+        const LEN: u32 = 0x6000_0000;
+        let mem = single_region_mem(LEN as usize);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut queue = vq.create_queue();
+        for i in 0..3 {
+            let next = if i < 2 { VIRTQ_DESC_F_NEXT } else { 0 };
+            vq.dtable[i].set(0, LEN, VIRTQ_DESC_F_WRITE | next, (i + 1) as u16);
+        }
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+        let chain = queue.pop().unwrap().unwrap();
+        let buffers = Buffers::new(&mem, chain);
+        assert!(
+            matches!(buffers, Err(BuffersError::TooLong(0x1_2000_0000))),
+            "{:?}",
+            buffers.map(|buffers| buffers.writable_len())
+        );
     }
 
     fn io(store: &RemoteExtentStore, sequence: u64, offset: u64, len: usize) -> IoArgs {
