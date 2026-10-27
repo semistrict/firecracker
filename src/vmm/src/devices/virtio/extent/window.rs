@@ -54,7 +54,10 @@ impl Drop for GuestRange {
 }
 
 /// Anonymous host memory of the window's size, aligned as the window is, so that KVM maps it
-/// for the guest with huge pages where the daemon's are. Unmapped on drop.
+/// for the guest with huge pages where the daemon's are. Unmapped on drop. fxdax: inaccessible
+/// until the store's connection takes it over, as once it lets it go (TASK-79.8): a guest's
+/// accesses meanwhile, as before it sets DRIVER_OK, fault, rather than growing its VMM's memory by
+/// the window's size.
 #[derive(Debug)]
 struct HostMemory {
     base: NonNull<u8>,
@@ -73,7 +76,7 @@ impl HostMemory {
             libc::mmap(
                 std::ptr::null_mut(),
                 reserved,
-                libc::PROT_READ | libc::PROT_WRITE,
+                libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                 -1,
                 0,

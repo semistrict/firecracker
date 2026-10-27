@@ -342,7 +342,7 @@ impl Extent {
         hear_commits(&store, &self.following);
         self.config_space.branch = store.branch().to_le();
         // The old connection goes, with its window's faults, before the new one creates its
-        // window in the same memory.
+        // window in the same memory, which it leaves inaccessible meanwhile (TASK-79.8).
         self.store = Arc::new(store);
         self.window_created = false;
         self.reopen = false;
@@ -410,10 +410,6 @@ impl Extent {
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
         assert!(!self.is_activated());
-        if self.reopen {
-            self.reopen()
-                .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
-        }
         // fxdax: those the driver set up, one per CPU of the guest's, up to the device's.
         let event_idx = self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
@@ -423,6 +419,12 @@ impl Extent {
             if event_idx {
                 queue.enable_notif_suppression();
             }
+        }
+        // fxdax: once the queues are, so that an activation failing on them leaves the store as
+        // it was, to open anew at the next (TASK-79.8).
+        if self.reopen {
+            self.reopen()
+                .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
         }
         self.create_dax_window()
             .map_err(|err| ActivateError::Extent(format!("creating the DAX window: {err:#}")))?;
