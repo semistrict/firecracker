@@ -2,6 +2,8 @@
 target-dir = "build/cargo_target"
 rustflags = [
   "-Ccodegen-units=1",
+  # fxdax: frame pointers, always, which perf's call graphs of the VMM walk (TASK-92.39).
+  "-Cforce-frame-pointers=yes",
 ]
 
 [net]
