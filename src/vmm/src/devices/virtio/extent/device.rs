@@ -21,7 +21,7 @@ use super::{
     VIRTIO_EXTENT_F_RESIZE, VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use super::{
-    Following, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_MANY, VIRTIO_EXTENT_F_READ_ONLY,
+    Following, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_AHEAD, VIRTIO_EXTENT_F_MAP_MANY, VIRTIO_EXTENT_F_READ_ONLY,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
@@ -255,8 +255,11 @@ impl Extent {
                     guest_addr: window.guest_addr(),
                     len: window.len(),
                 });
-                // fxdax: a MAP may carry a chunk's pieces (doc-4's MAP_MANY, TASK-91.4).
-                avail_features |= (1 << VIRTIO_EXTENT_F_DAX) | (1 << VIRTIO_EXTENT_F_MAP_MANY);
+                // fxdax: a MAP may carry a chunk's pieces (doc-4's MAP_MANY, TASK-91.4), and say
+                // the guest reads them next (MAP_AHEAD, TASK-112.1).
+                avail_features |= (1 << VIRTIO_EXTENT_F_DAX)
+                    | (1 << VIRTIO_EXTENT_F_MAP_MANY)
+                    | (1 << VIRTIO_EXTENT_F_MAP_AHEAD);
                 // The store maps open extents writably too (doc-4's DAX_WRITE): a writer's.
                 if !config.read_only {
                     avail_features |= 1 << VIRTIO_EXTENT_F_DAX_WRITE;

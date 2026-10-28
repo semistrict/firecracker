@@ -51,6 +51,10 @@ pub const VIRTIO_EXTENT_F_FREE_MANY: u32 = 6;
 /// one its arguments say: the pieces of a file's chunk in one request rather than one each
 /// (TASK-91.4).
 pub const VIRTIO_EXTENT_F_MAP_MANY: u32 = 7;
+/// fxdax: `MAP` takes `MAP_AHEAD`, as each of its further maps does: the guest accesses the pages
+/// next, as it maps them to read, and the device maps them for it ahead of its accesses, as it does
+/// writable ones, rather than the hypervisor one fault at a time (TASK-112.1).
+pub const VIRTIO_EXTENT_F_MAP_AHEAD: u32 = 8;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -115,9 +119,10 @@ pub const VIRTIO_EXTENT_FREE_MANY: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_DURABLE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_ROOT: u32 = 1 << 1;
 /// A `MAP`'s flag: writable, which needs `DAX_WRITE`. fxdax: and its data holds more maps
-/// (`F_MAP_MANY`).
+/// (`F_MAP_MANY`); and the guest accesses the pages next (`F_MAP_AHEAD`).
 pub const VIRTIO_EXTENT_MAP_WRITE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_MAP_MANY: u32 = 1 << 1;
+pub const VIRTIO_EXTENT_MAP_AHEAD: u32 = 1 << 2;
 
 /// The device's queues, and their size: request queues, interchangeable, which a driver may use one
 /// per CPU of (fxdax TASK-26.18.5).
@@ -180,7 +185,8 @@ pub struct MapArgs {
     pub window_offset: u64,
 }
 
-/// fxdax: one of a `MAP_MANY`'s further maps, its flags `MAP_WRITE` alone (`F_MAP_MANY`).
+/// fxdax: one of a `MAP_MANY`'s further maps, its flags `MAP_WRITE` and `MAP_AHEAD` alone
+/// (`F_MAP_MANY`).
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
 pub struct MapEntry {
