@@ -118,6 +118,8 @@ pub struct Vcpu {
 struct Efaults {
     first: std::time::Instant,
     last: std::time::Instant,
+    /// How many failed.
+    count: u64,
 }
 
 #[cfg(feature = "fxdax")]
@@ -130,12 +132,31 @@ impl Efaults {
     /// Records a `KVM_RUN` failing with `EFAULT`, and returns whether to retry it.
     fn retry(efaults: &mut Option<Efaults>) -> bool {
         let now = std::time::Instant::now();
-        let first = match efaults {
-            Some(efaults) if now - efaults.last < Self::IN_A_ROW => efaults.first,
-            _ => now,
+        let (first, count) = match efaults {
+            Some(efaults) if now - efaults.last < Self::IN_A_ROW => (efaults.first, efaults.count),
+            _ => (now, 0),
         };
-        *efaults = Some(Efaults { first, last: now });
+        *efaults = Some(Efaults { first, last: now, count: count + 1 });
         now - first < Self::PATIENCE
+    }
+
+    /// fxdax: a `KVM_RUN` of vCPU `index` that didn't fail with `EFAULT`, after some that did:
+    /// logs how many, over how long, the first thousand runs of them and every power of two
+    /// after, which says whether the stores the DAX window refuses stall the vCPUs whose they are,
+    /// and for how long (TASK-44.12).
+    fn ran_on(efaults: &mut Option<Efaults>, index: u8) {
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let Some(Efaults { first, last, count }) = efaults.take() else {
+            return;
+        };
+        let logged = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if logged <= 1000 || logged.is_power_of_two() {
+            warn!(
+                "fxdax: vCPU {index}'s KVM_RUN failed with EFAULT {count} times in {:?}, then ran \
+                 on ({logged} such runs so far)",
+                last - first
+            );
+        }
     }
 }
 
@@ -427,7 +448,12 @@ impl Vcpu {
             return Ok(VcpuEmulation::Interrupted);
         }
 
-        match self.kvm_vcpu.fd.run() {
+        let ran = self.kvm_vcpu.fd.run();
+        #[cfg(feature = "fxdax")]
+        if !matches!(&ran, Err(err) if err.errno() == libc::EFAULT) {
+            Efaults::ran_on(&mut self.efaults, self.kvm_vcpu.index);
+        }
+        match ran {
             Err(ref err) if err.errno() == libc::EINTR => {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
                 // Notify that this KVM_RUN was interrupted.
