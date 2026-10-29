@@ -163,7 +163,7 @@ impl Extent {
                 .expect("the queues are few")
                 .to_le(),
             block_size: ExtentStore::BLOCK_SIZE.to_le(),
-            map_alignment: u32::try_from(fxdax::kernel::page_size())
+            map_alignment: u32::try_from(fxdax::pages::page_size())
                 .expect("a page is small")
                 .to_le(),
             max_transfer: MAX_TRANSFER.to_le(),
