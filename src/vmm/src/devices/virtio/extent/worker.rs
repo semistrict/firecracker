@@ -105,9 +105,17 @@ impl Shared {
         // Its descriptors read now, the future holds its buffers alone.
         let buffers = Buffers::new(&self.mem, chain);
         fxdax::extentd::spawn_on_replies(async move {
+            let mut ahead = Vec::new();
             let len = match buffers {
                 Ok(buffers) => {
-                    handle(&shared.store, &shared.resizing, &shared.frozen, buffers).await
+                    handle(
+                        &shared.store,
+                        &shared.resizing,
+                        &shared.frozen,
+                        buffers,
+                        &mut ahead,
+                    )
+                    .await
                 }
                 Err(err) => {
                     error!("extent device: {err}");
@@ -117,6 +125,13 @@ impl Shared {
             #[allow(clippy::cast_possible_truncation)]
             shared.served.add(type_, start.elapsed().as_nanos() as u64);
             shared.complete(index, len);
+            // fxdax: what the guest reads next is mapped for it once it has the MAP's reply, as
+            // it reads the first of it meanwhile, not before: the mapping runs ahead of its
+            // reading, as it maps each page several times faster than the guest's first touch
+            // of it costs (TASK-131.3).
+            for (window_offset, len) in ahead {
+                shared.store.prefault(window_offset, len);
+            }
             let mut serving = shared.serving.lock().expect("Poisoned lock");
             *serving -= 1;
             if *serving == 0 {
@@ -455,12 +470,15 @@ impl Writer<'_> {
 
 /// Serves the request whose buffers are `buffers` ([`Buffers::new`]) with `store`, and returns the
 /// length of what the device writes to it: its writable buffers, whose last bytes hold the
-/// response.
+/// response. fxdax: the window's ranges, offset and length, that its maps had mapped for the
+/// guest to read next (`F_MAP_AHEAD`) go to `ahead`, for the caller to pre-fault once the request
+/// is returned (`RemoteExtentStore::prefault`).
 pub(super) async fn handle(
     store: &RemoteExtentStore,
     resizing: &Resizing,
     frozen: &AtomicBool,
     buffers: Buffers,
+    ahead: &mut Vec<(u64, u64)>,
 ) -> u32 {
     // The response is the chain's last bytes, after what the request returns.
     let writable = buffers.writable_len();
@@ -475,7 +493,8 @@ pub(super) async fn handle(
     let writer = Writer {
         segments: &buffers.writable,
     };
-    let (status, written) = match serve(store, resizing, frozen, &mut reader, &writer, room).await {
+    let served = serve(store, resizing, frozen, &mut reader, &writer, room, ahead).await;
+    let (status, written) = match served {
         Ok(written) => (0, written),
         Err(errno) => (errno.raw().cast_unsigned(), 0),
     };
@@ -489,8 +508,32 @@ pub(super) async fn handle(
     u32::try_from(writable).expect("a request's buffers' writable length fits in u32 (Buffers::new)")
 }
 
+/// Has `store` map what one of a `MAP`'s maps, `args`, with its `flags`, asks; and returns the
+/// window's range it mapped, offset and length, if the guest reads it next (`F_MAP_AHEAD`), for
+/// its pre-fault ([`handle`]'s `ahead`).
+async fn map(
+    store: &RemoteExtentStore,
+    args: &MapArgs,
+    flags: u32,
+) -> Result<Option<(u64, u64)>, Errno> {
+    let (window_offset, len) = (u64::from_le(args.window_offset), u64::from_le(args.len));
+    let writable = flags & VIRTIO_EXTENT_MAP_WRITE != 0;
+    store
+        .map_async(
+            args.id.into(),
+            u64::from_le(args.offset),
+            len,
+            window_offset,
+            writable,
+        )
+        .await?;
+    let read_next = !writable && flags & VIRTIO_EXTENT_MAP_AHEAD != 0;
+    Ok(read_next.then_some((window_offset, len)))
+}
+
 /// Serves the request `reader` holds, writing what it returns with `writer`, which has `room`
-/// bytes for it, and returns how many it wrote.
+/// bytes for it, and returns how many it wrote: and the window's ranges its maps mapped for the
+/// guest to read next to `ahead` ([`handle`]).
 async fn serve(
     store: &RemoteExtentStore,
     resizing: &Resizing,
@@ -498,6 +541,7 @@ async fn serve(
     reader: &mut Reader<'_>,
     writer: &Writer<'_>,
     room: usize,
+    ahead: &mut Vec<(u64, u64)>,
 ) -> Result<usize, Errno> {
     let header: RequestHeader = reader.obj()?;
     let flags = u32::from_le(header.flags);
@@ -573,26 +617,10 @@ async fn serve(
             // Sent to the daemon at once, each as it would be alone: the first error fails the
             // request, whichever others it mapped (`F_MAP_MANY`). fxdax: what the guest reads
             // next (`F_MAP_AHEAD`) is then mapped for it, as the window maps writable pages
-            // already (TASK-112.1).
-            futures::future::try_join_all(maps.iter().map(|(args, flags)| async move {
-                let (window_offset, len) =
-                    (u64::from_le(args.window_offset), u64::from_le(args.len));
-                let writable = flags & VIRTIO_EXTENT_MAP_WRITE != 0;
-                store
-                    .map_async(
-                        args.id.into(),
-                        u64::from_le(args.offset),
-                        len,
-                        window_offset,
-                        writable,
-                    )
-                    .await?;
-                if !writable && flags & VIRTIO_EXTENT_MAP_AHEAD != 0 {
-                    store.prefault(window_offset, len);
-                }
-                Ok::<_, Errno>(())
-            }))
-            .await?;
+            // already (TASK-112.1), once the request is returned (`ahead`, TASK-131.3).
+            let mapped = maps.iter().map(|(args, flags)| map(store, args, *flags));
+            let mapped = futures::future::try_join_all(mapped).await?;
+            ahead.extend(mapped.into_iter().flatten());
             Ok(0)
         }
         VIRTIO_EXTENT_T_UNMAP => {
@@ -807,6 +835,18 @@ mod tests {
         writable: usize,
         split: usize,
     ) -> (Vec<u8>, u32) {
+        let (written, status, _ahead) = request_ahead(store, readable, writable, split);
+        (written, status)
+    }
+
+    /// As [`request_split`], and the window's ranges the request left to pre-fault once it is
+    /// returned ([`handle`]'s `ahead`).
+    fn request_ahead(
+        store: &RemoteExtentStore,
+        readable: &[u8],
+        writable: usize,
+        split: usize,
+    ) -> (Vec<u8>, u32, Vec<(u64, u64)>) {
         let mem = single_region_mem(16 << 20);
         let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
         let mut queue = vq.create_queue();
@@ -837,11 +877,13 @@ mod tests {
         vq.avail.idx.set(1);
         let chain = queue.pop().unwrap().unwrap();
         let buffers = Buffers::new(&mem, chain).unwrap();
+        let mut ahead = Vec::new();
         let used = futures::executor::block_on(handle(
             store,
             &Resizing::default(),
             &AtomicBool::new(false),
             buffers,
+            &mut ahead,
         )) as usize;
         assert_eq!(
             used, writable,
@@ -852,7 +894,7 @@ mod tests {
         let response_at = written.len() - RESPONSE;
         let response = *Response::from_slice(&written[response_at..]).unwrap();
         written.truncate(response_at);
-        (written, response.status)
+        (written, response.status, ahead)
     }
 
     fn request(store: &RemoteExtentStore, readable: &[u8], writable: usize) -> (Vec<u8>, u32) {
@@ -1203,6 +1245,89 @@ mod tests {
             request(&store, &advance, size_of::<Epoch>() + RESPONSE).1,
             errno(Errno::EINVAL)
         );
+    }
+
+    /// The window's pre-faults, as `fxdax::Prefault` is told of them.
+    #[derive(Default)]
+    struct Prefaults(Mutex<Vec<(u64, u64)>>);
+
+    impl fxdax::Prefault for Prefaults {
+        fn prefault(&self, offset: u64, len: u64) {
+            self.0.lock().unwrap().push((offset, len));
+        }
+    }
+
+    /// fxdax: what a guest maps read-only to read next (`MAP_AHEAD`) is left to pre-fault once
+    /// the MAP is returned, as the guest reads the first of it, not before (TASK-131.3); nothing
+    /// that the guest maps writably, or to read later.
+    #[test]
+    fn maps_ahead_are_prefaulted_after_their_reply() {
+        const SIZE: usize = 4 << 20;
+        let (store, _dir) = store();
+        // SAFETY: A new anonymous mapping, the window's alone, which outlives the store.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let prefaults = Arc::new(Prefaults::default());
+        // SAFETY: As above.
+        unsafe {
+            store
+                .create_dax_window_in_host_memory(
+                    std::ptr::NonNull::new(base.cast()).unwrap(),
+                    SIZE as u64,
+                    Some(prefaults.clone()),
+                )
+                .unwrap();
+        }
+        let data = vec![7; 2 * BLOCK];
+        let write = |sequence, flags| {
+            bytes(
+                VIRTIO_EXTENT_T_WRITE,
+                flags,
+                Some(io(&store, sequence, 0, data.len())),
+                &data,
+            )
+        };
+        let sealed = write(1, VIRTIO_EXTENT_WRITE_COMMIT | VIRTIO_EXTENT_WRITE_DURABLE);
+        assert_eq!(request(&store, &sealed, RESPONSE).1, 0);
+        assert_eq!(request(&store, &write(2, 0), RESPONSE).1, 0);
+        let len = data.len() as u64;
+        let map = |sequence, flags, window_offset| {
+            let args = MapArgs {
+                id: ExtentIdLe {
+                    branch: store.branch(),
+                    sequence,
+                },
+                offset: 0,
+                len,
+                window_offset,
+            };
+            let map = bytes(VIRTIO_EXTENT_T_MAP, flags, Some(args), &[]);
+            let (_, status, ahead) = request_ahead(&store, &map, RESPONSE, usize::MAX);
+            assert_eq!(status, 0, "MAP of extent {sequence} with flags {flags:#x}");
+            ahead
+        };
+        assert_eq!(map(1, VIRTIO_EXTENT_MAP_AHEAD, 1 << 20), [(1 << 20, len)]);
+        assert_eq!(map(1, 0, 2 << 20), []);
+        assert_eq!(
+            *prefaults.0.lock().unwrap(),
+            [],
+            "read-only pages pre-faulted before their MAP's reply"
+        );
+        // Writable pages the window pre-faults as it maps them, itself.
+        let writable = VIRTIO_EXTENT_MAP_WRITE | VIRTIO_EXTENT_MAP_AHEAD;
+        assert_eq!(map(2, writable, 3 << 20), []);
+        drop(store);
+        // SAFETY: The window's mapping, which the store, gone, uses no more.
+        assert_eq!(unsafe { libc::munmap(base, SIZE) }, 0);
     }
 
     #[test]
