@@ -381,25 +381,32 @@ impl Extent {
         let ready: Vec<usize> = (0..self.queues.len())
             .filter(|index| self.queues[*index].ready)
             .collect();
-        let mut workers = Vec::with_capacity(ready.len());
-        for &index in &ready {
+        let queues = self.queues.clone();
+        let (queue_events, store) = (&self.queue_events, &self.store);
+        let (resizing, frozen) = (&self.resizing, &self.frozen);
+        let spawn = |index: usize| {
             // The worker serves the queue from here on, notified through a copy of its event.
-            let queue_event = self.queue_events[index]
+            let queue_event = queue_events[index]
                 .try_clone()
                 .map_err(|_| ActivateError::EventFd)?;
-            let worker = Worker::spawn(
-                self.queues[index].clone(),
+            Worker::spawn(
+                queues[index].clone(),
                 u16::try_from(index).expect("the queues are few"),
                 queue_event,
                 interrupt.clone(),
                 mem.clone(),
-                self.store.clone(),
-                self.resizing.clone(),
-                self.frozen.clone(),
+                store.clone(),
+                resizing.clone(),
+                frozen.clone(),
             )
-            .map_err(|err| ActivateError::Extent(format!("starting a worker: {err}")))?;
-            workers.push((index, worker));
-        }
+            .map_err(|err| ActivateError::Extent(format!("starting a worker: {err}")))
+        };
+        let own = &mut self.queues;
+        let workers = start_all(&ready, spawn, |index, worker: Worker| {
+            if let Some(queue) = worker.stop() {
+                own[index] = queue;
+            }
+        })?;
         self.workers = workers;
         Ok(())
     }
@@ -704,9 +711,47 @@ impl MutEventSubscriber for Extent {
     fn process(&mut self, _events: Events, _ops: &mut EventOps) {}
 }
 
+/// fxdax: starts a worker for each of `ready` by `spawn`: all of them, or, one failing, none,
+/// those it started stopped by `stop`. Left running, no stop or reset would reach them, and the
+/// next kick would start others on the same queues (TASK-79.44).
+fn start_all<W, E>(
+    ready: &[usize],
+    mut spawn: impl FnMut(usize) -> Result<W, E>,
+    mut stop: impl FnMut(usize, W),
+) -> Result<Vec<(usize, W)>, E> {
+    let mut started = Vec::with_capacity(ready.len());
+    for &index in ready {
+        match spawn(index) {
+            Ok(worker) => started.push((index, worker)),
+            Err(err) => {
+                started.into_iter().for_each(|(index, worker)| stop(index, worker));
+                return Err(err);
+            }
+        }
+    }
+    Ok(started)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASK-79.44: a worker failing to start stops those started before it.
+    #[test]
+    fn workers_start_all_or_none() {
+        let mut stopped = Vec::new();
+        let spawn = |index: usize| if index == 5 { Err("no thread") } else { Ok(index * 10) };
+        let stop = |index, worker| stopped.push((index, worker));
+        assert_eq!(start_all(&[1, 3, 5, 7], spawn, stop), Err("no thread"));
+        assert_eq!(stopped, vec![(1, 10), (3, 30)]);
+
+        let mut stopped: Vec<(usize, usize)> = Vec::new();
+        let started = start_all(&[1, 3], |index| Ok::<_, ()>(index * 10), |index, worker| {
+            stopped.push((index, worker))
+        });
+        assert_eq!(started, Ok(vec![(1, 10), (3, 30)]));
+        assert_eq!(stopped, vec![]);
+    }
 
     /// The value `xorshift32` (13, 17, 5) gave `value`, as vmm-sys-util's `xor_pseudo_rng_u32`
     /// does the clock's, which is a bijection.
