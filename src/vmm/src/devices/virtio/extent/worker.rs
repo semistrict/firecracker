@@ -129,8 +129,10 @@ impl Shared {
             // it reads the first of it meanwhile, not before: the mapping runs ahead of its
             // reading, as it maps each page several times faster than the guest's first touch
             // of it costs (TASK-131.3).
-            for (window_offset, len) in ahead {
-                shared.store.prefault(window_offset, len);
+            // EXPERIMENT (TASK-133, not for main): the pre-fault made before the reply, as main
+            // does, and the receive thread held after it as long as a late pre-fault holds it.
+            for (_window_offset, len) in ahead {
+                std::thread::sleep(std::time::Duration::from_nanos(len / 4096 * 900));
             }
             let mut serving = shared.serving.lock().expect("Poisoned lock");
             *serving -= 1;
@@ -528,6 +530,9 @@ async fn map(
         )
         .await?;
     let read_next = !writable && flags & VIRTIO_EXTENT_MAP_AHEAD != 0;
+    if read_next {
+        store.prefault(window_offset, len);
+    }
     Ok(read_next.then_some((window_offset, len)))
 }
 
