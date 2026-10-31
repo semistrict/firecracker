@@ -807,6 +807,25 @@ mod tests {
         writable: usize,
         split: usize,
     ) -> (Vec<u8>, u32) {
+        let (used, mut written) = serve(store, readable, writable, split);
+        assert_eq!(
+            used, writable,
+            "the device wrote {used} of {writable} bytes"
+        );
+        let response_at = written.len() - RESPONSE;
+        let response = *Response::from_slice(&written[response_at..]).unwrap();
+        written.truncate(response_at);
+        (written, response.status)
+    }
+
+    /// Serves a request as [`request_split`] says, and returns how much the device says it wrote,
+    /// and the `writable` bytes it was given.
+    fn serve(
+        store: &RemoteExtentStore,
+        readable: &[u8],
+        writable: usize,
+        split: usize,
+    ) -> (usize, Vec<u8>) {
         let mem = single_region_mem(16 << 20);
         let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
         let mut queue = vq.create_queue();
@@ -843,16 +862,9 @@ mod tests {
             &AtomicBool::new(false),
             buffers,
         )) as usize;
-        assert_eq!(
-            used, writable,
-            "the device wrote {used} of {writable} bytes"
-        );
         let mut written = vec![0; writable];
         mem.read_slice(&mut written, WRITABLE).unwrap();
-        let response_at = written.len() - RESPONSE;
-        let response = *Response::from_slice(&written[response_at..]).unwrap();
-        written.truncate(response_at);
-        (written, response.status)
+        (used, written)
     }
 
     fn request(store: &RemoteExtentStore, readable: &[u8], writable: usize) -> (Vec<u8>, u32) {
@@ -1203,6 +1215,64 @@ mod tests {
             request(&store, &advance, size_of::<Epoch>() + RESPONSE).1,
             errno(Errno::EINVAL)
         );
+    }
+
+    /// fxdax TASK-77: a guest's driver is untrusted: whatever a request says, of the types and
+    /// flags it may name, of extents of its branch or another's, at offsets near the store's ends
+    /// or at the ends of a u64, the device answers it, with a status, no more than the room it was
+    /// given written, and goes on serving. Seeded by proptest, which says the case if one fails.
+    #[test]
+    fn test_answers_whatever_a_driver_asks() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+
+        let (store, _dir) = store_of(64 << 20);
+        let near_or_far = || {
+            prop_oneof![
+                0u64..(1 << 22),
+                any::<u64>(),
+                (0u64..4096).prop_map(|back| u64::MAX - back),
+            ]
+        };
+        let branch = prop_oneof![Just(store.branch()), any::<u64>()];
+        let args = (branch, 0u64..64, near_or_far(), near_or_far(), any::<u32>());
+        let word = || prop_oneof![0u32..16, any::<u32>()];
+        let data = proptest::collection::vec(any::<u8>(), 0..2 * BLOCK);
+        let requests = (word(), word(), args, data, 0usize..4 * BLOCK);
+        let config = Config {
+            cases: 5000,
+            failure_persistence: None,
+            ..Config::default()
+        };
+        // Those the device served: refusing each at its header would show nothing.
+        let served = AtomicU32::new(0);
+        TestRunner::new(config)
+            .run(&requests, |(type_, flags, args, data, room)| {
+                let (branch, sequence, first, second, last) = args;
+                let mut readable = bytes::<Info>(type_, flags, None, &[]);
+                for word in [branch, sequence, first, second, u64::from(last)] {
+                    readable.extend_from_slice(&word.to_le_bytes());
+                }
+                readable.extend_from_slice(&data);
+                let writable = RESPONSE + room;
+                // A queue's 16 descriptors hold it.
+                let split = (readable.len() + writable) / 14 + 1;
+                let (used, written) = serve(&store, &readable, writable, split);
+                prop_assert!(used <= writable, "{used} bytes used of {writable}");
+                let at = used.checked_sub(RESPONSE).expect("a response");
+                // Wherever the data before it left it, as a u8 slice's alignment doesn't say.
+                let status = u32::from_le_bytes(written[at..at + 4].try_into().unwrap());
+                prop_assert!(status < 4096, "status {status}");
+                served.fetch_add(u32::from(status == 0), Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        let served = served.load(Ordering::Relaxed);
+        assert!(served > 100, "{served} requests of 5000 served");
+        // The device, and the daemon behind it, serve on.
+        let info = bytes::<Info>(VIRTIO_EXTENT_T_INFO, 0, None, &[]);
+        let writable = size_of::<Info>() + RESPONSE;
+        assert_eq!(request(&store, &info, writable).1, 0);
     }
 
     #[test]
