@@ -35,6 +35,9 @@ pub const VCPU_RTSIG_OFFSET: i32 = 0;
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VcpuError {
+    /// fxdax: an access of the guest's stayed refused
+    #[cfg(feature = "fxdax")]
+    AccessRefused,
     /// Error creating vcpu config: {0}
     VcpuConfig(GuestConfigError),
     /// Received error signaling kvm exit: {0}
@@ -294,6 +297,9 @@ impl Vcpu {
                     self.kvm_vcpu.kvmclock_ctrl();
                     return StateMachine::next(Self::paused);
                 }
+                // fxdax: the guest's doing, not the VMM's: a host tells them apart by the status.
+                #[cfg(feature = "fxdax")]
+                Err(VcpuError::AccessRefused) => return self.exit(FcExitCode::AccessRefused),
                 // Emulation errors lead to vCPU exit.
                 Err(_) => return self.exit(FcExitCode::GenericError),
             }
@@ -462,6 +468,11 @@ impl Vcpu {
             #[cfg(feature = "fxdax")]
             Err(ref err) if err.errno() == libc::EFAULT && Efaults::retry(&mut self.efaults) => {
                 Ok(VcpuEmulation::Handled)
+            }
+            #[cfg(feature = "fxdax")]
+            Err(ref err) if err.errno() == libc::EFAULT => {
+                error!("fxdax: vCPU {}: KVM_RUN kept failing with EFAULT", self.kvm_vcpu.index);
+                Err(VcpuError::AccessRefused)
             }
             #[cfg(feature = "gdb")]
             Ok(VcpuExit::Debug(_)) => {
