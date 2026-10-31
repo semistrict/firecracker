@@ -93,7 +93,8 @@ pub struct Extent {
     pub config: ExtentDeviceConfig,
     // The store before the window, whose host memory the store's fault thread serves: the store
     // is dropped first.
-    store: Arc<RemoteExtentStore>,
+    // fxdax: none from a follower's reset until it is activated again.
+    store: Option<Arc<RemoteExtentStore>>,
     window: Option<DaxWindow>,
     /// The window's shared memory region, if the device has a window.
     shm_regions: Vec<VirtioShmRegion>,
@@ -106,9 +107,6 @@ pub struct Extent {
     resizing: Arc<Resizing>,
     /// fxdax: a follower's writer's commits, as the daemon tells of them.
     following: Arc<Following>,
-    /// fxdax: whether a follower's device was reset since its store was opened: it opens it
-    /// anew as the driver activates it again, its guest remounting on a new view (doc-4).
-    reopen: bool,
 
     // VirtIO fields
     avail_features: u64,
@@ -202,13 +200,7 @@ impl Extent {
             ),
         }
         .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
-        // fxdax: with the daemon gone, the guest's disk is gone: the VM stops at once, its exit
-        // status saying why, rather than going on with every request failing (TASK-50.2).
-        let id = config.id.clone();
-        store.on_daemon_lost(move || {
-            error!("extent device {id}: the extent daemon went; stopping the VM");
-            std::process::exit(crate::FcExitCode::ExtentdLost as i32);
-        });
+        stop_with_daemon(&store, &config.id);
         config_space.branch = store.branch().to_le();
         let resizing = Arc::new(Resizing::default());
         let info = store
@@ -271,7 +263,7 @@ impl Extent {
 
         Ok(Self {
             config,
-            store: Arc::new(store),
+            store: Some(Arc::new(store)),
             window,
             shm_regions,
             window_created: false,
@@ -279,7 +271,6 @@ impl Extent {
             config_space,
             resizing,
             following,
-            reopen: false,
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
@@ -300,6 +291,11 @@ impl Extent {
     /// than the guest faulting on each.
     pub fn set_prefault(&mut self, prefault: Arc<dyn PrefaultGuestMemory>) {
         self.prefault = Some(prefault);
+    }
+
+    /// Its store: open, but from a follower's reset until it is activated again.
+    fn store(&self) -> &Arc<RemoteExtentStore> {
+        self.store.as_ref().expect("the device's store is closed")
     }
 
     /// Creates the store's DAX window in the window's host memory, unless the device has no
@@ -323,7 +319,7 @@ impl Extent {
         // SAFETY: The window's host memory is the device's, which only the guest accesses, and
         // which outlives the store's connection, as the store is dropped first.
         unsafe {
-            self.store.create_dax_window_in_host_memory(
+            self.store().create_dax_window_in_host_memory(
                 window.host_memory(),
                 window.len(),
                 prefault,
@@ -335,20 +331,20 @@ impl Extent {
 
     /// fxdax: opens a follower's store anew, as of its writer's latest commit, with a window of
     /// its own, created as the driver activates the device: after a reset, its guest remounting
-    /// on a new view, as it does once it was cut off (`ESTALE`).
+    /// on a new view, as it does once it was cut off (`ESTALE`). The old connection went as it
+    /// reset (`reset_confined`), with its window's faults, before the new one creates its window
+    /// in the same memory, which it left inaccessible meanwhile (TASK-79.8).
     fn reopen(&mut self) -> Result<(), fxdax::Error> {
         let store = RemoteExtentStore::connect_read_only(
             &self.config.extentd_socket,
             &self.config.path_on_host,
         )?;
+        stop_with_daemon(&store, &self.config.id);
         self.following = Arc::new(Following::default());
         hear_commits(&store, &self.following);
         self.config_space.branch = store.branch().to_le();
-        // The old connection goes, with its window's faults, before the new one creates its
-        // window in the same memory, which it leaves inaccessible meanwhile (TASK-79.8).
-        self.store = Arc::new(store);
+        self.store = Some(Arc::new(store));
         self.window_created = false;
-        self.reopen = false;
         Ok(())
     }
 
@@ -382,7 +378,8 @@ impl Extent {
             .filter(|index| self.queues[*index].ready)
             .collect();
         let queues = self.queues.clone();
-        let (queue_events, store) = (&self.queue_events, &self.store);
+        let store = self.store.as_ref().expect("the device's store is closed");
+        let queue_events = &self.queue_events;
         let (resizing, frozen) = (&self.resizing, &self.frozen);
         let spawn = |index: usize| {
             // The worker serves the queue from here on, notified through a copy of its event.
@@ -430,9 +427,10 @@ impl Extent {
                 queue.enable_notif_suppression();
             }
         }
-        // fxdax: once the queues are, so that an activation failing on them leaves the store as
-        // it was, to open anew at the next (TASK-79.8).
-        if self.reopen {
+        // fxdax: once the queues are, so that an activation failing on them leaves the store
+        // closed, to open anew at the next (TASK-79.8), its guest remounting on a new view
+        // (doc-4).
+        if self.store.is_none() {
             self.reopen()
                 .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
         }
@@ -461,11 +459,11 @@ impl Extent {
         // No request is in progress, which could change the window meanwhile.
         self.pause_worker();
         let branch = rand_branch().map_err(|err| ExtentSnapshotError::Branch(id.clone(), err))?;
-        self.store.fork_quiescent(point, branch).map_err(|errno| {
+        self.store().fork_quiescent(point, branch).map_err(|errno| {
             ExtentSnapshotError::Fork(id.clone(), point.display().to_string(), errno)
         })?;
         let mappings = self
-            .store
+            .store()
             .window_mappings()
             .map_err(|errno| ExtentSnapshotError::Mappings(id, errno))?;
         self.snapshot = Some(ExtentSnapshot {
@@ -510,10 +508,21 @@ impl Extent {
     /// Maps the window's mappings of the snapshot the device was restored from again.
     fn map_again(&mut self) -> Result<(), fxdax::Errno> {
         for mapping in std::mem::take(&mut self.mappings) {
-            self.store.map_again(&mapping)?;
+            self.store().map_again(&mapping)?;
         }
         Ok(())
     }
+}
+
+/// fxdax: with the daemon of `store`, the device `id`'s, gone, the guest's disk is gone: the VM
+/// stops at once, its exit status saying why, rather than going on with every request failing
+/// (TASK-50.2).
+fn stop_with_daemon(store: &RemoteExtentStore, id: &str) {
+    let id = id.to_owned();
+    store.on_daemon_lost(move || {
+        error!("extent device {id}: the extent daemon went; stopping the VM");
+        std::process::exit(crate::FcExitCode::ExtentdLost as i32);
+    });
 }
 
 /// fxdax: has `following` hear of the commits of the writer of `store`, a follower's, from the
@@ -692,7 +701,24 @@ impl Extent {
     /// Resets the device (`VirtioDevice::reset`), on a thread under the VMM's seccomp filter.
     fn reset_confined(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
         self.stop_worker();
-        self.reopen = self.config.read_only;
+        // fxdax: a follower lets go of its store now, not as it is activated again: a store its
+        // writer retired, going with writes uncommitted, opens only once it is gone, for its
+        // follower or a new writer, and the guest may not mount for a while (TASK-79.24).
+        // Its guest leaves its window mapped as it unmounts, for the device's going to unmap: this
+        // process would go on mapping pages the daemon, its connection gone, gives others, so they
+        // go first, the daemon's stage operations made as the reply comes (TASK-79.100).
+        if self.config.read_only {
+            if let (Some(store), Some(window), true) =
+                (&self.store, &self.window, self.window_created)
+                && let Err(err) = store.unmap(0, window.len())
+            {
+                error!(
+                    "extent device {}: unmapping its window: {err:#}",
+                    self.config.id
+                );
+            }
+            self.store = None;
+        }
         let DeviceState::Activated(ActiveState { interrupt, .. }) =
             std::mem::replace(&mut self.device_state, DeviceState::Inactive)
         else {
