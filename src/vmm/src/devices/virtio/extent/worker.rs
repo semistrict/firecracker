@@ -71,6 +71,15 @@ impl Served {
     }
 }
 
+/// fxdax: what the device's guest and the daemon tell each other beside requests, which the workers
+/// serve them with: the store's capacity, and whether the guest's filesystem is frozen
+/// (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
+#[derive(Debug, Default)]
+pub(super) struct Notices {
+    pub resizing: Resizing,
+    pub frozen: AtomicBool,
+}
+
 /// What the worker shares with the requests it serves.
 struct Shared {
     queue: Mutex<Queue>,
@@ -79,9 +88,7 @@ struct Shared {
     interrupt: Arc<dyn VirtioInterrupt>,
     mem: GuestMemoryMmap,
     store: Arc<RemoteExtentStore>,
-    resizing: Arc<Resizing>,
-    /// Whether the guest's filesystem is frozen (`VIRTIO_EXTENT_T_FREEZE`).
-    frozen: Arc<AtomicBool>,
+    notices: Arc<Notices>,
     served: Served,
     /// The requests taken off the queue and not yet returned to the driver.
     serving: Mutex<usize>,
@@ -107,9 +114,7 @@ impl Shared {
         let buffers = Buffers::new(&self.mem, chain);
         fxdax::extentd::spawn_on_replies(async move {
             let len = match buffers {
-                Ok(buffers) => {
-                    handle(&shared.store, &shared.resizing, &shared.frozen, buffers).await
-                }
+                Ok(buffers) => handle(&shared.store, &shared.notices, buffers).await,
                 Err(err) => {
                     error!("extent device: {err}");
                     0
@@ -173,8 +178,7 @@ impl Worker {
         interrupt: Arc<dyn VirtioInterrupt>,
         mem: GuestMemoryMmap,
         store: Arc<RemoteExtentStore>,
-        resizing: Arc<Resizing>,
-        frozen: Arc<AtomicBool>,
+        notices: Arc<Notices>,
     ) -> io::Result<Self> {
         let stop = EventFd::new(libc::EFD_NONBLOCK)?;
         let stop_theirs = stop.try_clone()?;
@@ -184,8 +188,7 @@ impl Worker {
             interrupt,
             mem,
             store,
-            resizing,
-            frozen,
+            notices,
             served: Served::default(),
             serving: Mutex::new(0),
             idle: Condvar::new(),
@@ -458,12 +461,7 @@ impl Writer<'_> {
 /// Serves the request whose buffers are `buffers` ([`Buffers::new`]) with `store`, and returns the
 /// length of what the device writes to it: its writable buffers, whose last bytes hold the
 /// response.
-pub(super) async fn handle(
-    store: &RemoteExtentStore,
-    resizing: &Resizing,
-    frozen: &AtomicBool,
-    buffers: Buffers,
-) -> u32 {
+pub(super) async fn handle(store: &RemoteExtentStore, notices: &Notices, buffers: Buffers) -> u32 {
     // The response is the chain's last bytes, after what the request returns.
     let writable = buffers.writable_len();
     let Some(room) = writable.checked_sub(size_of::<Response>()) else {
@@ -477,7 +475,7 @@ pub(super) async fn handle(
     let writer = Writer {
         segments: &buffers.writable,
     };
-    let (status, written) = match serve(store, resizing, frozen, &mut reader, &writer, room).await {
+    let (status, written) = match serve(store, notices, &mut reader, &writer, room).await {
         Ok(written) => (0, written),
         Err(errno) => (errno.raw().cast_unsigned(), 0),
     };
@@ -495,8 +493,7 @@ pub(super) async fn handle(
 /// bytes for it, and returns how many it wrote.
 async fn serve(
     store: &RemoteExtentStore,
-    resizing: &Resizing,
-    frozen: &AtomicBool,
+    notices: &Notices,
     reader: &mut Reader<'_>,
     writer: &Writer<'_>,
     room: usize,
@@ -670,14 +667,16 @@ async fn serve(
             Ok(len)
         }
         VIRTIO_EXTENT_T_FREEZE => {
-            frozen.store(flags & VIRTIO_EXTENT_FREEZE_FROZEN != 0, Ordering::Release);
+            notices
+                .frozen
+                .store(flags & VIRTIO_EXTENT_FREEZE_FROZEN != 0, Ordering::Release);
             Ok(0)
         }
         VIRTIO_EXTENT_T_RESIZED => {
             let args: ResizedArgs = reader.obj()?;
             let capacity = u64::from_le(args.capacity);
             let took = flags & VIRTIO_EXTENT_RESIZED_TOOK != 0;
-            resizing.answered(capacity, took);
+            notices.resizing.answered(capacity, took);
             store.resized_async(capacity, took).await?;
             Ok(0)
         }
@@ -869,12 +868,8 @@ mod tests {
         vq.avail.idx.set(1);
         let chain = queue.pop().unwrap().unwrap();
         let buffers = Buffers::new(&mem, chain).unwrap();
-        let used = futures::executor::block_on(handle(
-            store,
-            &Resizing::default(),
-            &AtomicBool::new(false),
-            buffers,
-        )) as usize;
+        let used =
+            futures::executor::block_on(handle(store, &Notices::default(), buffers)) as usize;
         let mut written = vec![0; writable];
         mem.read_slice(&mut written, WRITABLE).unwrap();
         (used, written)

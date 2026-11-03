@@ -7,17 +7,17 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use fxdax::{ExtentStore, RemoteExtentStore};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefault};
-use super::worker::Worker;
+use super::worker::{Notices, Worker};
 use super::{
     ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
-    MAX_TRANSFER, Resizing, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_FREEZE,
+    MAX_TRANSFER, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_FREEZE,
     VIRTIO_EXTENT_F_RESIZE, VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use super::{
@@ -103,8 +103,9 @@ pub struct Extent {
     /// Maps the window's pages for the guest as the store maps them.
     prefault: Option<Arc<dyn PrefaultGuestMemory>>,
     config_space: ConfigSpace,
-    /// The store's capacity, as the daemon changes it.
-    resizing: Arc<Resizing>,
+    /// The store's capacity, as the daemon changes it; fxdax: and whether the guest's filesystem
+    /// is frozen (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
+    notices: Arc<Notices>,
     /// fxdax: a follower's writer's commits, as the daemon tells of them.
     following: Arc<Following>,
 
@@ -120,9 +121,6 @@ pub struct Extent {
     /// The workers serving the queues the driver set up, by index, while the device is activated,
     /// and not paused for a snapshot (`pause_worker`).
     workers: Vec<(usize, Worker)>,
-    /// fxdax: whether the guest's filesystem is frozen (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot
-    /// needs it.
-    frozen: Arc<AtomicBool>,
     /// fxdax: the snapshot taken of the device's store, or restored from (TASK-39.1).
     snapshot: Option<ExtentSnapshot>,
     /// fxdax: the window's mappings to map again as the window is created: those of the snapshot
@@ -202,15 +200,16 @@ impl Extent {
         .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
         stop_with_daemon(&store, &config.id);
         config_space.branch = store.branch().to_le();
-        let resizing = Arc::new(Resizing::default());
+        let notices = Arc::new(Notices::default());
         let info = store
             .info()
             .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err.into()))?;
-        resizing
+        notices
+            .resizing
             .capacity
             .store(info.capacity, std::sync::atomic::Ordering::Release);
-        let changes = resizing.clone();
-        store.on_capacity(move |capacity, ask| changes.changed(capacity, ask));
+        let changes = notices.clone();
+        store.on_capacity(move |capacity, ask| changes.resizing.changed(capacity, ask));
         let following = Arc::new(Following::default());
         hear_commits(&store, &following);
 
@@ -269,7 +268,7 @@ impl Extent {
             window_created: false,
             prefault: None,
             config_space,
-            resizing,
+            notices,
             following,
             avail_features,
             acked_features: 0,
@@ -281,7 +280,6 @@ impl Extent {
                 .map(|_| EventFd::new(libc::EFD_NONBLOCK).map_err(ExtentError::EventFd))
                 .collect::<Result<_, _>>()?,
             workers: Vec::new(),
-            frozen: Arc::default(),
             snapshot: None,
             mappings: Vec::new(),
         })
@@ -380,7 +378,7 @@ impl Extent {
         let queues = self.queues.clone();
         let store = self.store.as_ref().expect("the device's store is closed");
         let queue_events = &self.queue_events;
-        let (resizing, frozen) = (&self.resizing, &self.frozen);
+        let notices = &self.notices;
         let spawn = |index: usize| {
             // The worker serves the queue from here on, notified through a copy of its event.
             let queue_event = queue_events[index]
@@ -393,8 +391,7 @@ impl Extent {
                 interrupt.clone(),
                 mem.clone(),
                 store.clone(),
-                resizing.clone(),
-                frozen.clone(),
+                notices.clone(),
             )
             .map_err(|err| ActivateError::Extent(format!("starting a worker: {err}")))
         };
@@ -439,7 +436,12 @@ impl Extent {
         self.map_again().map_err(|errno| {
             ActivateError::Extent(format!("mapping the snapshot's window again: {errno}"))
         })?;
-        *self.resizing.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
+        *self
+            .notices
+            .resizing
+            .interrupt
+            .lock()
+            .expect("Poisoned lock") = Some(interrupt.clone());
         *self.following.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         self.resume_worker()
@@ -453,7 +455,7 @@ impl Extent {
         if self.config.read_only {
             return Err(ExtentSnapshotError::ReadOnly(id));
         }
-        if !self.frozen.load(Ordering::Acquire) {
+        if !self.notices.frozen.load(Ordering::Acquire) {
             return Err(ExtentSnapshotError::NotFrozen(id));
         }
         // No request is in progress, which could change the window meanwhile.
@@ -481,7 +483,7 @@ impl Extent {
 
     /// Whether the guest's filesystem is frozen.
     pub(super) fn frozen(&self) -> bool {
-        self.frozen.load(Ordering::Acquire)
+        self.notices.frozen.load(Ordering::Acquire)
     }
 
     /// The window's address in guest memory, if the device has a window.
@@ -500,7 +502,7 @@ impl Extent {
     ) {
         self.queues = queues;
         self.acked_features = acked_features;
-        self.frozen.store(frozen, Ordering::Release);
+        self.notices.frozen.store(frozen, Ordering::Release);
         self.mappings.clone_from(&snapshot.mappings);
         self.snapshot = Some(snapshot);
     }
@@ -609,8 +611,13 @@ impl VirtioDevice for Extent {
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         use std::sync::atomic::Ordering;
         let config = ConfigSpace {
-            capacity: self.resizing.capacity.load(Ordering::Acquire).to_le(),
-            asked: self.resizing.asked.load(Ordering::Acquire).to_le(),
+            capacity: self
+                .notices
+                .resizing
+                .capacity
+                .load(Ordering::Acquire)
+                .to_le(),
+            asked: self.notices.resizing.asked.load(Ordering::Acquire).to_le(),
             committed: self.following.committed.load(Ordering::Acquire).to_le(),
             ..self.config_space
         };
