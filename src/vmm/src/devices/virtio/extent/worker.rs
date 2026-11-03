@@ -23,9 +23,10 @@ use vmm_sys_util::eventfd::EventFd;
 use super::{
     CommitArgs, ExtentIdLe, Info, IoArgs, MAX_ROOT, MAX_TRANSFER, MapArgs, MapEntry, RequestHeader,
     Response, RootLen, UnmapArgs, VIRTIO_EXTENT_COMMIT_DURABLE, VIRTIO_EXTENT_COMMIT_ROOT,
-    VIRTIO_EXTENT_MAP_AHEAD, VIRTIO_EXTENT_MAP_MANY, VIRTIO_EXTENT_MAP_WRITE, VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO,
-    VIRTIO_EXTENT_T_MAP, VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP,
-    VIRTIO_EXTENT_T_WRITE, write_barriers,
+    VIRTIO_EXTENT_MAP_AHEAD, VIRTIO_EXTENT_MAP_MANY, VIRTIO_EXTENT_MAP_WRITE,
+    VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO, VIRTIO_EXTENT_T_MAP,
+    VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP, VIRTIO_EXTENT_T_WRITE,
+    VIRTIO_EXTENT_WRITE_ROOT, write_barriers,
 };
 use super::{
     Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREE_MANY,
@@ -377,9 +378,10 @@ struct Reader<'a> {
     offset: usize,
 }
 
-impl Reader<'_> {
-    /// The next `len` bytes, as the store copies them out of guest memory.
-    fn slices(&mut self, len: usize) -> Result<Vec<fxdax::VolatileSlice<'_>>, Errno> {
+impl<'a> Reader<'a> {
+    /// The next `len` bytes, as the store copies them out of guest memory: as long as the request
+    /// lives, so that what comes after them can be read too.
+    fn slices(&mut self, len: usize) -> Result<Vec<fxdax::VolatileSlice<'a>>, Errno> {
         let parts = range(self.segments, self.offset, len).ok_or(Errno::EINVAL)?;
         self.offset += len;
         Ok(parts
@@ -523,7 +525,17 @@ async fn serve(
             let data = reader.slices(len as usize)?;
             // A barrier before orders, without waiting for durability (doc-4); one after, with
             // WRITE_COMMIT, waits as a COMMIT does. One round trip to the daemon either way.
-            let barriers = write_barriers(flags).ok_or(Errno::EINVAL)?;
+            let mut barriers = write_barriers(flags).ok_or(Errno::EINVAL)?;
+            // fxdax: the root that commit sets, after the data (WRITE_ROOT).
+            let root;
+            if flags & VIRTIO_EXTENT_WRITE_ROOT != 0 {
+                let len = u32::from_le(args.root_len);
+                if len > MAX_ROOT {
+                    return Err(Errno::EINVAL);
+                }
+                root = reader.bytes(len as usize)?;
+                barriers.root = Some(&root);
+            }
             store
                 .write_with_barriers_async(
                     args.id.into(),
@@ -712,6 +724,7 @@ mod tests {
 
     use super::super::{
         VIRTIO_EXTENT_WRITE_BARRIER, VIRTIO_EXTENT_WRITE_COMMIT, VIRTIO_EXTENT_WRITE_DURABLE,
+        VIRTIO_EXTENT_WRITE_ROOT,
     };
     use super::*;
     use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -903,7 +916,7 @@ mod tests {
             },
             offset,
             len: len as u32,
-            reserved: 0,
+            root_len: 0,
         }
     }
 
@@ -1140,6 +1153,47 @@ mod tests {
         let (written, status) = request(&store, &info, INFO_LEN_WITHOUT_BRANCH + RESPONSE);
         assert_eq!(status, 0);
         assert_eq!(written.len(), INFO_LEN_WITHOUT_BRANCH);
+
+        // fxdax: a WRITE's commit sets the root after its data, which isn't the data's; there is
+        // no root without a commit to set it.
+        let data = [7u8; BLOCK];
+        let rooted = IoArgs {
+            root_len: 6,
+            ..io(&store, 1, 0, BLOCK)
+        };
+        let flags = VIRTIO_EXTENT_WRITE_COMMIT | VIRTIO_EXTENT_WRITE_ROOT;
+        let write = bytes(
+            VIRTIO_EXTENT_T_WRITE,
+            flags,
+            Some(rooted),
+            &[&data[..], b"second"].concat(),
+        );
+        assert_eq!(request(&store, &write, RESPONSE), (vec![], 0));
+        let (written, status) = request(&store, &root, root_len + RESPONSE);
+        assert_eq!(status, 0);
+        assert_eq!(&written[..6], b"second");
+        let mut read = vec![0; BLOCK];
+        store
+            .read(
+                io(&store, 1, 0, BLOCK).id.into(),
+                0,
+                &mut [fxdax::VolatileSliceMut::from(&mut read[..])],
+            )
+            .unwrap();
+        assert_eq!(read, data);
+        let uncommitted = bytes(
+            VIRTIO_EXTENT_T_WRITE,
+            VIRTIO_EXTENT_WRITE_ROOT,
+            Some(IoArgs {
+                root_len: 5,
+                ..io(&store, 2, 0, BLOCK)
+            }),
+            &[&data[..], b"third"].concat(),
+        );
+        assert_eq!(
+            request(&store, &uncommitted, RESPONSE).1,
+            errno(Errno::EINVAL)
+        );
     }
 
     /// fxdax: a follower's device reads its writer's store as of its view's commit, advances to

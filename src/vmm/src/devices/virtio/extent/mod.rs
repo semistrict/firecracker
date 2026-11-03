@@ -85,17 +85,23 @@ pub const VIRTIO_EXTENT_T_UNPIN: u32 = 14;
 pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_UNPIN;
 
 /// A `WRITE`'s flags: a barrier precedes it, as if a `COMMIT` did; a `COMMIT` follows it (with
-/// `WRITE_COMMIT`); that commit completes once durable.
+/// `WRITE_COMMIT`); that commit completes once durable; fxdax: that commit sets the root, which
+/// follows the data, of `IoArgs::root_len` bytes.
 pub const VIRTIO_EXTENT_WRITE_BARRIER: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_WRITE_COMMIT: u32 = 1 << 1;
 pub const VIRTIO_EXTENT_WRITE_DURABLE: u32 = 1 << 2;
+pub const VIRTIO_EXTENT_WRITE_ROOT: u32 = 1 << 3;
 
-/// The barriers a `WRITE`'s `flags` order it with, unless they are not a `WRITE`'s.
-pub fn write_barriers(flags: u32) -> Option<fxdax::WriteBarriers> {
-    let known =
-        VIRTIO_EXTENT_WRITE_BARRIER | VIRTIO_EXTENT_WRITE_COMMIT | VIRTIO_EXTENT_WRITE_DURABLE;
+/// The barriers a `WRITE`'s `flags` order it with, unless they are not a `WRITE`'s; the root that
+/// `WRITE_ROOT` sets the caller reads, after the data.
+pub fn write_barriers(flags: u32) -> Option<fxdax::WriteBarriers<'static>> {
+    let known = VIRTIO_EXTENT_WRITE_BARRIER
+        | VIRTIO_EXTENT_WRITE_COMMIT
+        | VIRTIO_EXTENT_WRITE_DURABLE
+        | VIRTIO_EXTENT_WRITE_ROOT;
+    let commit = flags & VIRTIO_EXTENT_WRITE_COMMIT != 0;
     if flags & !known != 0
-        || (flags & VIRTIO_EXTENT_WRITE_DURABLE != 0 && flags & VIRTIO_EXTENT_WRITE_COMMIT == 0)
+        || (flags & (VIRTIO_EXTENT_WRITE_DURABLE | VIRTIO_EXTENT_WRITE_ROOT) != 0 && !commit)
     {
         return None;
     }
@@ -109,6 +115,7 @@ pub fn write_barriers(flags: u32) -> Option<fxdax::WriteBarriers> {
     Some(fxdax::WriteBarriers {
         before: flags & VIRTIO_EXTENT_WRITE_BARRIER != 0,
         after,
+        root: None,
     })
 }
 /// fxdax: a `FREE`'s flags: its data names more extents to free, each a `virtio_extent_id`
@@ -172,7 +179,8 @@ pub struct IoArgs {
     pub id: ExtentIdLe,
     pub offset: u64,
     pub len: u32,
-    pub reserved: u32,
+    /// fxdax: a `WRITE`'s with `WRITE_ROOT`: the root's bytes, after the data.
+    pub root_len: u32,
 }
 
 /// `MAP`'s arguments.
