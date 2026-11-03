@@ -29,10 +29,10 @@ use super::{
     VIRTIO_EXTENT_WRITE_ROOT, write_barriers,
 };
 use super::{
-    Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREE_MANY,
-    VIRTIO_EXTENT_FREEZE_FROZEN, VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_ADVANCE,
-    VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO, VIRTIO_EXTENT_T_PIN,
-    VIRTIO_EXTENT_T_RESIZED, VIRTIO_EXTENT_T_UNPIN,
+    Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, SealedArgs, Sealing,
+    VIRTIO_EXTENT_FREE_MANY, VIRTIO_EXTENT_FREEZE_FROZEN, VIRTIO_EXTENT_RESIZED_TOOK,
+    VIRTIO_EXTENT_T_ADVANCE, VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO,
+    VIRTIO_EXTENT_T_PIN, VIRTIO_EXTENT_T_RESIZED, VIRTIO_EXTENT_T_SEALED, VIRTIO_EXTENT_T_UNPIN,
 };
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
@@ -72,11 +72,12 @@ impl Served {
 }
 
 /// fxdax: what the device's guest and the daemon tell each other beside requests, which the workers
-/// serve them with: the store's capacity, and whether the guest's filesystem is frozen
-/// (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
+/// serve them with: the store's capacity, the asks to seal, and whether the guest's filesystem is
+/// frozen (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
 #[derive(Debug, Default)]
 pub(super) struct Notices {
     pub resizing: Resizing,
+    pub sealing: Sealing,
     pub frozen: AtomicBool,
 }
 
@@ -678,6 +679,14 @@ async fn serve(
             let took = flags & VIRTIO_EXTENT_RESIZED_TOOK != 0;
             notices.resizing.answered(capacity, took);
             store.resized_async(capacity, took).await?;
+            Ok(0)
+        }
+        // fxdax: the guest's answer to the daemon's ask that it seal (`VIRTIO_EXTENT_F_SEAL`).
+        VIRTIO_EXTENT_T_SEALED => {
+            let args: SealedArgs = reader.obj()?;
+            let asked = u64::from_le(args.asked);
+            notices.sealing.answered(asked);
+            store.sealed_async(asked).await?;
             Ok(0)
         }
         // fxdax: a follower's (doc-4's F_READ_ONLY); a writer's store refuses them (EINVAL).

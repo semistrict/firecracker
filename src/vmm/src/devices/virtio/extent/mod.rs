@@ -55,6 +55,11 @@ pub const VIRTIO_EXTENT_F_MAP_MANY: u32 = 7;
 /// next, as it maps them to read, and the device maps them for it ahead of its accesses, as it does
 /// writable ones, rather than the hypervisor one fault at a time (TASK-112.1).
 pub const VIRTIO_EXTENT_F_MAP_AHEAD: u32 = 8;
+/// fxdax: the configuration's `seal_asked` asks the guest to seal what it holds open, changing as
+/// the daemon asks, which tells it with a configuration change, and the guest answers
+/// (`VIRTIO_EXTENT_T_SEALED`): its open extents' pages, which nothing else lets go of, hold the
+/// memory another guest's writable `MAP` was refused for (TASK-153.15).
+pub const VIRTIO_EXTENT_F_SEAL: u32 = 9;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -81,8 +86,11 @@ pub const VIRTIO_EXTENT_T_LET_GO: u32 = 12;
 /// fxdax: keeps an extent the view holds, whatever commit it advances to, until `UNPIN`.
 pub const VIRTIO_EXTENT_T_PIN: u32 = 13;
 pub const VIRTIO_EXTENT_T_UNPIN: u32 = 14;
+/// fxdax (`VIRTIO_EXTENT_F_SEAL`): the guest has sealed, as the ask its argument names asked it to
+/// (`SealedArgs`).
+pub const VIRTIO_EXTENT_T_SEALED: u32 = 15;
 /// The last request type.
-pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_UNPIN;
+pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_SEALED;
 
 /// A `WRITE`'s flags: a barrier precedes it, as if a `COMMIT` did; a `COMMIT` follows it (with
 /// `WRITE_COMMIT`); that commit completes once durable; fxdax: that commit sets the root, which
@@ -261,6 +269,14 @@ pub struct ResizedArgs {
     pub capacity: u64,
 }
 
+/// fxdax: `VIRTIO_EXTENT_T_SEALED`'s arguments: the ask answered, as `ConfigSpace::seal_asked` said
+/// it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct SealedArgs {
+    pub asked: u64,
+}
+
 /// fxdax: what the device knows of its store's capacity, which the daemon changes
 /// (`RemoteExtentStore::on_capacity`): the capacity, the shrink the guest is asked to take, if any
 /// (0 if none), and how the guest is told, once the driver activates the device. The daemon's
@@ -316,6 +332,65 @@ impl Resizing {
     }
 }
 
+/// fxdax: the daemon's ask that the guest seal what it holds open (`VIRTIO_EXTENT_F_SEAL`,
+/// `RemoteExtentStore::on_seal`): the ask's number until the guest answers, 0 if none, and how the
+/// guest is told, while its driver takes asks (TASK-153.15). The daemon numbers its asks, the
+/// latest answered answering those before it.
+#[derive(Default)]
+pub struct Sealing {
+    pub asked: AtomicU64,
+    /// How the guest is told, if its driver takes asks: from its activation until its reset.
+    pub interrupt: Mutex<Option<Arc<dyn VirtioInterrupt>>>,
+}
+
+impl std::fmt::Debug for Sealing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sealing")
+            .field("asked", &self.asked)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Sealing {
+    /// The daemon asks the guest to seal, its ask `number`: the guest is told, with a
+    /// configuration change, if its driver takes asks. Whether it does: if not, nothing seals,
+    /// which is the daemon's answer.
+    pub fn ask(&self, number: u64) -> bool {
+        let interrupt = self.interrupt.lock().expect("Poisoned lock");
+        let Some(interrupt) = &*interrupt else {
+            return false;
+        };
+        self.asked.store(number, Ordering::Release);
+        if let Err(err) = interrupt.trigger(VirtioInterruptType::Config) {
+            crate::logger::error!("extent device: signalling a configuration change: {err:?}");
+        }
+        true
+    }
+
+    /// The guest answered the ask of `number`: no ask is outstanding, unless the daemon has made
+    /// another since.
+    pub fn answered(&self, number: u64) {
+        let _ = self
+            .asked
+            .compare_exchange(number, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// Asks are told the guest through `interrupt` from now on, its driver taking them; or, if
+    /// `None`, its device reset, no more: the ask outstanding, if any, which no guest will answer
+    /// now, returned for the device to answer.
+    pub fn told_through(&self, interrupt: Option<Arc<dyn VirtioInterrupt>>) -> Option<u64> {
+        let mut told = self.interrupt.lock().expect("Poisoned lock");
+        let stopped = interrupt.is_none();
+        *told = interrupt;
+        let asked = if stopped {
+            self.asked.swap(0, Ordering::AcqRel)
+        } else {
+            0
+        };
+        (asked != 0).then_some(asked)
+    }
+}
+
 /// fxdax: what a follower's device knows of its writer's commits (`VIRTIO_EXTENT_F_READ_ONLY`,
 /// `RemoteExtentStore::on_committed`): the latest commit's epoch, and how the guest is told, once
 /// the driver activates the device.
@@ -368,6 +443,9 @@ pub struct ConfigSpace {
     pub asked: u64,
     /// fxdax: the epoch of the latest commit of a follower's writer (`VIRTIO_EXTENT_F_READ_ONLY`).
     pub committed: u64,
+    /// fxdax: the daemon's ask that the guest seal, its number, or 0 if none
+    /// (`VIRTIO_EXTENT_F_SEAL`).
+    pub seal_asked: u64,
 }
 
 // SAFETY: They are plain data, with no implicit padding.
@@ -378,6 +456,8 @@ unsafe impl ByteValued for RequestHeader {}
 unsafe impl ByteValued for Response {}
 // SAFETY: As above.
 unsafe impl ByteValued for ResizedArgs {}
+// SAFETY: As above.
+unsafe impl ByteValued for SealedArgs {}
 // SAFETY: As above.
 unsafe impl ByteValued for IoArgs {}
 // SAFETY: As above.
@@ -433,5 +513,29 @@ mod tests {
         resizing.changed(4, false);
         resizing.answered(2, true);
         assert_eq!(known(&resizing), (4, 0));
+    }
+
+    /// fxdax TASK-153.15: an ask to seal reaches a guest whose driver takes asks, from its
+    /// activation to its reset, which leaves the ask outstanding for the device to answer; an
+    /// answer to an ask the daemon has made another since leaves the newer asked.
+    #[test]
+    fn asks_to_seal_reach_drivers_that_take_them() {
+        use crate::devices::virtio::test_utils::default_interrupt;
+        let sealing = Sealing::default();
+        let asked = |sealing: &Sealing| sealing.asked.load(Ordering::Acquire);
+        assert!(!sealing.ask(1), "asked of no driver");
+        assert_eq!(asked(&sealing), 0);
+        assert_eq!(sealing.told_through(Some(default_interrupt())), None);
+        assert!(sealing.ask(2));
+        assert!(sealing.ask(3));
+        sealing.answered(2);
+        assert_eq!(asked(&sealing), 3);
+        sealing.answered(3);
+        assert_eq!(asked(&sealing), 0);
+        assert!(sealing.ask(4));
+        assert_eq!(sealing.told_through(None), Some(4));
+        assert_eq!(asked(&sealing), 0);
+        assert!(!sealing.ask(5), "asked once reset");
+        assert_eq!(sealing.told_through(None), None);
     }
 }
