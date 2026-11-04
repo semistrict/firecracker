@@ -60,6 +60,14 @@ pub const VIRTIO_EXTENT_F_MAP_AHEAD: u32 = 8;
 /// (`VIRTIO_EXTENT_T_SEALED`): its open extents' pages, which nothing else lets go of, hold the
 /// memory another guest's writable `MAP` was refused for (TASK-153.15).
 pub const VIRTIO_EXTENT_F_SEAL: u32 = 9;
+/// fxdax: the DAX window copies on write (fxdax's backlog doc-13): it maps sealed extents and
+/// zeros alone, read-only (`MAP_WRITE` refused, `MAP_ZEROS` taken), and a store to a page of it
+/// gives the device a private page holding what the page held, mapped writable at the same
+/// address, until a `MAP` or `UNMAP` over it; past the configuration's `private_max` private pages
+/// a store is refused, and the VM stops. `PRIVATE` makes pages private ahead of stores. Needs
+/// `DAX`; a driver takes it or `DAX_WRITE`, not both; excludes `READ_ONLY`. Bit 10, beside
+/// `DAX_WRITE`, as stage 1 offers both (bit 9 is `SEAL`'s).
+pub const VIRTIO_EXTENT_F_DAX_COW: u32 = 10;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -89,8 +97,12 @@ pub const VIRTIO_EXTENT_T_UNPIN: u32 = 14;
 /// fxdax (`VIRTIO_EXTENT_F_SEAL`): the guest has sealed, as the ask its argument names asked it to
 /// (`SealedArgs`).
 pub const VIRTIO_EXTENT_T_SEALED: u32 = 15;
+/// fxdax (`VIRTIO_EXTENT_F_DAX_COW`): makes the window's `len` bytes at `window_offset` private
+/// now, as stores would, mapped for the guest ahead of its accesses: `ENOMEM`, none made private,
+/// past `private_max`; `EINVAL` where nothing is mapped (`UnmapArgs` are its arguments).
+pub const VIRTIO_EXTENT_T_PRIVATE: u32 = 16;
 /// The last request type.
-pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_SEALED;
+pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_PRIVATE;
 
 /// A `WRITE`'s flags: a barrier precedes it, as if a `COMMIT` did; a `COMMIT` follows it (with
 /// `WRITE_COMMIT`); that commit completes once durable; fxdax: that commit sets the root, which
@@ -134,10 +146,13 @@ pub const VIRTIO_EXTENT_FREE_MANY: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_DURABLE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_ROOT: u32 = 1 << 1;
 /// A `MAP`'s flag: writable, which needs `DAX_WRITE`. fxdax: and its data holds more maps
-/// (`F_MAP_MANY`); and the guest accesses the pages next (`F_MAP_AHEAD`).
+/// (`F_MAP_MANY`); and the guest accesses the pages next (`F_MAP_AHEAD`); and zeros, its extent and
+/// offset ignored, read-only, which needs `DAX_COW` (`F_DAX_COW`), as each of a `MAP_MANY`'s maps
+/// may be.
 pub const VIRTIO_EXTENT_MAP_WRITE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_MAP_MANY: u32 = 1 << 1;
 pub const VIRTIO_EXTENT_MAP_AHEAD: u32 = 1 << 2;
+pub const VIRTIO_EXTENT_MAP_ZEROS: u32 = 1 << 3;
 
 /// The device's queues, and their size: request queues, interchangeable, which a driver may use one
 /// per CPU of (fxdax TASK-26.18.5).
@@ -446,6 +461,8 @@ pub struct ConfigSpace {
     /// fxdax: the daemon's ask that the guest seal, its number, or 0 if none
     /// (`VIRTIO_EXTENT_F_SEAL`).
     pub seal_asked: u64,
+    /// fxdax: the most private pages the window holds (`VIRTIO_EXTENT_F_DAX_COW`, backlog doc-13).
+    pub private_max: u64,
 }
 
 // SAFETY: They are plain data, with no implicit padding.

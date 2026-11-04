@@ -48,6 +48,7 @@ mod tests {
             path_on_host: "/store".into(),
             capacity: 1 << 30,
             dax_window_size: Some(64 << 20),
+            dax_private_max: None,
             extentd_socket: "/extentd.sock".into(),
             read_only: false,
         };

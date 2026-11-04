@@ -34,6 +34,7 @@ use super::{
     VIRTIO_EXTENT_T_ADVANCE, VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO,
     VIRTIO_EXTENT_T_PIN, VIRTIO_EXTENT_T_RESIZED, VIRTIO_EXTENT_T_SEALED, VIRTIO_EXTENT_T_UNPIN,
 };
+use super::{VIRTIO_EXTENT_MAP_ZEROS, VIRTIO_EXTENT_T_PRIVATE};
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::{error, info};
@@ -564,7 +565,14 @@ async fn serve(
         }
         VIRTIO_EXTENT_T_MAP => {
             let args: MapArgs = reader.obj()?;
-            let map_flags = VIRTIO_EXTENT_MAP_WRITE | VIRTIO_EXTENT_MAP_AHEAD;
+            // fxdax: a window that copies on write (DAX_COW) maps zeros, and nothing writably;
+            // one that doesn't maps no zeros (backlog doc-13).
+            let map_flags = VIRTIO_EXTENT_MAP_AHEAD
+                | if store.copies_on_write() {
+                    VIRTIO_EXTENT_MAP_ZEROS
+                } else {
+                    VIRTIO_EXTENT_MAP_WRITE
+                };
             if flags & !(map_flags | VIRTIO_EXTENT_MAP_MANY) != 0 {
                 return Err(Errno::EINVAL);
             }
@@ -588,15 +596,19 @@ async fn serve(
                 let (window_offset, len) =
                     (u64::from_le(args.window_offset), u64::from_le(args.len));
                 let writable = flags & VIRTIO_EXTENT_MAP_WRITE != 0;
-                store
-                    .map_async(
-                        args.id.into(),
-                        u64::from_le(args.offset),
-                        len,
-                        window_offset,
-                        writable,
-                    )
-                    .await?;
+                if flags & VIRTIO_EXTENT_MAP_ZEROS != 0 {
+                    store.map_zeros_async(window_offset, len).await?;
+                } else {
+                    store
+                        .map_async(
+                            args.id.into(),
+                            u64::from_le(args.offset),
+                            len,
+                            window_offset,
+                            writable,
+                        )
+                        .await?;
+                }
                 if !writable && flags & VIRTIO_EXTENT_MAP_AHEAD != 0 {
                     store.prefault(window_offset, len);
                 }
@@ -609,6 +621,17 @@ async fn serve(
             let args: UnmapArgs = reader.obj()?;
             store
                 .unmap_async(u64::from_le(args.window_offset), u64::from_le(args.len))
+                .await?;
+            Ok(0)
+        }
+        // fxdax: a window that copies on write's (DAX_COW, backlog doc-13), its arguments UNMAP's.
+        VIRTIO_EXTENT_T_PRIVATE => {
+            if flags != 0 || !store.copies_on_write() {
+                return Err(Errno::EINVAL);
+            }
+            let args: UnmapArgs = reader.obj()?;
+            store
+                .make_private_async(u64::from_le(args.window_offset), u64::from_le(args.len))
                 .await?;
             Ok(0)
         }
@@ -1294,7 +1317,7 @@ mod tests {
         };
         let branch = prop_oneof![Just(store.branch()), any::<u64>()];
         let args = (branch, 0u64..64, near_or_far(), near_or_far(), any::<u32>());
-        let word = || prop_oneof![0u32..16, any::<u32>()];
+        let word = || prop_oneof![0u32..18, any::<u32>()];
         let data = proptest::collection::vec(any::<u8>(), 0..2 * BLOCK);
         let requests = (word(), word(), args, data, 0usize..4 * BLOCK);
         let config = Config {
@@ -1385,6 +1408,16 @@ mod tests {
         }
         let map = bytes(VIRTIO_EXTENT_T_MAP, 1 << 3, Some(MapArgs::default()), &[]);
         assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::EINVAL));
+        // fxdax: zeros, and PRIVATE, of a window that doesn't copy on write (doc-13).
+        let map = bytes(
+            VIRTIO_EXTENT_T_MAP,
+            VIRTIO_EXTENT_MAP_MANY,
+            Some(MapArgs::default()),
+            &entries(&[VIRTIO_EXTENT_MAP_ZEROS]),
+        );
+        assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::EINVAL));
+        let private = bytes(VIRTIO_EXTENT_T_PRIVATE, 0, Some(UnmapArgs::default()), &[]);
+        assert_eq!(request(&store, &private, RESPONSE).1, errno(Errno::EINVAL));
         let map = bytes(
             VIRTIO_EXTENT_T_MAP,
             VIRTIO_EXTENT_MAP_MANY,

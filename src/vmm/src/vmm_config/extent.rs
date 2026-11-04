@@ -16,6 +16,8 @@ pub enum ExtentConfigError {
     InvalidTag(String),
     /// The DAX window's size, {0:#x} bytes, is not a nonzero multiple of 2 MiB
     InvalidDaxWindowSize(u64),
+    /// The DAX window's private pages, {0}, are none, or more than it has pages, or it has no window
+    InvalidDaxPrivateMax(u64),
 }
 
 /// An extent-store device: the store of extents that a guest running fxdax's Fxfs itself keeps
@@ -35,6 +37,12 @@ pub struct ExtentDeviceConfig {
     /// files' data from: none without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dax_window_size: Option<u64>,
+    /// fxdax: the most private pages the window holds for a guest that copies on write (doc-4's
+    /// `DAX_COW`, fxdax's backlog doc-13), which fxdax's extent daemon reserves against the
+    /// store's tenant's memory as the guest activates the device: a quarter of the window's pages
+    /// without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dax_private_max: Option<u64>,
     /// The socket of fxdax's extent daemon, which serves the store.
     pub extentd_socket: String,
     /// fxdax: whether the device follows the store, read-only, as another VM writes it (fxdax's
@@ -61,6 +69,15 @@ impl ExtentBuilder {
         {
             return Err(ExtentConfigError::InvalidDaxWindowSize(size));
         }
+        // fxdax: some of the window's pages, of a window (doc-13).
+        if let Some(most) = config.dax_private_max {
+            // SAFETY: Plain system call.
+            let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+            let pages = config.dax_window_size.unwrap_or(0) / page_size;
+            if most == 0 || most > pages {
+                return Err(ExtentConfigError::InvalidDaxPrivateMax(most));
+            }
+        }
         match self.configs.iter_mut().find(|c| c.id == config.id) {
             Some(existing) => *existing = config,
             None => self.configs.push(config),
@@ -80,6 +97,7 @@ mod tests {
             path_on_host: "/store".into(),
             capacity: 1 << 30,
             dax_window_size: Some(64 << 20),
+            dax_private_max: None,
             extentd_socket: "/extentd.sock".into(),
             read_only: false,
         }
@@ -111,9 +129,26 @@ mod tests {
             builder.insert(unaligned),
             Err(ExtentConfigError::InvalidDaxWindowSize(3 << 20 >> 1))
         );
+        // fxdax: some of the window's pages private at most, of a window.
+        for most in [0, (64 << 20) / 4096 * 2] {
+            let mut private = config("a");
+            private.dax_private_max = Some(most);
+            assert_eq!(
+                builder.insert(private),
+                Err(ExtentConfigError::InvalidDaxPrivateMax(most))
+            );
+        }
+        let mut private = config("a");
+        private.dax_private_max = Some(16);
+        builder.insert(private).unwrap();
         let mut none = config("a");
         none.dax_window_size = None;
-        builder.insert(none).unwrap();
+        builder.insert(none.clone()).unwrap();
+        none.dax_private_max = Some(1);
+        assert_eq!(
+            builder.insert(none),
+            Err(ExtentConfigError::InvalidDaxPrivateMax(1))
+        );
         assert_eq!(builder.configs.len(), 1);
     }
 

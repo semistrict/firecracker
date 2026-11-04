@@ -51,6 +51,8 @@ pub struct ExtentConfigState {
     pub path_on_host: String,
     pub capacity: u64,
     pub dax_window_size: Option<u64>,
+    /// fxdax: the window's private pages at most, as configured (doc-13).
+    pub dax_private_max: Option<u64>,
     pub extentd_socket: String,
 }
 
@@ -62,6 +64,7 @@ impl From<&ExtentDeviceConfig> for ExtentConfigState {
             path_on_host: config.path_on_host.clone(),
             capacity: config.capacity,
             dax_window_size: config.dax_window_size,
+            dax_private_max: config.dax_private_max,
             extentd_socket: config.extentd_socket.clone(),
         }
     }
@@ -77,6 +80,7 @@ impl From<&ExtentConfigState> for ExtentDeviceConfig {
             path_on_host: config.path_on_host.clone(),
             capacity: config.capacity,
             dax_window_size: config.dax_window_size,
+            dax_private_max: config.dax_private_max,
             extentd_socket: config.extentd_socket.clone(),
             read_only: false,
         }

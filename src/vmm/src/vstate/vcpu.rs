@@ -244,6 +244,11 @@ impl Vcpu {
                 // before the vCPU's seccomp filter, which allows neither its `mmap` nor its
                 // `mprotect`.
                 crate::signal_handler::install_signal_stack();
+                // fxdax: this thread's faults on a DAX window that copies on write are the
+                // guest's own accesses, a store a store, unlike KVM's asynchronous page fault's
+                // worker's (fxdax's backlog doc-13).
+                #[cfg(feature = "fxdax")]
+                fxdax::guest_thread_started();
                 let filter = &*seccomp_filter;
                 self.register_kick_signal_handler();
                 // Synchronization to make sure thread local data is initialized.
@@ -471,6 +476,10 @@ impl Vcpu {
             }
             #[cfg(feature = "fxdax")]
             Err(ref err) if err.errno() == libc::EFAULT && Efaults::retry(&mut self.efaults) => {
+                // fxdax: a store KVM's worker's write left a DAX window's page read-only for, which
+                // the window copies on write, is let fault to it as the access is retried
+                // (`fxdax::guest_access_failed`, backlog doc-13).
+                fxdax::guest_access_failed();
                 Ok(VcpuEmulation::Handled)
             }
             #[cfg(feature = "fxdax")]

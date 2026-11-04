@@ -1300,6 +1300,7 @@ mod tests {
                 path_on_host: String::new(),
                 capacity: 0,
                 dax_window_size: None,
+                dax_private_max: None,
                 extentd_socket: String::new(),
                 read_only: false,
             },

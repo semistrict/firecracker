@@ -21,7 +21,8 @@ use super::{
     VIRTIO_EXTENT_F_RESIZE, VIRTIO_EXTENT_F_SEAL, VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use super::{
-    Following, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_AHEAD, VIRTIO_EXTENT_F_MAP_MANY, VIRTIO_EXTENT_F_READ_ONLY,
+    Following, VIRTIO_EXTENT_F_DAX_COW, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_AHEAD,
+    VIRTIO_EXTENT_F_MAP_MANY, VIRTIO_EXTENT_F_READ_ONLY,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
@@ -172,6 +173,7 @@ impl Extent {
             asked: 0,
             committed: 0,
             seal_asked: 0,
+            private_max: 0,
         };
         let tag = config.tag.as_bytes();
         if tag.len() > config_space.tag.len() {
@@ -257,9 +259,15 @@ impl Extent {
                 avail_features |= (1 << VIRTIO_EXTENT_F_DAX)
                     | (1 << VIRTIO_EXTENT_F_MAP_MANY)
                     | (1 << VIRTIO_EXTENT_F_MAP_AHEAD);
-                // The store maps open extents writably too (doc-4's DAX_WRITE): a writer's.
+                // The store maps open extents writably too (doc-4's DAX_WRITE): a writer's. fxdax:
+                // or copies on write (DAX_COW, backlog doc-13), of a quarter of the window's pages
+                // at most unless configured, which the guest takes instead.
                 if !config.read_only {
-                    avail_features |= 1 << VIRTIO_EXTENT_F_DAX_WRITE;
+                    avail_features |=
+                        (1 << VIRTIO_EXTENT_F_DAX_WRITE) | (1 << VIRTIO_EXTENT_F_DAX_COW);
+                    let pages = window.len() / fxdax::pages::page_size();
+                    let private_max = config.dax_private_max.unwrap_or(pages / 4).max(1);
+                    config_space.private_max = private_max.to_le();
                 }
                 Some(window)
             }
@@ -320,14 +328,24 @@ impl Extent {
                     prefault,
                 })
             });
+        // fxdax: one that copies on write, for a guest that took DAX_COW (backlog doc-13).
+        let copying = self.acked_features & (1u64 << VIRTIO_EXTENT_F_DAX_COW) != 0;
         // SAFETY: The window's host memory is the device's, which only the guest accesses, and
         // which outlives the store's connection, as the store is dropped first.
         unsafe {
-            self.store().create_dax_window_in_host_memory(
-                window.host_memory(),
-                window.len(),
-                prefault,
-            )
+            match copying {
+                false => self.store().create_dax_window_in_host_memory(
+                    window.host_memory(),
+                    window.len(),
+                    prefault,
+                ),
+                true => self.store().create_copying_dax_window_in_host_memory(
+                    window.host_memory(),
+                    window.len(),
+                    prefault,
+                    u64::from_le(self.config_space.private_max),
+                ),
+            }
         }?;
         self.window_created = true;
         Ok(())
@@ -420,6 +438,13 @@ impl Extent {
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
         assert!(!self.is_activated());
+        // fxdax: a guest takes writable DAX or copy-on-write DAX, not both (backlog doc-13).
+        let both = (1u64 << VIRTIO_EXTENT_F_DAX_WRITE) | (1u64 << VIRTIO_EXTENT_F_DAX_COW);
+        if self.acked_features & both == both {
+            return Err(ActivateError::Extent(
+                "the driver took both DAX_WRITE and DAX_COW".to_owned(),
+            ));
+        }
         // fxdax: those the driver set up, one per CPU of the guest's, up to the device's.
         let event_idx = self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
