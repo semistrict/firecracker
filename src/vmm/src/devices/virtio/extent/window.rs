@@ -12,7 +12,7 @@
 
 use std::io;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use vm_allocator::{AllocPolicy, RangeInclusive};
 
@@ -161,6 +161,10 @@ impl DaxWindow {
     fn in_range(vm: Arc<KvmVm>, guest: GuestRange) -> Result<Self, DaxWindowError> {
         let host = HostMemory::map(u64_to_usize(guest.len))?;
         let slot = KvmMemSlot::new(vm, guest.start, guest.len, host.base.as_ptr() as u64, 0)?;
+        WINDOWS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((guest.start, guest.len, host.base.as_ptr() as usize));
         Ok(Self {
             _slot: slot,
             host,
@@ -182,6 +186,30 @@ impl DaxWindow {
     pub(super) fn host_memory(&self) -> NonNull<u8> {
         self.host.base
     }
+}
+
+impl Drop for DaxWindow {
+    fn drop(&mut self) {
+        let mut windows = WINDOWS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let this = (self.guest.start, self.guest.len, self.host.base.as_ptr() as usize);
+        windows.retain(|window| *window != this);
+    }
+}
+
+/// fxdax: the DAX windows of this process's guest, as their guest physical addresses, lengths
+/// and host memory: where a vCPU whose access keeps failing finds what it failed at
+/// ([`dax_window_at`]).
+static WINDOWS: Mutex<Vec<(u64, u64, usize)>> = Mutex::new(Vec::new());
+
+/// fxdax: the DAX window guest physical address `gpa` is in, if any: its offset there, and the
+/// host address KVM maps there, which fxdax's second stage of the window is in
+/// (`fxdax::describe_windows`).
+pub fn dax_window_at(gpa: u64) -> Option<(u64, usize)> {
+    let windows = WINDOWS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let within = |&&(start, len, _): &&(u64, u64, usize)| (start..start + len).contains(&gpa);
+    let &(start, _, host) = windows.iter().find(within)?;
+    let offset = gpa - start;
+    Some((offset, host + u64_to_usize(offset)))
 }
 
 /// Maps guest memory for the guest ahead of its accesses, as KVM's `KVM_PRE_FAULT_MEMORY` does,
