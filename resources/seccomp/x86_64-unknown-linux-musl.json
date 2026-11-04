@@ -4,6 +4,45 @@
         "filter_action": "allow",
         "filter": [
                 {
+                    "syscall": "memfd_create",
+                    "comment": "fxdax: a copy-on-write DAX window's private pages, laid out like the window (doc-13)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 1,
+                            "comment": "MFD_CLOEXEC"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "fallocate",
+                    "comment": "fxdax: a private page let go of as the guest's MAP or UNMAP ends it (doc-13)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 3,
+                            "comment": "FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE"
+                        }
+                    ]
+                },
+                {
+                    "syscall": "ioctl",
+                    "comment": "fxdax: a private page filled before it is mapped (doc-13)",
+                    "args": [
+                        {
+                            "index": 1,
+                            "type": "dword",
+                            "op": "eq",
+                            "val": 3223890435,
+                            "comment": "UFFDIO_COPY"
+                        }
+                    ]
+                },
+                {
                     "syscall": "clone",
                     "comment": "fxdax: starting extent devices' threads, from their spawner (TASK-50.1)",
                     "args": [
