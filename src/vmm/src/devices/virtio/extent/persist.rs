@@ -102,7 +102,6 @@ pub enum MappingContentsState {
         branch: u64,
         sequence: u64,
         offset: u64,
-        writable: bool,
     },
     Zeros,
 }
@@ -113,15 +112,10 @@ impl From<&fxdax::WindowMapping> for MappingState {
             window_offset: mapping.window_offset,
             len: mapping.len,
             contents: match mapping.contents {
-                fxdax::MappingContents::Extent {
-                    extent,
-                    offset,
-                    writable,
-                } => MappingContentsState::Extent {
+                fxdax::MappingContents::Extent { extent, offset } => MappingContentsState::Extent {
                     branch: extent.branch,
                     sequence: extent.sequence,
                     offset,
-                    writable,
                 },
                 fxdax::MappingContents::Zeros => MappingContentsState::Zeros,
             },
@@ -139,11 +133,9 @@ impl From<&MappingState> for fxdax::WindowMapping {
                     branch,
                     sequence,
                     offset,
-                    writable,
                 } => fxdax::MappingContents::Extent {
                     extent: fxdax::ExtentId { branch, sequence },
                     offset,
-                    writable,
                 },
                 MappingContentsState::Zeros => fxdax::MappingContents::Zeros,
             },

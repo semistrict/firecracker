@@ -23,16 +23,15 @@ use vmm_sys_util::eventfd::EventFd;
 use super::{
     CommitArgs, ExtentIdLe, Info, IoArgs, MAX_ROOT, MAX_TRANSFER, MapArgs, MapEntry, RequestHeader,
     Response, RootLen, UnmapArgs, VIRTIO_EXTENT_COMMIT_DURABLE, VIRTIO_EXTENT_COMMIT_ROOT,
-    VIRTIO_EXTENT_MAP_AHEAD, VIRTIO_EXTENT_MAP_MANY, VIRTIO_EXTENT_MAP_WRITE,
-    VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO, VIRTIO_EXTENT_T_MAP,
+    VIRTIO_EXTENT_MAP_AHEAD, VIRTIO_EXTENT_MAP_MANY, VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO, VIRTIO_EXTENT_T_MAP,
     VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP, VIRTIO_EXTENT_T_WRITE,
     VIRTIO_EXTENT_WRITE_ROOT, write_barriers,
 };
 use super::{
-    Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, SealedArgs, Sealing,
-    VIRTIO_EXTENT_FREE_MANY, VIRTIO_EXTENT_FREEZE_FROZEN, VIRTIO_EXTENT_RESIZED_TOOK,
-    VIRTIO_EXTENT_T_ADVANCE, VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO,
-    VIRTIO_EXTENT_T_PIN, VIRTIO_EXTENT_T_RESIZED, VIRTIO_EXTENT_T_SEALED, VIRTIO_EXTENT_T_UNPIN,
+    Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREE_MANY,
+    VIRTIO_EXTENT_FREEZE_FROZEN, VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_ADVANCE,
+    VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO, VIRTIO_EXTENT_T_PIN,
+    VIRTIO_EXTENT_T_RESIZED, VIRTIO_EXTENT_T_UNPIN,
 };
 use super::{VIRTIO_EXTENT_MAP_ZEROS, VIRTIO_EXTENT_T_PRIVATE};
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
@@ -73,12 +72,11 @@ impl Served {
 }
 
 /// fxdax: what the device's guest and the daemon tell each other beside requests, which the workers
-/// serve them with: the store's capacity, the asks to seal, and whether the guest's filesystem is
-/// frozen (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
+/// serve them with: the store's capacity, and whether the guest's filesystem is frozen
+/// (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
 #[derive(Debug, Default)]
 pub(super) struct Notices {
     pub resizing: Resizing,
-    pub sealing: Sealing,
     pub frozen: AtomicBool,
 }
 
@@ -565,13 +563,13 @@ async fn serve(
         }
         VIRTIO_EXTENT_T_MAP => {
             let args: MapArgs = reader.obj()?;
-            // fxdax: a window that copies on write (DAX_COW) maps zeros, and nothing writably;
-            // one that doesn't maps no zeros (backlog doc-13).
+            // fxdax: every map is read-only; a window that copies on write, a writer's, maps
+            // zeros, and a follower's none (backlog doc-13).
             let map_flags = VIRTIO_EXTENT_MAP_AHEAD
                 | if store.copies_on_write() {
                     VIRTIO_EXTENT_MAP_ZEROS
                 } else {
-                    VIRTIO_EXTENT_MAP_WRITE
+                    0
                 };
             if flags & !(map_flags | VIRTIO_EXTENT_MAP_MANY) != 0 {
                 return Err(Errno::EINVAL);
@@ -590,26 +588,18 @@ async fn serve(
             }
             // Sent to the daemon at once, each as it would be alone: the first error fails the
             // request, whichever others it mapped (`F_MAP_MANY`). fxdax: what the guest reads
-            // next (`F_MAP_AHEAD`) is then mapped for it, as the window maps writable pages
-            // already (TASK-112.1).
+            // next (`F_MAP_AHEAD`) is then mapped for it (TASK-112.1).
             futures::future::try_join_all(maps.iter().map(|(args, flags)| async move {
                 let (window_offset, len) =
                     (u64::from_le(args.window_offset), u64::from_le(args.len));
-                let writable = flags & VIRTIO_EXTENT_MAP_WRITE != 0;
                 if flags & VIRTIO_EXTENT_MAP_ZEROS != 0 {
                     store.map_zeros_async(window_offset, len).await?;
                 } else {
                     store
-                        .map_async(
-                            args.id.into(),
-                            u64::from_le(args.offset),
-                            len,
-                            window_offset,
-                            writable,
-                        )
+                        .map_async(args.id.into(), u64::from_le(args.offset), len, window_offset)
                         .await?;
                 }
-                if !writable && flags & VIRTIO_EXTENT_MAP_AHEAD != 0 {
+                if flags & VIRTIO_EXTENT_MAP_AHEAD != 0 {
                     store.prefault(window_offset, len);
                 }
                 Ok::<_, Errno>(())
@@ -624,7 +614,7 @@ async fn serve(
                 .await?;
             Ok(0)
         }
-        // fxdax: a window that copies on write's (DAX_COW, backlog doc-13), its arguments UNMAP's.
+        // fxdax: a window that copies on write's, a writer's (backlog doc-13), its arguments UNMAP's.
         VIRTIO_EXTENT_T_PRIVATE => {
             if flags != 0 || !store.copies_on_write() {
                 return Err(Errno::EINVAL);
@@ -702,14 +692,6 @@ async fn serve(
             let took = flags & VIRTIO_EXTENT_RESIZED_TOOK != 0;
             notices.resizing.answered(capacity, took);
             store.resized_async(capacity, took).await?;
-            Ok(0)
-        }
-        // fxdax: the guest's answer to the daemon's ask that it seal (`VIRTIO_EXTENT_F_SEAL`).
-        VIRTIO_EXTENT_T_SEALED => {
-            let args: SealedArgs = reader.obj()?;
-            let asked = u64::from_le(args.asked);
-            notices.sealing.answered(asked);
-            store.sealed_async(asked).await?;
             Ok(0)
         }
         // fxdax: a follower's (doc-4's F_READ_ONLY); a writer's store refuses them (EINVAL).
@@ -1381,8 +1363,9 @@ mod tests {
             &[1; 100],
         );
         assert_eq!(request(&store, &short, RESPONSE).1, errno(Errno::EINVAL));
-        // Without a DAX window, writable or not, one map or many; and a MAP flag the device
-        // doesn't know, of the request or of one of its maps (`F_MAP_MANY`).
+        // Without a DAX window, one map or many; and a MAP flag the device doesn't know, of the
+        // request or of one of its maps (`F_MAP_MANY`): fxdax: writable DAX's `MAP_WRITE` among
+        // them (backlog doc-13).
         let entries = |flags: &[u32]| -> Vec<u8> {
             (flags.iter())
                 .flat_map(|flags| {
@@ -1394,8 +1377,8 @@ mod tests {
                 })
                 .collect()
         };
-        let many = entries(&[VIRTIO_EXTENT_MAP_WRITE, VIRTIO_EXTENT_MAP_AHEAD, 0]);
-        for flags in [0, VIRTIO_EXTENT_MAP_WRITE, VIRTIO_EXTENT_MAP_AHEAD] {
+        let many = entries(&[VIRTIO_EXTENT_MAP_AHEAD, 0]);
+        for flags in [0, VIRTIO_EXTENT_MAP_AHEAD] {
             let map = bytes(VIRTIO_EXTENT_T_MAP, flags, Some(MapArgs::default()), &[]);
             assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::ENOSYS));
             let map = bytes(
@@ -1406,9 +1389,11 @@ mod tests {
             );
             assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::ENOSYS));
         }
-        let map = bytes(VIRTIO_EXTENT_T_MAP, 1 << 3, Some(MapArgs::default()), &[]);
-        assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::EINVAL));
-        // fxdax: zeros, and PRIVATE, of a window that doesn't copy on write (doc-13).
+        for unknown in [1 << 0, 1 << 3] {
+            let map = bytes(VIRTIO_EXTENT_T_MAP, unknown, Some(MapArgs::default()), &[]);
+            assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::EINVAL));
+        }
+        // fxdax: zeros, and PRIVATE, of a store without a window that copies on write (doc-13).
         let map = bytes(
             VIRTIO_EXTENT_T_MAP,
             VIRTIO_EXTENT_MAP_MANY,

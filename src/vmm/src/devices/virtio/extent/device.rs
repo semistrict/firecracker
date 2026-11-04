@@ -17,12 +17,12 @@ use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefau
 use super::worker::{Notices, Worker};
 use super::{
     ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
-    MAX_TRANSFER, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_FREEZE,
-    VIRTIO_EXTENT_F_RESIZE, VIRTIO_EXTENT_F_SEAL, VIRTIO_EXTENT_F_WRITE_COMMIT,
+    MAX_TRANSFER, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_FREEZE, VIRTIO_EXTENT_F_RESIZE,
+    VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use super::{
-    Following, VIRTIO_EXTENT_F_DAX_COW, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_AHEAD,
-    VIRTIO_EXTENT_F_MAP_MANY, VIRTIO_EXTENT_F_READ_ONLY,
+    Following, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_AHEAD, VIRTIO_EXTENT_F_MAP_MANY,
+    VIRTIO_EXTENT_F_READ_ONLY,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
@@ -104,9 +104,8 @@ pub struct Extent {
     /// Maps the window's pages for the guest as the store maps them.
     prefault: Option<Arc<dyn PrefaultGuestMemory>>,
     config_space: ConfigSpace,
-    /// The store's capacity, as the daemon changes it; fxdax: its asks that the guest seal
-    /// (TASK-153.15); and whether the guest's filesystem is frozen (`VIRTIO_EXTENT_T_FREEZE`), as
-    /// a snapshot needs it.
+    /// The store's capacity, as the daemon changes it; fxdax: and whether the guest's filesystem is
+    /// frozen (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
     notices: Arc<Notices>,
     /// fxdax: a follower's writer's commits, as the daemon tells of them.
     following: Arc<Following>,
@@ -172,7 +171,6 @@ impl Extent {
             capacity: 0,
             asked: 0,
             committed: 0,
-            seal_asked: 0,
             private_max: 0,
         };
         let tag = config.tag.as_bytes();
@@ -214,9 +212,6 @@ impl Extent {
             .store(info.capacity, std::sync::atomic::Ordering::Release);
         let changes = notices.clone();
         store.on_capacity(move |capacity, ask| changes.resizing.changed(capacity, ask));
-        // fxdax: told the guest, if its driver takes them; answered at once otherwise (TASK-153.15).
-        let asks = notices.clone();
-        store.on_seal(move |number| asks.sealing.ask(number));
         let following = Arc::new(Following::default());
         hear_commits(&store, &following);
 
@@ -236,7 +231,6 @@ impl Extent {
                 | (1 << VIRTIO_EXTENT_F_RESIZE)
                 | (1 << VIRTIO_EXTENT_F_FREEZE)
                 | (1 << VIRTIO_EXTENT_F_FREE_MANY)
-                | (1 << VIRTIO_EXTENT_F_SEAL)
         };
         let mut shm_regions = Vec::new();
         let window_addr = match making {
@@ -259,12 +253,9 @@ impl Extent {
                 avail_features |= (1 << VIRTIO_EXTENT_F_DAX)
                     | (1 << VIRTIO_EXTENT_F_MAP_MANY)
                     | (1 << VIRTIO_EXTENT_F_MAP_AHEAD);
-                // The store maps open extents writably too (doc-4's DAX_WRITE): a writer's. fxdax:
-                // or copies on write (DAX_COW, backlog doc-13), of a quarter of the window's pages
-                // at most unless configured, which the guest takes instead.
+                // fxdax: a writer's window copies on write (backlog doc-13), of a quarter of its
+                // pages at most unless configured; a follower's copies nothing.
                 if !config.read_only {
-                    avail_features |=
-                        (1 << VIRTIO_EXTENT_F_DAX_WRITE) | (1 << VIRTIO_EXTENT_F_DAX_COW);
                     let pages = window.len() / fxdax::pages::page_size();
                     let private_max = config.dax_private_max.unwrap_or(pages / 4).max(1);
                     config_space.private_max = private_max.to_le();
@@ -328,24 +319,18 @@ impl Extent {
                     prefault,
                 })
             });
-        // fxdax: one that copies on write, for a guest that took DAX_COW (backlog doc-13).
-        let copying = self.acked_features & (1u64 << VIRTIO_EXTENT_F_DAX_COW) != 0;
+        // fxdax: a writer's copies on write, of `private_max` pages at most; a follower's, of
+        // none, copies nothing (backlog doc-13).
+        let private_max = u64::from_le(self.config_space.private_max);
         // SAFETY: The window's host memory is the device's, which only the guest accesses, and
         // which outlives the store's connection, as the store is dropped first.
         unsafe {
-            match copying {
-                false => self.store().create_dax_window_in_host_memory(
-                    window.host_memory(),
-                    window.len(),
-                    prefault,
-                ),
-                true => self.store().create_copying_dax_window_in_host_memory(
-                    window.host_memory(),
-                    window.len(),
-                    prefault,
-                    u64::from_le(self.config_space.private_max),
-                ),
-            }
+            self.store().create_dax_window_in_host_memory(
+                window.host_memory(),
+                window.len(),
+                prefault,
+                private_max,
+            )
         }?;
         self.window_created = true;
         Ok(())
@@ -438,13 +423,6 @@ impl Extent {
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
         assert!(!self.is_activated());
-        // fxdax: a guest takes writable DAX or copy-on-write DAX, not both (backlog doc-13).
-        let both = (1u64 << VIRTIO_EXTENT_F_DAX_WRITE) | (1u64 << VIRTIO_EXTENT_F_DAX_COW);
-        if self.acked_features & both == both {
-            return Err(ActivateError::Extent(
-                "the driver took both DAX_WRITE and DAX_COW".to_owned(),
-            ));
-        }
         // fxdax: those the driver set up, one per CPU of the guest's, up to the device's.
         let event_idx = self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
@@ -473,10 +451,6 @@ impl Extent {
             .interrupt
             .lock()
             .expect("Poisoned lock") = Some(interrupt.clone());
-        // fxdax: asks to seal reach a guest whose driver takes them (TASK-153.15).
-        if self.acked_features & (1 << VIRTIO_EXTENT_F_SEAL) != 0 {
-            self.notices.sealing.told_through(Some(interrupt.clone()));
-        }
         *self.following.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         self.resume_worker()
@@ -653,7 +627,6 @@ impl VirtioDevice for Extent {
                 .load(Ordering::Acquire)
                 .to_le(),
             asked: self.notices.resizing.asked.load(Ordering::Acquire).to_le(),
-            seal_asked: self.notices.sealing.asked.load(Ordering::Acquire).to_le(),
             committed: self.following.committed.load(Ordering::Acquire).to_le(),
             ..self.config_space
         };
@@ -744,16 +717,6 @@ impl Extent {
     /// Resets the device (`VirtioDevice::reset`), on a thread under the VMM's seccomp filter.
     fn reset_confined(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
         self.stop_worker();
-        // fxdax: an ask to seal outstanding no guest answers now: the device does (TASK-153.15).
-        if let Some(asked) = self.notices.sealing.told_through(None)
-            && let Some(store) = &self.store
-            && let Err(err) = store.sealed(asked)
-        {
-            error!(
-                "extent device {}: answering an ask to seal: {err:#}",
-                self.config.id
-            );
-        }
         // fxdax: a follower lets go of its store now, not as it is activated again: a store its
         // writer retired, going with writes uncommitted, opens only once it is gone, for its
         // follower or a new writer, and the guest may not mount for a while (TASK-79.24).
