@@ -240,6 +240,10 @@ impl Vcpu {
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.kvm_vcpu.index))
             .spawn(move || {
+                // fxdax: an alternate stack for the fatal signals' handlers (TASK-137), mapped
+                // before the vCPU's seccomp filter, which allows neither its `mmap` nor its
+                // `mprotect`.
+                crate::signal_handler::install_signal_stack();
                 let filter = &*seccomp_filter;
                 self.register_kick_signal_handler();
                 // Synchronization to make sure thread local data is initialized.

@@ -200,6 +200,9 @@ pub(crate) fn run_with_api(
     let api_thread = thread::Builder::new()
         .name("fc_api".to_owned())
         .spawn(move || {
+            // fxdax: an alternate stack for the fatal signals' handlers (TASK-137), mapped before
+            // the API's seccomp filter, which allows neither its `mmap` nor its `mprotect`.
+            vmm::signal_handler::install_signal_stack();
             ApiServer::new(to_vmm, from_vmm, to_vmm_event_fd).run(
                 server,
                 process_time_reporter,

@@ -976,6 +976,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "extent_frame",
+ "fail",
  "futures",
  "libc",
  "log",
@@ -995,6 +996,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "extent_frame",
+ "fail",
  "libc",
  "log",
  "rand 0.10.3",
@@ -3553,6 +3555,7 @@ name = "storage_device"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arbitrary",
  "async-trait",
  "block_protocol",
  "event-listener",

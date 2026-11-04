@@ -826,10 +826,18 @@ fn confine_extent_threads(seccomp_filters: &BpfThreadMap) -> Result<(), StartMic
         let spawning = std::thread::Builder::new()
             .name("fc_extent_spawn".into())
             .spawn(move || {
+                // An alternate stack for the fatal signals' handlers (TASK-137).
+                crate::signal_handler::install_signal_stack();
                 if let Err(err) = crate::seccomp::apply_filter(&filter) {
                     panic!("Failed to set the VMM's seccomp filter on the extent spawner: {err}");
                 }
+                // Each thread with an alternate stack for the fatal signals' handlers, which the
+                // VMM's filter lets it map (TASK-137).
                 while let Ok((name, run, started)) = asked.recv() {
+                    let run = move || {
+                        crate::signal_handler::install_signal_stack();
+                        run()
+                    };
                     let _ =
                         started.send(std::thread::Builder::new().name(name).spawn(run).map(drop));
                 }

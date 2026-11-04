@@ -31,7 +31,7 @@
                 },
                 {
                     "syscall": "mmap",
-                    "comment": "fxdax: the alternate signal stack Rust's stdlib maps for each of extent devices' threads as it starts (TASK-50.1)",
+                    "comment": "fxdax: the alternate signal stacks mapped for each of extent devices' threads as it starts: Rust's stdlib's (TASK-50.1), and the one the fatal signals' handlers run on (TASK-137)",
                     "args": [
                         {
                             "index": 3,
@@ -328,7 +328,7 @@
             },
             {
                 "syscall": "sigaltstack",
-                "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
+                "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown. fxdax: and to install the alternate signal stacks of extent devices' threads as they start (TASK-50.1, TASK-137)"
             },
             {
               "syscall": "getrandom",
@@ -919,7 +919,7 @@
             },
             {
                 "syscall": "mprotect",
-                "comment": "Used by memory hotplug to protect access to underlying host memory",
+                "comment": "Used by memory hotplug to protect access to underlying host memory. fxdax: and for the guard pages of the alternate signal stacks of extent devices' threads (TASK-50.1, TASK-137)",
                 "args": [
                     {
                         "index": 2,
