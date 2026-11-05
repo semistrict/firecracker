@@ -974,7 +974,9 @@ dependencies = [
 name = "extent_remote"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
+ "bytes",
  "extent_frame",
  "fail",
  "futures",
@@ -996,6 +998,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "extent_frame",
+ "extent_remote",
  "fail",
  "libc",
  "log",
