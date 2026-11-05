@@ -105,9 +105,10 @@ pub struct Vcpu {
     response_receiver: Option<Receiver<VcpuResponse>>,
     /// The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
-    /// The `KVM_RUN`s failing with `EFAULT` in a row, while fxdax changes a DAX window's mappings.
+    /// fxdax: the `KVM_RUN`s failing with `EFAULT`, as fxdax changes a DAX window's mappings, or
+    /// as the guest strays in it (`efaults`).
     #[cfg(feature = "fxdax")]
-    efaults: Option<Efaults>,
+    efaults: fxdax::AccessFailures,
     /// fxdax: whether KVM says where some accesses failing with `EFAULT` failed
     /// (`KVM_CAP_MEMORY_FAULT_INFO`), which a vCPU giving up on one tells of.
     #[cfg(feature = "fxdax")]
@@ -125,7 +126,8 @@ struct MemoryFault {
     size: u64,
 }
 
-/// `KVM_RUN`s failing with `EFAULT` in a row: when the first did, and the last.
+/// fxdax: `KVM_RUN`s failing with `EFAULT`, which fxdax's `AccessFailures` has the vCPU retry or
+/// give up on.
 ///
 /// fxdax replaces the host memory of an extent device's DAX window as it changes the window's
 /// mappings, and a guest's access to a page meanwhile fails with `EFAULT` (see fxdax's
@@ -133,67 +135,42 @@ struct MemoryFault {
 /// `KVM_CAP_MEMORY_FAULT_INFO`. The vCPU retries its access until the change is done, which takes
 /// a few system calls, and gives up if it keeps failing, telling what it can of it.
 #[cfg(feature = "fxdax")]
-#[derive(Debug)]
-struct Efaults {
-    first: std::time::Instant,
-    last: std::time::Instant,
-    /// How many failed.
-    count: u64,
-}
+mod efaults {
+    use super::MemoryFault;
+    use crate::logger::warn;
 
-#[cfg(feature = "fxdax")]
-impl Efaults {
-    /// How long a vCPU retries an access that keeps failing.
-    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
-    /// How soon after the last a failing `KVM_RUN` is the same access's.
-    const IN_A_ROW: std::time::Duration = std::time::Duration::from_millis(10);
-
-    /// Records a `KVM_RUN` failing with `EFAULT`, and returns whether to retry it.
-    fn retry(efaults: &mut Option<Efaults>) -> bool {
-        let now = std::time::Instant::now();
-        let (first, count) = match efaults {
-            Some(efaults) if now - efaults.last < Self::IN_A_ROW => (efaults.first, efaults.count),
-            _ => (now, 0),
-        };
-        *efaults = Some(Efaults { first, last: now, count: count + 1 });
-        now - first < Self::PATIENCE
+    /// How often and how long `run` failed, and how many other exits it took meanwhile.
+    fn failed(run: &fxdax::FailingRun) -> String {
+        let fxdax::FailingRun { first, last, failures, exits } = run;
+        format!("{failures} times in {:?}, among {exits} other exits", *last - *first)
     }
 
-    /// fxdax: a `KVM_RUN` of vCPU `index` that didn't fail with `EFAULT`, after some that did:
+    /// A run of vCPU `index`'s `KVM_RUN`s failing with `EFAULT` that ended, the vCPU running on:
     /// logs how many, over how long, the first thousand runs of them and every power of two
     /// after, which says whether the stores the DAX window refuses stall the vCPUs whose they are,
     /// and for how long (TASK-44.12).
-    fn ran_on(efaults: &mut Option<Efaults>, index: u8) {
+    pub(super) fn ran_on(index: u8, run: &fxdax::FailingRun) {
         static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let Some(Efaults { first, last, count }) = efaults.take() else {
-            return;
-        };
         let logged = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if logged <= 1000 || logged.is_power_of_two() {
             warn!(
-                "fxdax: vCPU {index}'s KVM_RUN failed with EFAULT {count} times in {:?}, then ran \
-                 on ({logged} such runs so far)",
-                last - first
+                "fxdax: vCPU {index}'s KVM_RUN failed with EFAULT {}, then ran on ({logged} such \
+                 runs so far)",
+                failed(run)
             );
         }
     }
 
-    /// fxdax: what a vCPU giving up on an access that kept failing tells of it, beside `KVM_RUN`'s
-    /// `EFAULT`, which says nothing more: how long and how often it failed; where, if KVM said
-    /// (`fault`, which it may with `KVM_CAP_MEMORY_FAULT_INFO`, as `memory_fault_info` says it has
-    /// or hasn't), and the DAX window's offset there, if it is in one; and what the windows'
-    /// second stages hold there and are doing, from fxdax (`fxdax::describe_windows`).
-    fn gave_up(
-        efaults: &Option<Efaults>,
+    /// What a vCPU giving up on an access that kept failing, `run`, tells of it, beside
+    /// `KVM_RUN`'s `EFAULT`, which says nothing more: how long and how often it failed; where, if
+    /// KVM said (`fault`, which it may with `KVM_CAP_MEMORY_FAULT_INFO`, as `memory_fault_info`
+    /// says it has or hasn't), and the DAX window's offset there, if it is in one; and what the
+    /// windows' second stages hold there and are doing, from fxdax (`fxdax::describe_windows`).
+    pub(super) fn gave_up(
+        run: &fxdax::FailingRun,
         fault: Option<MemoryFault>,
         memory_fault_info: bool,
     ) -> String {
-        let failed = match efaults {
-            Some(Efaults { first, last, count }) => {
-                format!("{count} times in {:?}", *last - *first)
-            }
-            None => "once".to_owned(),
-        };
         let (at, host) = match fault {
             Some(MemoryFault { flags, gpa, size }) => {
                 let window = crate::devices::virtio::extent::dax_window_at(gpa);
@@ -212,7 +189,7 @@ impl Efaults {
                 (format!("where, KVM didn't say (it {info} KVM_CAP_MEMORY_FAULT_INFO)"), None)
             }
         };
-        format!("{failed}, {at}; {}", fxdax::describe_windows(host))
+        format!("{}, {at}; {}", failed(run), fxdax::describe_windows(host))
     }
 }
 
@@ -250,7 +227,7 @@ impl Vcpu {
             #[cfg(feature = "gdb")]
             gdb_event: None,
             #[cfg(feature = "fxdax")]
-            efaults: None,
+            efaults: fxdax::AccessFailures::default(),
             #[cfg(feature = "fxdax")]
             memory_fault_info: vm
                 .fd()
@@ -527,24 +504,32 @@ impl Vcpu {
             }
             _ => None,
         };
+        // fxdax: a store KVM's worker's write left a DAX window's page read-only for, which the
+        // window copies on write, is let fault to it as the access is retried
+        // (`fxdax::guest_access_failed`, backlog doc-13), which `failed` does.
         #[cfg(feature = "fxdax")]
         match failed {
-            None => Efaults::ran_on(&mut self.efaults, self.kvm_vcpu.index),
-            Some(_) if Efaults::retry(&mut self.efaults) => {
-                // fxdax: a store KVM's worker's write left a DAX window's page read-only for, which
-                // the window copies on write, is let fault to it as the access is retried
-                // (`fxdax::guest_access_failed`, backlog doc-13).
-                fxdax::guest_access_failed();
-                return Ok(VcpuEmulation::Handled);
+            None => {
+                if let Some(run) = self.efaults.ran(std::time::Instant::now) {
+                    efaults::ran_on(self.kvm_vcpu.index, &run);
+                }
             }
-            Some(fault) => {
-                let gave_up = Efaults::gave_up(&self.efaults, fault, self.memory_fault_info);
-                error!(
-                    "fxdax: vCPU {}: KVM_RUN kept failing with EFAULT, {gave_up}",
-                    self.kvm_vcpu.index
-                );
-                return Err(VcpuError::AccessRefused);
-            }
+            Some(fault) => match self.efaults.failed(std::time::Instant::now()) {
+                fxdax::Failure::Retry { ended } => {
+                    if let Some(run) = ended {
+                        efaults::ran_on(self.kvm_vcpu.index, &run);
+                    }
+                    return Ok(VcpuEmulation::Handled);
+                }
+                fxdax::Failure::GiveUp(run) => {
+                    let gave_up = efaults::gave_up(&run, fault, self.memory_fault_info);
+                    error!(
+                        "fxdax: vCPU {}: KVM_RUN kept failing with EFAULT, {gave_up}",
+                        self.kvm_vcpu.index
+                    );
+                    return Err(VcpuError::AccessRefused);
+                }
+            },
         }
         match ran {
             Err(ref err) if err.errno() == libc::EINTR => {
@@ -864,12 +849,16 @@ pub(crate) mod tests {
     #[test]
     fn efaults_given_up_on_tell_where() {
         let fault = MemoryFault { flags: 0, gpa: 0x1000, size: 0x1000 };
-        let told = Efaults::gave_up(&None, Some(fault), true);
-        let at = "once, at guest physical address 0x1000 (0x1000 bytes, flags 0x0), in no DAX \
-                  window; ";
+        let first = std::time::Instant::now();
+        let last = first + std::time::Duration::from_millis(1500);
+        let run = fxdax::FailingRun { first, last, failures: 3, exits: 2 };
+        let told = efaults::gave_up(&run, Some(fault), true);
+        let at = "3 times in 1.5s, among 2 other exits, at guest physical address 0x1000 (0x1000 \
+                  bytes, flags 0x0), in no DAX window; ";
         assert!(told.starts_with(at), "{told}");
-        let told = Efaults::gave_up(&None, None, false);
-        let unsaid = "once, where, KVM didn't say (it hasn't KVM_CAP_MEMORY_FAULT_INFO); ";
+        let told = efaults::gave_up(&run, None, false);
+        let unsaid = "3 times in 1.5s, among 2 other exits, where, KVM didn't say (it hasn't \
+                      KVM_CAP_MEMORY_FAULT_INFO); ";
         assert!(told.starts_with(unsaid), "{told}");
     }
     use crate::arch::{BootProtocol, EntryPoint};
