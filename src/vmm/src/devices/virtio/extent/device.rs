@@ -22,7 +22,7 @@ use super::{
 };
 use super::{
     Following, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_AHEAD, VIRTIO_EXTENT_F_MAP_MANY,
-    VIRTIO_EXTENT_F_READ_ONLY, VIRTIO_EXTENT_F_STATS,
+    VIRTIO_EXTENT_F_READ_ONLY, VIRTIO_EXTENT_F_STATS, VIRTIO_EXTENT_VERSION,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
@@ -41,7 +41,7 @@ use crate::vstate::vm::KvmVm;
 /// Errors making an extent-store device.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ExtentError {
-    /// Cannot open the extent store {0}: {1}
+    /// Cannot open the extent store {0}: {1:#}
     Store(String, fxdax::Error),
     /// The read-only extent device {0} is restored from no snapshot: it takes none
     ReadOnlyRestored(String),
@@ -51,6 +51,8 @@ pub enum ExtentError {
     DaxWindow(#[from] DaxWindowError),
     /// Error with EventFd: {0}
     EventFd(std::io::Error),
+    /// The snapshot's extent device is of protocol version {0}, this VMM's {1}: its guest's driver is of another
+    Protocol(u32, u32),
 }
 
 /// Errors taking a snapshot of an extent-store device (TASK-39.1).
@@ -155,6 +157,7 @@ impl Extent {
         making: Making<'_>,
     ) -> Result<Self, ExtentError> {
         let mut config_space = ConfigSpace {
+            version: VIRTIO_EXTENT_VERSION.to_le(),
             tag: [0; 36],
             num_request_queues: u32::try_from(EXTENT_NUM_QUEUES)
                 .expect("the queues are few")
@@ -430,6 +433,7 @@ impl Extent {
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
         assert!(!self.is_activated());
+        took_every_feature(self.avail_features, self.acked_features)?;
         // fxdax: those the driver set up, one per CPU of the guest's, up to the device's.
         let event_idx = self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
@@ -780,6 +784,20 @@ impl Extent {
     }
 }
 
+/// fxdax: `Ok` if a driver that took `acked` of the features the device offers, `offered`, took
+/// every one, as a driver of the device's protocol does (TASK-141.3): its features are no
+/// negotiation, but what the device is configured as, which a driver serving it otherwise, as it
+/// would one of another protocol's, would serve wrong. Refused, naming both.
+fn took_every_feature(offered: u64, acked: u64) -> Result<(), ActivateError> {
+    if acked == offered {
+        return Ok(());
+    }
+    Err(ActivateError::Extent(format!(
+        "the driver took features {acked:#x} of the {offered:#x} offered, where a driver of \
+         protocol version {VIRTIO_EXTENT_VERSION} takes every one: it is of another"
+    )))
+}
+
 /// The device's events are the worker's own: the event manager has none to process.
 impl MutEventSubscriber for Extent {
     fn init(&mut self, _ops: &mut EventOps) {}
@@ -811,6 +829,35 @@ fn start_all<W, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fxdax TASK-141.3: the configuration says the device's protocol version first, where a
+    /// driver of every version reads it.
+    #[test]
+    fn the_configuration_says_its_version_first() {
+        assert_eq!(std::mem::offset_of!(ConfigSpace, version), 0);
+        assert_eq!(std::mem::offset_of!(ConfigSpace, tag), 4);
+        assert_eq!(std::mem::size_of::<ConfigSpace>(), 120);
+    }
+
+    /// fxdax TASK-141.3: a driver activating the device having taken fewer features than it
+    /// offers, or others, is refused, naming them; one taking every one isn't. Before, it was
+    /// served, as negotiation has it, its INFOs short of the branch without F_FREEZE.
+    #[test]
+    fn drivers_take_every_feature_offered() {
+        let offered = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+            | (1 << VIRTIO_EXTENT_F_FREEZE)
+            | (1 << VIRTIO_EXTENT_F_DAX);
+        took_every_feature(offered, offered).unwrap();
+        let fewer = offered & !(1 << VIRTIO_EXTENT_F_FREEZE);
+        let refused = took_every_feature(offered, fewer).unwrap_err().to_string();
+        assert_eq!(
+            refused,
+            "Extent device: the driver took features 0x120000001 of the 0x120000011 offered, \
+             where a driver of protocol version 1 takes every one: it is of another"
+        );
+        assert!(took_every_feature(offered, offered | (1 << VIRTIO_EXTENT_F_READ_ONLY)).is_err());
+    }
 
     /// TASK-79.44: a worker failing to start stops those started before it.
     #[test]

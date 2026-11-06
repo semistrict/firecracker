@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::device::{Extent, ExtentError, ExtentSnapshot, Making};
 use super::window::PrefaultGuestMemory;
-use super::{EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE};
+use super::{EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, VIRTIO_EXTENT_VERSION};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::snapshot::Persist;
@@ -27,6 +27,9 @@ use crate::vstate::vm::KvmVm;
 /// What a snapshot of its VM holds of an extent-store device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtentState {
+    /// fxdax: the device's protocol version, which its guest's driver checked at probe, and a
+    /// restore by a VMM of another refuses (TASK-141.3): the guest's driver goes on as it was.
+    pub protocol: u32,
     pub virtio_state: VirtioDeviceState,
     /// Its configuration: its store's path is the one a restore opens, unless the snapshot's
     /// load overrides it.
@@ -161,6 +164,16 @@ pub enum ExtentPersistError {
     Extent(#[from] ExtentError),
 }
 
+/// fxdax: `Ok` if a snapshot's device, of protocol version `protocol`, is of this VMM's
+/// (TASK-141.3): its guest's driver, which checked the device's version at probe, goes on as of
+/// that one.
+fn of_this_protocol(protocol: u32) -> Result<(), ExtentError> {
+    match protocol {
+        VIRTIO_EXTENT_VERSION => Ok(()),
+        other => Err(ExtentError::Protocol(other, VIRTIO_EXTENT_VERSION)),
+    }
+}
+
 impl<'a> Persist<'a> for Extent {
     type State = ExtentState;
     type ConstructorArgs = ExtentConstructorArgs<'a>;
@@ -173,6 +186,7 @@ impl<'a> Persist<'a> for Extent {
             .snapshot()
             .expect("an extent device's store is snapshotted before the device is saved");
         ExtentState {
+            protocol: VIRTIO_EXTENT_VERSION,
             virtio_state: VirtioDeviceState::from_device(self),
             config: ExtentConfigState::from(&self.config),
             window_addr: self.window_addr(),
@@ -187,6 +201,7 @@ impl<'a> Persist<'a> for Extent {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
+        of_this_protocol(state.protocol)?;
         // fxdax: built as a device's not activated are, then those the driver set up initialized:
         // it may have set up fewer than the device has, one per CPU of the guest's.
         let unactivated = VirtioDeviceState {
@@ -231,5 +246,22 @@ impl<'a> Persist<'a> for Extent {
             state.frozen,
         );
         Ok(extent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// fxdax TASK-141.3: a snapshot's device of another protocol version is refused, naming both.
+    #[test]
+    fn snapshots_of_other_protocols_are_refused() {
+        of_this_protocol(VIRTIO_EXTENT_VERSION).unwrap();
+        let refused = of_this_protocol(VIRTIO_EXTENT_VERSION + 1).unwrap_err().to_string();
+        assert_eq!(
+            refused,
+            "The snapshot's extent device is of protocol version 2, this VMM's 1: its guest's \
+             driver is of another"
+        );
     }
 }

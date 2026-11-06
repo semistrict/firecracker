@@ -26,6 +26,15 @@ use std::sync::{Arc, Mutex};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::vstate::memory::ByteValued;
 
+/// fxdax: the device's protocol version, the configuration's first field (TASK-141.3): a change to
+/// any of its requests, flags, features, configuration or what they mean makes a new one, which
+/// the driver refuses a device of another of at probe, naming both, as AGENTS.md's rule, no
+/// migrations, has every format refuse another. Its features are not a negotiation: they say
+/// what the device is configured as (a follower, a window), and a driver takes every one offered,
+/// or its activation is refused. Where it is, the configuration's first four bytes, no version
+/// moves. Its driver's is `VIRTIO_EXTENT_VERSION` (guest/linux/include/linux/virtio_extent.h).
+pub const VIRTIO_EXTENT_VERSION: u32 = 1;
+
 /// Shared memory region 0 is a DAX window, and `MAP`/`UNMAP` work. fxdax: the window maps sealed
 /// extents and zeros alone, read-only (backlog doc-13): a `MAP` of an open extent fails `EPERM`. A
 /// writer's copies on write: a store to a page of it gives the device a private page holding what
@@ -40,9 +49,9 @@ pub const VIRTIO_EXTENT_F_WRITE_COMMIT: u32 = 2;
 /// runs, telling it with a configuration change; a shrink the guest is asked to take it answers
 /// (`VIRTIO_EXTENT_T_RESIZED`).
 pub const VIRTIO_EXTENT_F_RESIZE: u32 = 3;
-/// fxdax: `VIRTIO_EXTENT_T_FREEZE` tells the device the guest's filesystem is frozen, or thawed,
-/// and `INFO` says the branch: a snapshot of the VM is taken frozen, and a VM restored from it,
-/// with a store of its own, learns its branch as its filesystem thaws (TASK-39.1).
+/// fxdax: `VIRTIO_EXTENT_T_FREEZE` tells the device the guest's filesystem is frozen, or thawed: a
+/// snapshot of the VM is taken frozen, and a VM restored from it, with a store of its own, learns
+/// its branch, which `INFO` says, as its filesystem thaws (TASK-39.1).
 pub const VIRTIO_EXTENT_F_FREEZE: u32 = 4;
 /// fxdax: the device follows a store another VM writes, read-only (backlog doc-8): `ADVANCE`,
 /// `LET_GO`, `PIN` and `UNPIN` work, and the configuration's `committed` changes as the writer
@@ -273,7 +282,7 @@ pub struct Info {
     pub next_sequence: u64,
     /// fxdax: the lowest sequence number the guest may mint from.
     pub sequence_floor: u64,
-    /// fxdax (`VIRTIO_EXTENT_F_FREEZE`): the branch the guest mints extents of.
+    /// fxdax: the branch the guest mints extents of.
     pub branch: u64,
 }
 
@@ -285,10 +294,6 @@ pub struct Epoch {
     pub epoch: u64,
     pub reserved: u64,
 }
-
-/// The length of what `INFO` writes for a driver without `VIRTIO_EXTENT_F_FREEZE`: the fields
-/// before `Info::branch`.
-pub const INFO_LEN_WITHOUT_BRANCH: usize = std::mem::offset_of!(Info, branch);
 
 /// `VIRTIO_EXTENT_T_RESIZED`'s arguments: the capacity the guest was asked to shrink to.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -424,6 +429,9 @@ impl StatsAsks {
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
 pub struct ConfigSpace {
+    /// fxdax: the device's protocol version, [`VIRTIO_EXTENT_VERSION`], first, where every version
+    /// has it (TASK-141.3).
+    pub version: u32,
     /// The filesystem's name, NUL-padded: the mount's source.
     pub tag: [u8; 36],
     pub num_request_queues: u32,

@@ -29,7 +29,7 @@ use super::{
     VIRTIO_EXTENT_WRITE_ROOT, write_barriers,
 };
 use super::{
-    Epoch, INFO_LEN_WITHOUT_BRANCH, ResizedArgs, Resizing, VIRTIO_EXTENT_FREE_MANY,
+    Epoch, ResizedArgs, Resizing, VIRTIO_EXTENT_FREE_MANY,
     VIRTIO_EXTENT_FREEZE_FROZEN, VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_ADVANCE,
     VIRTIO_EXTENT_T_FREEZE, VIRTIO_EXTENT_T_LAST, VIRTIO_EXTENT_T_LET_GO, VIRTIO_EXTENT_T_PIN,
     VIRTIO_EXTENT_T_RESIZED, VIRTIO_EXTENT_T_UNPIN,
@@ -674,8 +674,9 @@ async fn serve(
             Ok(returned)
         }
         VIRTIO_EXTENT_T_INFO => {
-            // A driver without VIRTIO_EXTENT_F_FREEZE has no room for the branch.
-            if room < INFO_LEN_WITHOUT_BRANCH {
+            // fxdax: the whole of it, the branch too, which a driver without F_FREEZE had no room
+            // for, served before: a driver of this protocol has (TASK-141.3).
+            if room < size_of::<Info>() {
                 return Err(Errno::EINVAL);
             }
             let info = store.info_async().await?;
@@ -687,9 +688,8 @@ async fn serve(
                 sequence_floor: info.sequence_floor.to_le(),
                 branch: store.branch().to_le(),
             };
-            let len = room.min(size_of::<Info>());
-            writer.write(0, &info.as_slice()[..len]);
-            Ok(len)
+            writer.write(0, info.as_slice());
+            Ok(size_of::<Info>())
         }
         VIRTIO_EXTENT_T_FREEZE => {
             notices
@@ -1209,10 +1209,11 @@ mod tests {
                 branch: store.branch(),
             }
         );
-        // A driver without VIRTIO_EXTENT_F_FREEZE has room for what comes before the branch.
-        let (written, status) = request(&store, &info, INFO_LEN_WITHOUT_BRANCH + RESPONSE);
-        assert_eq!(status, 0);
-        assert_eq!(written.len(), INFO_LEN_WITHOUT_BRANCH);
+        // fxdax: room for what comes before the branch alone, as a driver without F_FREEZE had,
+        // is refused (TASK-141.3).
+        let short = std::mem::offset_of!(Info, branch);
+        let (_, status) = request(&store, &info, short + RESPONSE);
+        assert_eq!(status, errno(Errno::EINVAL));
 
         // fxdax: a WRITE's commit sets the root after its data, which isn't the data's; there is
         // no root without a commit to set it.
