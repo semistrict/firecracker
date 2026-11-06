@@ -139,13 +139,14 @@ pub fn write_barriers(flags: u32) -> Option<fxdax::WriteBarriers<'static>> {
     })
 }
 /// fxdax: a `FREE`'s flags: its data names more extents to free, each a `virtio_extent_id`
-/// (`F_FREE_MANY`).
+/// (`F_FREE_MANY`), of `MAX_MANY_DATA` bytes at most.
 pub const VIRTIO_EXTENT_FREE_MANY: u32 = 1 << 0;
 
 /// A `COMMIT`'s flags: it completes once durable; it sets the root.
 pub const VIRTIO_EXTENT_COMMIT_DURABLE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_ROOT: u32 = 1 << 1;
-/// A `MAP`'s flags, fxdax: its data holds more maps (`F_MAP_MANY`); and the guest accesses the
+/// A `MAP`'s flags, fxdax: its data holds more maps (`F_MAP_MANY`), of `MAX_MANY_DATA` bytes at
+/// most; and the guest accesses the
 /// pages next (`F_MAP_AHEAD`); and zeros, its extent and offset ignored, of a writer's window, as
 /// each of a `MAP_MANY`'s maps may be. Every map is read-only: bit 0, writable DAX's `MAP_WRITE`,
 /// is not reused.
@@ -167,6 +168,12 @@ const MAX_TRANSFER: u32 = 8 << 20;
 const MAX_ROOT: u32 = 4096;
 /// The most bytes one extent holds.
 const MAX_EXTENT: u64 = fxdax::ExtentStore::MAX_EXTENT;
+/// fxdax: the most bytes of data a `FREE_MANY` or a `MAP_MANY` carries, its further extents or
+/// maps: a page of the largest a guest's kernel has, as its drivers send a page's worth at most;
+/// past it, the request is refused (`EINVAL`). The device lists what the data names in its own
+/// memory, and a chain's descriptors, naming the same guest memory again and again, can name far
+/// more than the guest has: unbounded, one request grew the VMM by what they named.
+const MAX_MANY_DATA: usize = 64 << 10;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]

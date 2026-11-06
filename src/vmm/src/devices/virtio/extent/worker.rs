@@ -21,9 +21,10 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{
-    CommitArgs, ExtentIdLe, Info, IoArgs, MAX_ROOT, MAX_TRANSFER, MapArgs, MapEntry, RequestHeader,
-    Response, RootLen, UnmapArgs, VIRTIO_EXTENT_COMMIT_DURABLE, VIRTIO_EXTENT_COMMIT_ROOT,
-    VIRTIO_EXTENT_MAP_AHEAD, VIRTIO_EXTENT_MAP_MANY, VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO, VIRTIO_EXTENT_T_MAP,
+    CommitArgs, ExtentIdLe, Info, IoArgs, MAX_MANY_DATA, MAX_ROOT, MAX_TRANSFER, MapArgs, MapEntry,
+    RequestHeader, Response, RootLen, UnmapArgs, VIRTIO_EXTENT_COMMIT_DURABLE,
+    VIRTIO_EXTENT_COMMIT_ROOT, VIRTIO_EXTENT_MAP_AHEAD, VIRTIO_EXTENT_MAP_MANY,
+    VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO, VIRTIO_EXTENT_T_MAP,
     VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP, VIRTIO_EXTENT_T_WRITE,
     VIRTIO_EXTENT_WRITE_ROOT, write_barriers,
 };
@@ -554,8 +555,11 @@ async fn serve(
             let mut extents = vec![id.into()];
             // fxdax: the rest of a flush's dead extents, each freed as it would be alone, in one
             // request of the daemon's, not one each (TASK-92.13): the first error fails the
-            // request, the extents before it freed (`F_FREE_MANY`).
+            // request, the extents before it freed (`F_FREE_MANY`); refused past `MAX_MANY_DATA`.
             if flags & VIRTIO_EXTENT_FREE_MANY != 0 {
+                if reader.available() > MAX_MANY_DATA {
+                    return Err(Errno::EINVAL);
+                }
                 while reader.available() > 0 {
                     let id: ExtentIdLe = reader.obj()?;
                     extents.push(id.into());
@@ -578,8 +582,12 @@ async fn serve(
                 return Err(Errno::EINVAL);
             }
             let mut maps = vec![(args, flags & map_flags)];
-            // fxdax: the rest of a chunk's pieces (`F_MAP_MANY`), each with its own flags.
+            // fxdax: the rest of a chunk's pieces (`F_MAP_MANY`), each with its own flags; refused
+            // past `MAX_MANY_DATA`.
             if flags & VIRTIO_EXTENT_MAP_MANY != 0 {
+                if reader.available() > MAX_MANY_DATA {
+                    return Err(Errno::EINVAL);
+                }
                 while reader.available() > 0 {
                     let entry: MapEntry = reader.obj()?;
                     let flags = u32::from_le(entry.flags);
@@ -1453,5 +1461,52 @@ mod tests {
             &entries(&[1 << 1]),
         );
         assert_eq!(request(&store, &map, RESPONSE).1, errno(Errno::EINVAL));
+    }
+
+    /// fxdax: a `FREE_MANY`'s or a `MAP_MANY`'s data past `MAX_MANY_DATA` is refused, nothing
+    /// done: the device lists what it names in its own memory, and a chain naming the same guest
+    /// memory again and again names as much as it likes, which grew the VMM by as much. Up to it,
+    /// the request is served.
+    #[test]
+    fn test_refuses_many_past_their_most() {
+        let (store, _dir) = store();
+        let extent = io(&store, 1, 0, BLOCK);
+        let write = bytes(VIRTIO_EXTENT_T_WRITE, 0, Some(extent), &[7; BLOCK]);
+        assert_eq!(request(&store, &write, RESPONSE), (vec![], 0));
+        let commit = bytes(VIRTIO_EXTENT_T_COMMIT, 0, Some(CommitArgs::default()), &[]);
+        assert_eq!(request(&store, &commit, RESPONSE), (vec![], 0));
+        let read = bytes(VIRTIO_EXTENT_T_READ, 0, Some(extent), &[]);
+
+        // The extent named again past the most: refused, and the extent is there still.
+        let id = extent.id.as_slice();
+        let free = |data_len: usize| {
+            let data = id.repeat(data_len / id.len());
+            bytes(VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_FREE_MANY, Some(extent.id), &data)
+        };
+        let past = free(MAX_MANY_DATA + id.len());
+        assert_eq!(request(&store, &past, RESPONSE).1, errno(Errno::EINVAL));
+        assert_eq!(
+            request(&store, &read, BLOCK + RESPONSE),
+            (vec![7; BLOCK], 0)
+        );
+        // Up to the most, served: the extent freed, as often as it is named, and then not found.
+        let most = free(MAX_MANY_DATA);
+        assert_eq!(request(&store, &most, RESPONSE), (vec![], 0));
+        assert_eq!(
+            request(&store, &read, BLOCK + RESPONSE).1,
+            errno(Errno::ENOENT)
+        );
+
+        // Maps past the most: refused; up to it, served, as a store without a window serves maps.
+        let entry = MapEntry::default();
+        let entry = entry.as_slice();
+        let map = |data_len: usize| {
+            let data = entry.repeat(data_len / entry.len());
+            bytes(VIRTIO_EXTENT_T_MAP, VIRTIO_EXTENT_MAP_MANY, Some(MapArgs::default()), &data)
+        };
+        let past = map(MAX_MANY_DATA + entry.len());
+        assert_eq!(request(&store, &past, RESPONSE).1, errno(Errno::EINVAL));
+        let most = map(MAX_MANY_DATA);
+        assert_eq!(request(&store, &most, RESPONSE).1, errno(Errno::ENOSYS));
     }
 }
