@@ -33,7 +33,7 @@ use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
-use crate::logger::{error, warn};
+use crate::logger::{error, info, warn};
 use crate::vmm_config::extent::ExtentDeviceConfig;
 use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
 use crate::vstate::vm::KvmVm;
@@ -527,11 +527,22 @@ impl Extent {
         self.snapshot = Some(snapshot);
     }
 
-    /// Maps the window's mappings of the snapshot the device was restored from again.
+    /// Maps the window's mappings of the snapshot the device was restored from again. fxdax: all
+    /// at once, in a request of the daemon's or a few, each one change of the window, where a MAP
+    /// each, a round trip apiece, held the restore up (TASK-92.14).
     fn map_again(&mut self) -> Result<(), fxdax::Errno> {
-        for mapping in std::mem::take(&mut self.mappings) {
-            self.store().map_again(&mapping)?;
+        let mappings = std::mem::take(&mut self.mappings);
+        if mappings.is_empty() {
+            return Ok(());
         }
+        let start = std::time::Instant::now();
+        self.store().map_many(&mappings)?;
+        info!(
+            "extent device {}: the snapshot's {} window mappings mapped again in {:?}",
+            self.config.id,
+            mappings.len(),
+            start.elapsed()
+        );
         Ok(())
     }
 }
