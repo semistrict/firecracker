@@ -39,8 +39,8 @@ pub struct ExtentDeviceConfig {
     pub dax_window_size: Option<u64>,
     /// fxdax: the most private pages a writer's window holds, as it copies on write (doc-4's
     /// `DAX`, fxdax's backlog doc-13), which fxdax's extent daemon reserves against the store's
-    /// tenant's memory as the guest activates the device: a quarter of the window's pages without
-    /// it. A follower's window copies nothing.
+    /// tenant's memory as the guest activates the device: half the window's pages without it
+    /// (TASK-164.11). A follower's window copies nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dax_private_max: Option<u64>,
     /// The socket of fxdax's extent daemon, which serves the store.

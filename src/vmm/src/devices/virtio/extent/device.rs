@@ -262,12 +262,11 @@ impl Extent {
                 avail_features |= (1 << VIRTIO_EXTENT_F_DAX)
                     | (1 << VIRTIO_EXTENT_F_MAP_MANY)
                     | (1 << VIRTIO_EXTENT_F_MAP_AHEAD);
-                // fxdax: a writer's window copies on write (backlog doc-13), of a quarter of its
-                // pages at most unless configured; a follower's copies nothing.
+                // fxdax: a writer's window copies on write (backlog doc-13); a follower's copies
+                // nothing.
                 if !config.read_only {
-                    let pages = window.len() / fxdax::pages::page_size();
-                    let private_max = config.dax_private_max.unwrap_or(pages / 4).max(1);
-                    config_space.private_max = private_max.to_le();
+                    config_space.private_max =
+                        private_max(window.len(), config.dax_private_max).to_le();
                 }
                 Some(window)
             }
@@ -826,9 +825,27 @@ fn start_all<W, E>(
     Ok(started)
 }
 
+/// fxdax: the most private pages a writer's window of `len` bytes holds as it copies on write
+/// (backlog doc-13): `configured`, if given; otherwise half its pages, one at least (TASK-164.11).
+fn private_max(len: u64, configured: Option<u64>) -> u64 {
+    configured.unwrap_or(len / fxdax::pages::page_size() / 2).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fxdax TASK-164.11: a writer's window holds half its pages private at most unless configured
+    /// otherwise: a quarter kept a forked pgbench's every page not, each store to it in the fork
+    /// waiting for a PRIVATE (GCE r802: 309,608 of them, forked-dax 0.83; with half, r804:
+    /// 108,006, 0.91). One at least, of a window of a page.
+    #[test]
+    fn a_window_holds_half_its_pages_private_at_most() {
+        let page = fxdax::pages::page_size();
+        assert_eq!(private_max(2 << 30, None), (2 << 30) / page / 2);
+        assert_eq!(private_max(2 << 30, Some(16)), 16);
+        assert_eq!(private_max(page, None), 1);
+    }
 
     /// fxdax TASK-141.3: the configuration says the device's protocol version first, where a
     /// driver of every version reads it.
