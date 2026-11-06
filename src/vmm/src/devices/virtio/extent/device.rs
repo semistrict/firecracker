@@ -22,7 +22,7 @@ use super::{
 };
 use super::{
     Following, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_AHEAD, VIRTIO_EXTENT_F_MAP_MANY,
-    VIRTIO_EXTENT_F_READ_ONLY,
+    VIRTIO_EXTENT_F_READ_ONLY, VIRTIO_EXTENT_F_STATS,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
@@ -172,6 +172,7 @@ impl Extent {
             asked: 0,
             committed: 0,
             private_max: 0,
+            stats_asked: 0,
         };
         let tag = config.tag.as_bytes();
         if tag.len() > config_space.tag.len() {
@@ -212,6 +213,7 @@ impl Extent {
             .store(info.capacity, std::sync::atomic::Ordering::Release);
         let changes = notices.clone();
         store.on_capacity(move |capacity, ask| changes.resizing.changed(capacity, ask));
+        hear_stats_asks(&store, &notices);
         let following = Arc::new(Following::default());
         hear_commits(&store, &following);
 
@@ -219,11 +221,14 @@ impl Extent {
         // suppressed while the device takes the requests queued, and interrupts while the driver
         // takes the ones done (EVENT_IDX): each costs an exit, which nested virtualization makes
         // dear (TASK-41).
+        // fxdax: and the daemon asks the guest for its stats, a follower's as a writer's
+        // (TASK-111.4).
         let mut avail_features = if config.read_only {
             (1u64 << VIRTIO_F_VERSION_1)
                 | (1u64 << VIRTIO_RING_F_EVENT_IDX)
                 | (1 << VIRTIO_EXTENT_F_FREEZE)
                 | (1 << VIRTIO_EXTENT_F_READ_ONLY)
+                | (1 << VIRTIO_EXTENT_F_STATS)
         } else {
             (1u64 << VIRTIO_F_VERSION_1)
                 | (1u64 << VIRTIO_RING_F_EVENT_IDX)
@@ -231,6 +236,7 @@ impl Extent {
                 | (1 << VIRTIO_EXTENT_F_RESIZE)
                 | (1 << VIRTIO_EXTENT_F_FREEZE)
                 | (1 << VIRTIO_EXTENT_F_FREE_MANY)
+                | (1 << VIRTIO_EXTENT_F_STATS)
         };
         let mut shm_regions = Vec::new();
         let window_addr = match making {
@@ -349,6 +355,7 @@ impl Extent {
         stop_with_daemon(&store, &self.config.id);
         self.following = Arc::new(Following::default());
         hear_commits(&store, &self.following);
+        hear_stats_asks(&store, &self.notices);
         self.config_space.branch = store.branch().to_le();
         self.store = Some(Arc::new(store));
         self.window_created = false;
@@ -452,6 +459,10 @@ impl Extent {
             .lock()
             .expect("Poisoned lock") = Some(interrupt.clone());
         *self.following.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
+        // fxdax: the guest is asked for its stats if its driver takes asks (TASK-111.4).
+        let asks = self.acked_features & (1 << VIRTIO_EXTENT_F_STATS) != 0;
+        *self.notices.stats.interrupt.lock().expect("Poisoned lock") =
+            asks.then(|| interrupt.clone());
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         self.resume_worker()
     }
@@ -544,6 +555,14 @@ fn hear_commits(store: &RemoteExtentStore, following: &Arc<Following>) {
     following.committed(store.committed());
 }
 
+/// fxdax: has the daemon's asks for the stats of `store`'s VM process and guest ask the guest,
+/// through `notices`, while its driver takes asks; otherwise the store answers at once, with none of
+/// the guest's (TASK-111.4).
+fn hear_stats_asks(store: &RemoteExtentStore, notices: &Arc<Notices>) {
+    let notices = notices.clone();
+    store.on_stats_asked(move |ask| notices.stats.ask(ask));
+}
+
 /// A new branch's number, for a fork of the store, which names it in the extent daemon's bucket,
 /// which hosts share: 64 bits of the kernel's random numbers (getrandom(2)), none 0. fxdax
 /// TASK-79.26: not the clock's, whose xorshift gave about 38 bits, which two hosts' snapshots
@@ -616,7 +635,7 @@ impl VirtioDevice for Extent {
     }
 
     // fxdax: the store's capacity, and the shrink the guest is asked to take, as they are now;
-    // and a follower's writer's latest commit.
+    // and a follower's writer's latest commit; and the daemon's latest ask for the guest's stats.
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         use std::sync::atomic::Ordering;
         let config = ConfigSpace {
@@ -628,6 +647,7 @@ impl VirtioDevice for Extent {
                 .to_le(),
             asked: self.notices.resizing.asked.load(Ordering::Acquire).to_le(),
             committed: self.following.committed.load(Ordering::Acquire).to_le(),
+            stats_asked: self.notices.stats.asked.load(Ordering::Acquire).to_le(),
             ..self.config_space
         };
         let config = config.as_slice();
@@ -735,6 +755,9 @@ impl Extent {
             }
             self.store = None;
         }
+        // fxdax: no guest is asked for its stats until a driver activates it again, the store
+        // answering meanwhile (TASK-111.4).
+        *self.notices.stats.interrupt.lock().expect("Poisoned lock") = None;
         let DeviceState::Activated(ActiveState { interrupt, .. }) =
             std::mem::replace(&mut self.device_state, DeviceState::Inactive)
         else {

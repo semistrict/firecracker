@@ -34,6 +34,7 @@ use super::{
     VIRTIO_EXTENT_T_RESIZED, VIRTIO_EXTENT_T_UNPIN,
 };
 use super::{VIRTIO_EXTENT_MAP_ZEROS, VIRTIO_EXTENT_T_PRIVATE};
+use super::{StatsArgs, StatsAsks, VIRTIO_EXTENT_T_STATS};
 use crate::devices::virtio::queue::{DescriptorChain, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::{error, info};
@@ -72,12 +73,14 @@ impl Served {
 }
 
 /// fxdax: what the device's guest and the daemon tell each other beside requests, which the workers
-/// serve them with: the store's capacity, and whether the guest's filesystem is frozen
-/// (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
+/// serve them with: the store's capacity, whether the guest's filesystem is frozen
+/// (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it, and the daemon's asks for the guest's stats
+/// (`VIRTIO_EXTENT_F_STATS`).
 #[derive(Debug, Default)]
 pub(super) struct Notices {
     pub resizing: Resizing,
     pub frozen: AtomicBool,
+    pub stats: StatsAsks,
 }
 
 /// What the worker shares with the requests it serves.
@@ -686,6 +689,19 @@ async fn serve(
                 .store(flags & VIRTIO_EXTENT_FREEZE_FROZEN != 0, Ordering::Release);
             Ok(0)
         }
+        // fxdax: the guest's stats, which the daemon asked for (TASK-111.4).
+        VIRTIO_EXTENT_T_STATS => {
+            let args: StatsArgs = reader.obj()?;
+            if reader.available() > RemoteExtentStore::MAX_STATS {
+                return Err(Errno::EINVAL);
+            }
+            let text = reader.bytes(reader.available())?;
+            let text = std::str::from_utf8(&text).map_err(|_| Errno::EINVAL)?;
+            store
+                .answer_stats_async(u64::from_le(args.asked), Some(text))
+                .await?;
+            Ok(0)
+        }
         VIRTIO_EXTENT_T_RESIZED => {
             let args: ResizedArgs = reader.obj()?;
             let capacity = u64::from_le(args.capacity);
@@ -891,6 +907,33 @@ mod tests {
 
     fn request(store: &RemoteExtentStore, readable: &[u8], writable: usize) -> (Vec<u8>, u32) {
         request_split(store, readable, writable, usize::MAX)
+    }
+
+    /// fxdax: the requests of `kind` the daemons of this process have served (their metrics).
+    fn served(kind: &str) -> u64 {
+        let metrics = fxdax::extentd::metrics::render();
+        let name = format!("fxdax_extentd_requests_total{{kind=\"{kind}\"}} ");
+        let line = (metrics.lines()).find_map(|line| line.strip_prefix(&name));
+        let line = line.unwrap_or_else(|| panic!("no {kind} requests counted in {metrics}"));
+        line.parse().unwrap()
+    }
+
+    /// fxdax TASK-111.4: the guest's stats, text, go to the daemon, as the answer to the ask the
+    /// request names; what isn't text, or is longer than the daemon takes, is refused.
+    #[test]
+    fn stats_go_to_the_daemon() {
+        let (store, _dir) = store();
+        let asked = Some(StatsArgs { asked: 1u64.to_le() });
+        let before = served("stats");
+        let stats = bytes(VIRTIO_EXTENT_T_STATS, 0, asked, b"seals 1\ncommit abc\n");
+        assert_eq!(request(&store, &stats, RESPONSE), (vec![], 0));
+        assert_eq!(served("stats"), before + 1);
+        let not_text = bytes(VIRTIO_EXTENT_T_STATS, 0, asked, b"seals \xff\n");
+        assert_eq!(request(&store, &not_text, RESPONSE).1, errno(Errno::EINVAL));
+        let long = vec![b'\n'; RemoteExtentStore::MAX_STATS + 1];
+        let long = bytes(VIRTIO_EXTENT_T_STATS, 0, asked, &long);
+        assert_eq!(request(&store, &long, RESPONSE).1, errno(Errno::EINVAL));
+        assert_eq!(served("stats"), before + 1);
     }
 
     /// fxdax TASK-79.25: a chain whose descriptors give the device more bytes to write than a

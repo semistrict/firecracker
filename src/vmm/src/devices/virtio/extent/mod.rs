@@ -61,6 +61,10 @@ pub const VIRTIO_EXTENT_F_MAP_MANY: u32 = 7;
 pub const VIRTIO_EXTENT_F_MAP_AHEAD: u32 = 8;
 // fxdax: bits 9 and 10, writable DAX's asks to seal and stage 1's copy on write beside it, are
 // not reused (backlog doc-13).
+/// fxdax: the host asks the guest for its stats, the configuration's `stats_asked` changing, and
+/// telling it with a configuration change; the guest answers with `STATS`, its stats as text: what
+/// the extent daemon's snapshots report (TASK-111.4).
+pub const VIRTIO_EXTENT_F_STATS: u32 = 11;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -93,8 +97,12 @@ pub const VIRTIO_EXTENT_T_UNPIN: u32 = 14;
 /// private, past `private_max`; `EINVAL` where nothing is mapped, or of a follower's window
 /// (`UnmapArgs` are its arguments).
 pub const VIRTIO_EXTENT_T_PRIVATE: u32 = 16;
+/// fxdax (`VIRTIO_EXTENT_F_STATS`): the guest's answer to the ask its `StatsArgs` name, and those
+/// before it: its stats, the request's data, UTF-8 text of `RemoteExtentStore::MAX_STATS` bytes at
+/// most (`EINVAL` past it), lines of a name and a value (TASK-111.4).
+pub const VIRTIO_EXTENT_T_STATS: u32 = 17;
 /// The last request type.
-pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_PRIVATE;
+pub const VIRTIO_EXTENT_T_LAST: u32 = VIRTIO_EXTENT_T_STATS;
 
 /// A `WRITE`'s flags: a barrier precedes it, as if a `COMMIT` did; a `COMMIT` follows it (with
 /// `WRITE_COMMIT`); that commit completes once durable; fxdax: that commit sets the root, which
@@ -241,6 +249,13 @@ pub struct RootLen {
     pub reserved: u32,
 }
 
+/// fxdax: `STATS`'s arguments: the ask it answers (`ConfigSpace::stats_asked`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct StatsArgs {
+    pub asked: u64,
+}
+
 /// What `INFO` writes.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -362,6 +377,42 @@ impl Following {
     }
 }
 
+/// fxdax: the extent daemon's asks for the guest's stats (`VIRTIO_EXTENT_F_STATS`, TASK-111.4):
+/// the latest, which the configuration's `stats_asked` says, and how the guest is told, while the
+/// driver that activated the device takes asks.
+#[derive(Default)]
+pub struct StatsAsks {
+    pub asked: AtomicU64,
+    pub interrupt: Mutex<Option<Arc<dyn VirtioInterrupt>>>,
+}
+
+impl std::fmt::Debug for StatsAsks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatsAsks")
+            .field("asked", &self.asked)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StatsAsks {
+    /// The daemon asks `ask`: whether the guest is asked, with a configuration change, as it is
+    /// while the driver takes asks. Its answer, `STATS`, answers the asks before it too.
+    pub fn ask(&self, ask: u64) -> bool {
+        let interrupt = self.interrupt.lock().expect("Poisoned lock");
+        let Some(interrupt) = &*interrupt else {
+            return false;
+        };
+        self.asked.store(ask, Ordering::Release);
+        match interrupt.trigger(VirtioInterruptType::Config) {
+            Ok(()) => true,
+            Err(err) => {
+                crate::logger::error!("extent device: signalling a configuration change: {err:?}");
+                false
+            }
+        }
+    }
+}
+
 /// The device's configuration space.
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
@@ -385,6 +436,9 @@ pub struct ConfigSpace {
     /// fxdax: the most private pages a writer's window holds (`VIRTIO_EXTENT_F_DAX`, backlog
     /// doc-13): 0 of a follower's, which copies nothing.
     pub private_max: u64,
+    /// fxdax: the latest of the extent daemon's asks for the guest's stats, 0 before the first
+    /// (`VIRTIO_EXTENT_F_STATS`, TASK-111.4).
+    pub stats_asked: u64,
 }
 
 // SAFETY: They are plain data, with no implicit padding.
@@ -409,6 +463,8 @@ unsafe impl ByteValued for CommitArgs {}
 unsafe impl ByteValued for RootLen {}
 // SAFETY: As above.
 unsafe impl ByteValued for Info {}
+// SAFETY: As above.
+unsafe impl ByteValued for StatsArgs {}
 // SAFETY: As above.
 unsafe impl ByteValued for Epoch {}
 // SAFETY: As above.
@@ -450,5 +506,24 @@ mod tests {
         resizing.changed(4, false);
         resizing.answered(2, true);
         assert_eq!(known(&resizing), (4, 0));
+    }
+
+    /// fxdax TASK-111.4: the daemon's asks for the guest's stats reach the guest, the
+    /// configuration's `stats_asked` and a configuration change, while the driver takes asks; while
+    /// it doesn't, none is asked, for the store to answer at once.
+    #[test]
+    fn stats_are_asked_of_guests_that_take_asks() {
+        use crate::devices::virtio::test_utils::default_interrupt;
+        let asks = StatsAsks::default();
+        assert!(!asks.ask(1));
+        assert_eq!(asks.asked.load(Ordering::Acquire), 0);
+        let interrupt = default_interrupt();
+        *asks.interrupt.lock().unwrap() = Some(interrupt.clone());
+        assert!(asks.ask(2));
+        assert_eq!(asks.asked.load(Ordering::Acquire), 2);
+        assert!(interrupt.has_pending_interrupt(VirtioInterruptType::Config));
+        *asks.interrupt.lock().unwrap() = None;
+        assert!(!asks.ask(3));
+        assert_eq!(asks.asked.load(Ordering::Acquire), 2);
     }
 }
