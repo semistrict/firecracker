@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
-use fxdax::{ExtentStore, RemoteExtentStore};
+use fxdax::{DaemonConnection, ExtentStore, RemoteExtentStore};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefault};
@@ -183,28 +183,21 @@ impl Extent {
         }
         config_space.tag[..tag.len()].copy_from_slice(tag);
 
-        let store = match &making {
-            Making::Boot if config.read_only => {
-                RemoteExtentStore::connect_read_only(&config.extentd_socket, &config.path_on_host)
-            }
-            Making::Restore { .. } if config.read_only => {
-                return Err(ExtentError::ReadOnlyRestored(config.id.clone()));
-            }
-            Making::Boot => RemoteExtentStore::connect(
-                &config.extentd_socket,
-                &config.path_on_host,
-                config.capacity,
-            ),
-            Making::Restore { snapshot, .. } => RemoteExtentStore::connect_forked(
-                &config.extentd_socket,
-                &config.path_on_host,
-                &snapshot.point,
-                snapshot.point_branch,
-                config.capacity,
-            ),
+        if config.read_only && matches!(making, Making::Restore { .. }) {
+            return Err(ExtentError::ReadOnlyRestored(config.id.clone()));
         }
-        .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
-        stop_with_daemon(&store, &config.id);
+        let store = connect_stopping(&config.extentd_socket, &config.id)
+            .and_then(|daemon| match &making {
+                Making::Boot if config.read_only => daemon.open_read_only(&config.path_on_host),
+                Making::Boot => daemon.open(&config.path_on_host, config.capacity),
+                Making::Restore { snapshot, .. } => daemon.open_forked(
+                    &config.path_on_host,
+                    &snapshot.point,
+                    snapshot.point_branch,
+                    config.capacity,
+                ),
+            })
+            .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
         config_space.branch = store.branch().to_le();
         let notices = Arc::new(Notices::default());
         let info = store
@@ -350,11 +343,8 @@ impl Extent {
     /// reset (`reset_confined`), with its window's faults, before the new one creates its window
     /// in the same memory, which it left inaccessible meanwhile (TASK-79.8).
     fn reopen(&mut self) -> Result<(), fxdax::Error> {
-        let store = RemoteExtentStore::connect_read_only(
-            &self.config.extentd_socket,
-            &self.config.path_on_host,
-        )?;
-        stop_with_daemon(&store, &self.config.id);
+        let store = connect_stopping(&self.config.extentd_socket, &self.config.id)?
+            .open_read_only(&self.config.path_on_host)?;
         self.following = Arc::new(Following::default());
         hear_commits(&store, &self.following);
         hear_stats_asks(&store, &self.notices);
@@ -550,15 +540,22 @@ impl Extent {
     }
 }
 
-/// fxdax: with the daemon of `store`, the device `id`'s, gone, the guest's disk is gone: the VM
-/// stops at once, its exit status saying why, rather than going on with every request failing
-/// (TASK-50.2).
-fn stop_with_daemon(store: &RemoteExtentStore, id: &str) {
+/// fxdax: a connection to the extent daemon listening at `socket`, the device `id`'s, which stops
+/// the VM once the daemon goes: the guest's disk is gone then, and the VM stops at once, its exit
+/// status saying why, rather than going on with every request failing (TASK-50.2). Said before
+/// the store opens over it, so that a daemon going as it opens, as the VM is created, stops it so
+/// too, rather than as a store that failed to open (TASK-232).
+fn connect_stopping(
+    socket: impl AsRef<Path>,
+    id: &str,
+) -> Result<DaemonConnection, fxdax::Error> {
+    let daemon = DaemonConnection::connect(socket)?;
     let id = id.to_owned();
-    store.on_daemon_lost(move || {
+    daemon.on_lost(move || {
         error!("extent device {id}: the extent daemon went; stopping the VM");
         std::process::exit(crate::FcExitCode::ExtentdLost as i32);
     });
+    Ok(daemon)
 }
 
 /// fxdax: has `following` hear of the commits of the writer of `store`, a follower's, from the
