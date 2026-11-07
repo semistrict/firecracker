@@ -1000,9 +1000,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "event-listener",
  "extent_frame",
  "extent_remote",
  "fail",
+ "futures",
  "libc",
  "log",
  "rand 0.10.3",
@@ -1010,6 +1012,7 @@ dependencies = [
  "serde",
  "storage_device",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
