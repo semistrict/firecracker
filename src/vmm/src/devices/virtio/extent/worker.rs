@@ -799,18 +799,31 @@ mod tests {
 
     /// A store of 1 MiB, which an extent daemon of the test's serves: a host's, which keeps its
     /// stores' branches in the bucket FXDAX_EXTENTD_REMOTE names (memory:///NAME, in tests), as
-    /// of placement FXDAX_EXTENTD_TOKEN (1), which the tests' environment sets.
+    /// of placement FXDAX_EXTENTD_TOKEN (1), which the tests' environment sets: fxdax's
+    /// scripts/test.sh's firecracker part, which CI runs, and scripts/test-e2e.sh through it.
     fn store() -> (RemoteExtentStore, TestDir) {
         store_of(1 << 20)
     }
 
-    /// A store of `capacity` bytes, as [`store`] makes one.
+    /// A store of `capacity` bytes, as [`store`] makes one. fxdax: the daemon logs to standard
+    /// error, which a failed test shows: its EIO opening a store with no bucket named, as the tests
+    /// run without fxdax's scripts/test.sh, said nothing of why (fxdax TASK-220).
     fn store_of(capacity: u64) -> (RemoteExtentStore, TestDir) {
+        // Another test's logger already set is as good.
+        let _ = fxdax::extentd::logging::to_stderr();
         let dir = TestDir::new();
         let socket = dir.0.join("extentd.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         thread::spawn(move || fxdax::extentd::serve(listener));
-        let store = RemoteExtentStore::connect(&socket, dir.0.join("store"), capacity).unwrap();
+        let store = RemoteExtentStore::connect(&socket, dir.0.join("store"), capacity)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "opening a store through the test's daemon: {err:#}; its bucket is \
+                     FXDAX_EXTENTD_REMOTE's, its placement FXDAX_EXTENTD_TOKEN's \
+                     (memory:///vmm and 1, as fxdax's scripts/test.sh's firecracker part sets \
+                     them)"
+                )
+            });
         (store, dir)
     }
 
