@@ -826,24 +826,37 @@ fn start_all<W, E>(
 }
 
 /// fxdax: the most private pages a writer's window of `len` bytes holds as it copies on write
-/// (backlog doc-13): `configured`, if given; otherwise half its pages, one at least (TASK-164.11).
+/// (backlog doc-13): `configured`, if given; otherwise [`PRIVATE_MAX_DEFAULT`]'s pages, or the
+/// window's if fewer, one at least (TASK-227; half its pages before, TASK-164.11).
 fn private_max(len: u64, configured: Option<u64>) -> u64 {
-    configured.unwrap_or(len / fxdax::pages::page_size() / 2).max(1)
+    let pages = len / fxdax::pages::page_size();
+    configured
+        .unwrap_or((PRIVATE_MAX_DEFAULT / fxdax::pages::page_size()).min(pages))
+        .max(1)
 }
+
+/// fxdax: the bytes of private pages a writer's window holds at most unless configured
+/// (`dax_private_max`), whatever its size (TASK-227): enough for a forked pgbench's working set
+/// (GCE r804, forked-dax 0.91), which the daemon reserves against the tenant's memory.
+const PRIVATE_MAX_DEFAULT: u64 = 1 << 30;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// fxdax TASK-164.11: a writer's window holds half its pages private at most unless configured
-    /// otherwise: a quarter kept a forked pgbench's every page not, each store to it in the fork
-    /// waiting for a PRIVATE (GCE r802: 309,608 of them, forked-dax 0.83; with half, r804:
-    /// 108,006, 0.91). One at least, of a window of a page.
+    /// fxdax TASK-227: a writer's window holds 1 GiB of private pages at most unless configured
+    /// otherwise, whatever its size: the window is address space, as large as the data, and its
+    /// private pages are memory, which the daemon reserves against the tenant's. Half a 64 GiB
+    /// window's pages, as TASK-164.11's default had it, would have reserved 32 GiB a VM. A window
+    /// smaller than the default holds as many as it has pages; one of a page, one.
     #[test]
-    fn a_window_holds_half_its_pages_private_at_most() {
+    fn a_windows_private_pages_are_not_its_size() {
         let page = fxdax::pages::page_size();
-        assert_eq!(private_max(2 << 30, None), (2 << 30) / page / 2);
-        assert_eq!(private_max(2 << 30, Some(16)), 16);
+        let gib = (1 << 30) / page;
+        assert_eq!(private_max(64 << 30, None), gib);
+        assert_eq!(private_max(2 << 30, None), gib);
+        assert_eq!(private_max(512 << 20, None), (512 << 20) / page);
+        assert_eq!(private_max(64 << 30, Some(16)), 16);
         assert_eq!(private_max(page, None), 1);
     }
 
