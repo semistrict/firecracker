@@ -140,14 +140,23 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
         }
     }
 
-    /// Acknowledges that this set of features should be enabled.
+    /// Acknowledges that this set of features should be enabled: the page's features, in place of
+    /// those the driver wrote to it before. A driver may write a page again before `FEATURES_OK`,
+    /// as Linux does once a driver's `validate` has cleared some, and ORing the writes kept the
+    /// features it had cleared acked.
     fn ack_features_by_page(&mut self, page: u32, value: u32) {
-        let mut v = match page {
-            0 => u64::from(value),
-            1 => u64::from(value) << 32,
+        let (mut v, kept) = match page {
+            0 => (
+                u64::from(value),
+                self.acked_features() & !u64::from(u32::MAX),
+            ),
+            1 => (
+                u64::from(value) << 32,
+                self.acked_features() & u64::from(u32::MAX),
+            ),
             _ => {
                 warn!("Cannot acknowledge unknown features page: {}", page);
-                0u64
+                (0u64, self.acked_features())
             }
         };
 
@@ -159,7 +168,7 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
             // Don't count these features as acked.
             v &= !unrequested_features;
         }
-        self.set_acked_features(self.acked_features() | v);
+        self.set_acked_features(kept | v);
     }
 
     /// Reads this device configuration space at `offset`.
@@ -354,5 +363,21 @@ pub(crate) mod tests {
         }
 
         assert_eq!(device.acked_features, features);
+    }
+
+    /// A page written again replaces what it said, as Linux writes it once more after a driver's
+    /// `validate` clears features; the other page keeps its own.
+    #[test]
+    fn test_features_written_again() {
+        let mut device = MockVirtioDevice {
+            avail_features: u64::MAX,
+            acked_features: 0,
+        };
+        device.ack_features_by_page(0, 0b1100);
+        device.ack_features_by_page(1, 0b1);
+        device.ack_features_by_page(0, 0b0100);
+        assert_eq!(device.acked_features, (1 << 32) | 0b0100);
+        device.ack_features_by_page(1, 0);
+        assert_eq!(device.acked_features, 0b0100);
     }
 }
