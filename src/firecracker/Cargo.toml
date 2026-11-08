@@ -19,6 +19,8 @@ bench = false
 tracing = ["log-instrument", "utils/tracing", "vmm/tracing"]
 fuzzing = ["vmm/fuzzing"]
 gdb = ["vmm/gdb"]
+# fxdax's extent-store device (resources/fxdax/README.md).
+fxdax = ["vmm/fxdax"]
 
 [dependencies]
 displaydoc = "0.2.5"
