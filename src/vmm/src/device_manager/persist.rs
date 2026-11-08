@@ -615,24 +615,14 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             use crate::devices::virtio::extent::Extent;
             use crate::devices::virtio::extent::persist::ExtentConstructorArgs;
 
-            // On x86-64, KVM maps the windows' pages for the guest as the extent daemon maps
-            // them, with a vCPU of their own, as the VM booted with.
-            #[cfg(target_arch = "x86_64")]
-            let prefault = if state
-                .extent_devices
-                .iter()
-                .any(|extent| extent.device_state.window_addr.is_some())
-            {
-                use crate::devices::virtio::extent::{KvmPrefault, PrefaultGuestMemory};
-                let id = u64::from(constructor_args.vm_resources.machine_config.vcpu_count);
-                KvmPrefault::new(vm, id)
-                    .map_err(DevicePersistError::ExtentPrefault)?
-                    .map(|prefault| -> Arc<dyn PrefaultGuestMemory> { Arc::new(prefault) })
-            } else {
-                None
-            };
-            #[cfg(not(target_arch = "x86_64"))]
-            let prefault = None;
+            let prefault = restored_extent_prefault(
+                vm,
+                constructor_args.vm_resources.machine_config.vcpu_count,
+                state
+                    .extent_devices
+                    .iter()
+                    .map(|extent| &extent.device_state),
+            )?;
             for extent_state in &state.extent_devices {
                 let device = Arc::new(Mutex::new(Extent::restore(
                     ExtentConstructorArgs {
@@ -684,6 +674,31 @@ impl<'a> Persist<'a> for MMIODeviceManager {
 
         Ok(dev_manager)
     }
+}
+
+/// fxdax: what maps the windows of extent-store devices restored from `states` for the guest as
+/// the extent daemon maps their pages, on x86-64: a vCPU of their own, as the VM booted with,
+/// whose ID follows the guest's `vcpu_count` vCPUs'; none if no device has a window, or elsewhere.
+/// Either transport's devices restore with it (TASK-267).
+#[cfg(feature = "fxdax")]
+pub(crate) fn restored_extent_prefault<'s>(
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused))] vm: &KvmVm,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused))] vcpu_count: u8,
+    mut states: impl Iterator<Item = &'s crate::devices::virtio::extent::persist::ExtentState>,
+) -> Result<Option<Arc<dyn crate::devices::virtio::extent::PrefaultGuestMemory>>, DevicePersistError>
+{
+    if !states.any(|extent| extent.window_addr.is_some()) {
+        return Ok(None);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::devices::virtio::extent::{KvmPrefault, PrefaultGuestMemory};
+        Ok(KvmPrefault::new(vm, u64::from(vcpu_count))
+            .map_err(DevicePersistError::ExtentPrefault)?
+            .map(|prefault| -> Arc<dyn PrefaultGuestMemory> { Arc::new(prefault) }))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    Ok(None)
 }
 
 #[cfg(test)]

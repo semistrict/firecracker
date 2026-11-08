@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The extent device's DAX window: guest physical addresses past the 64-bit MMIO gap, as
-//! virtio-pmem's, backed by anonymous host memory that KVM follows. fxdax's extent daemon owns
+//! virtio-pmem's, over the MMIO transport, or a BAR of its own in the gap over PCI ([`Place`]),
+//! backed by anonymous host memory that KVM follows. fxdax's extent daemon owns
 //! the window: the device hands the host memory to the store's connection, which maps the
 //! window's pages there from the daemon's memory, and serves the faults KVM takes on the rest.
 //!
@@ -14,42 +15,115 @@ use std::io;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
-use vm_allocator::{AllocPolicy, RangeInclusive};
+use vm_allocator::{AddressAllocator, AllocPolicy, RangeInclusive};
 
+use crate::devices::virtio::transport::pci::device::shm_bar_size;
 use crate::utils::u64_to_usize;
 use crate::vmm_config::extent::DAX_WINDOW_ALIGNMENT;
+use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vm::{KvmMemSlot, KvmVm, VmError};
 
-/// The window's guest physical addresses, allocated past the 64-bit MMIO gap, and freed on drop.
+/// Where a window's guest physical addresses are (TASK-267).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// Past the 64-bit MMIO gap, as virtio-pmem's: the MMIO transport tells the guest of them
+    /// with its shared memory registers.
+    PastMmio64,
+    /// In the 64-bit MMIO gap, the PCI host bridge's window, as a BAR the PCI transport describes
+    /// with a shared memory capability: a power of two in size, the window's length rounded up,
+    /// and aligned to it, as BARs are; the guest finds it there, as Firecracker relocates no BAR.
+    PciBar,
+}
+
+impl Place {
+    /// Where the window at `start` is, as the VM's resource `allocator` has it: a BAR's if it is
+    /// in the 64-bit MMIO gap.
+    fn of(allocator: &ResourceAllocator, start: u64) -> Self {
+        let gap = &allocator.mmio64_memory;
+        if (gap.base()..=gap.end()).contains(&start) {
+            Place::PciBar
+        } else {
+            Place::PastMmio64
+        }
+    }
+
+    /// The addresses allocated for a window of `len` bytes, and their alignment.
+    fn allocated(self, len: u64) -> (u64, u64) {
+        match self {
+            Place::PastMmio64 => (len, DAX_WINDOW_ALIGNMENT),
+            Place::PciBar => {
+                let size = shm_bar_size(len);
+                (size, size)
+            }
+        }
+    }
+
+    fn allocator(self, allocator: &mut ResourceAllocator) -> &mut AddressAllocator {
+        match self {
+            Place::PastMmio64 => &mut allocator.past_mmio64_memory,
+            Place::PciBar => &mut allocator.mmio64_memory,
+        }
+    }
+
+    /// Allocates the addresses of a window of `len` bytes from `allocator`: where it starts.
+    fn allocate(
+        self,
+        allocator: &mut ResourceAllocator,
+        len: u64,
+    ) -> Result<u64, vm_allocator::Error> {
+        let (size, align) = self.allocated(len);
+        Ok(self
+            .allocator(allocator)
+            .allocate(size, align, AllocPolicy::FirstMatch)?
+            .start())
+    }
+
+    /// Frees the addresses [`Place::allocate`] allocated for the window of `len` bytes at `start`.
+    fn free(self, allocator: &mut ResourceAllocator, start: u64, len: u64) {
+        let (size, _) = self.allocated(len);
+        let range = RangeInclusive::new(start, start + size - 1).expect("Invalid DAX window range");
+        _ = self.allocator(allocator).free(&range);
+    }
+}
+
+/// The window's guest physical addresses, allocated where [`Place`] says, and freed on drop.
 #[derive(Debug)]
 struct GuestRange {
     vm: Arc<KvmVm>,
     start: u64,
+    /// The window's length.
     len: u64,
+    place: Place,
 }
 
 impl GuestRange {
-    fn allocate(vm: Arc<KvmVm>, len: u64) -> Result<Self, vm_allocator::Error> {
-        let start = vm
-            .resource_allocator()
-            .past_mmio64_memory
-            .allocate(len, DAX_WINDOW_ALIGNMENT, AllocPolicy::FirstMatch)?
-            .start();
-        Ok(Self { vm, start, len })
+    fn allocate(vm: Arc<KvmVm>, len: u64, place: Place) -> Result<Self, vm_allocator::Error> {
+        let start = place.allocate(&mut vm.resource_allocator(), len)?;
+        Ok(Self {
+            vm,
+            start,
+            len,
+            place,
+        })
     }
 
     /// The range at `start`, which the VM's resource allocator, restored from a snapshot, holds
     /// as allocated already.
     fn restored(vm: Arc<KvmVm>, start: u64, len: u64) -> Self {
-        Self { vm, start, len }
+        let place = Place::of(&vm.resource_allocator(), start);
+        Self {
+            vm,
+            start,
+            len,
+            place,
+        }
     }
 }
 
 impl Drop for GuestRange {
     fn drop(&mut self) {
-        let range = RangeInclusive::new(self.start, self.start + self.len - 1)
-            .expect("Invalid DAX window range");
-        _ = self.vm.resource_allocator().past_mmio64_memory.free(&range);
+        self.place
+            .free(&mut self.vm.resource_allocator(), self.start, self.len);
     }
 }
 
@@ -139,12 +213,12 @@ pub(super) struct DaxWindow {
 }
 
 impl DaxWindow {
-    /// A window of `len` bytes, a multiple of 2 MiB, mapped into `vm`'s guest.
-    pub(super) fn new(vm: Arc<KvmVm>, len: u64) -> Result<Self, DaxWindowError> {
+    /// A window of `len` bytes, a multiple of 2 MiB, mapped into `vm`'s guest where `place` says.
+    pub(super) fn new(vm: Arc<KvmVm>, len: u64, place: Place) -> Result<Self, DaxWindowError> {
         if len == 0 || !len.is_multiple_of(DAX_WINDOW_ALIGNMENT) {
             return Err(DaxWindowError::Size(len));
         }
-        let guest = GuestRange::allocate(vm.clone(), len)?;
+        let guest = GuestRange::allocate(vm.clone(), len, place)?;
         Self::in_range(vm, guest)
     }
 
@@ -331,5 +405,47 @@ mod x86_64 {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// fxdax TASK-267: over PCI, a window's addresses are a BAR's, in the 64-bit MMIO gap, its
+    /// length rounded up to a power of two and aligned to it; over MMIO, past the gap, as long
+    /// as the window, 2 MiB aligned. Either is freed whole, and a restore finds which it was by
+    /// its address.
+    #[test]
+    fn windows_are_placed_as_their_transport_needs() {
+        let mut allocator = ResourceAllocator::new();
+        // The capability BAR of a device attached before, which takes the gap's first bytes.
+        allocator
+            .mmio64_memory
+            .allocate(0x80000, 0x80000, AllocPolicy::FirstMatch)
+            .unwrap();
+        let len = (64 << 30) + (2 << 20);
+
+        let bar = Place::PciBar.allocate(&mut allocator, len).unwrap();
+        assert_eq!(bar, allocator.mmio64_memory.base() + (128 << 30));
+        assert_eq!(bar % (128 << 30), 0);
+        assert_eq!(Place::of(&allocator, bar), Place::PciBar);
+        // Another, which the first's rounding up leaves no room for in the gap.
+        assert!(Place::PciBar.allocate(&mut allocator, len).is_err());
+
+        let past = Place::PastMmio64.allocate(&mut allocator, len).unwrap();
+        assert_eq!(past, allocator.past_mmio64_memory.base());
+        assert_eq!(Place::of(&allocator, past), Place::PastMmio64);
+        let next = Place::PastMmio64.allocate(&mut allocator, 2 << 20).unwrap();
+        assert_eq!(next, past + len);
+
+        // Freed whole, each is allocated again where it was.
+        Place::PciBar.free(&mut allocator, bar, len);
+        assert_eq!(Place::PciBar.allocate(&mut allocator, len).unwrap(), bar);
+        Place::PastMmio64.free(&mut allocator, past, len);
+        assert_eq!(
+            Place::PastMmio64.allocate(&mut allocator, len).unwrap(),
+            past
+        );
     }
 }

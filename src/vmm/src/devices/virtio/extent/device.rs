@@ -13,7 +13,7 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use fxdax::{DaemonConnection, ExtentStore, RemoteExtentStore};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefault};
+use super::window::{DaxWindow, DaxWindowError, Place, PrefaultGuestMemory, WindowPrefault};
 use super::worker::{Notices, Worker};
 use super::{
     ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
@@ -53,6 +53,8 @@ pub enum ExtentError {
     EventFd(std::io::Error),
     /// The snapshot's extent device is of protocol version {0}, this VMM's {1}: its guest's driver is of another
     Protocol(u32, u32),
+    /// The snapshot's extent device {0} has a DAX window configured but no address saved for it
+    WindowNotSaved(String),
 }
 
 /// Errors taking a snapshot of an extent-store device (TASK-39.1).
@@ -84,7 +86,8 @@ pub struct ExtentSnapshot {
 /// How a device is made: as its VM boots, or restored from a snapshot ([`ExtentSnapshot`]), its
 /// window where the snapshot had it in guest memory.
 pub(super) enum Making<'a> {
-    Boot,
+    /// Booted, its window placed as its transport needs.
+    Boot(Place),
     Restore {
         snapshot: &'a ExtentSnapshot,
         window_addr: Option<u64>,
@@ -144,8 +147,12 @@ impl fmt::Debug for Extent {
 impl Extent {
     /// A device as `config` describes, in `vm`, which opens its store, creating it if it doesn't
     /// exist, in the extent daemon, and maps its DAX window, if it has one, into the guest.
-    pub fn new(vm: Arc<KvmVm>, config: ExtentDeviceConfig) -> Result<Self, ExtentError> {
-        Self::make(vm, config, Making::Boot)
+    pub fn new(
+        vm: Arc<KvmVm>,
+        config: ExtentDeviceConfig,
+        place: Place,
+    ) -> Result<Self, ExtentError> {
+        Self::make(vm, config, Making::Boot(place))
     }
 
     /// A device as `config` describes, made as `making` says: its store opened, or, restored from
@@ -188,8 +195,8 @@ impl Extent {
         }
         let store = connect_stopping(&config.extentd_socket, &config.id)
             .and_then(|daemon| match &making {
-                Making::Boot if config.read_only => daemon.open_read_only(&config.path_on_host),
-                Making::Boot => daemon.open(&config.path_on_host, config.capacity),
+                Making::Boot(_) if config.read_only => daemon.open_read_only(&config.path_on_host),
+                Making::Boot(_) => daemon.open(&config.path_on_host, config.capacity),
                 Making::Restore { snapshot, .. } => daemon.open_forked(
                     &config.path_on_host,
                     &snapshot.point,
@@ -235,15 +242,17 @@ impl Extent {
                 | (1 << VIRTIO_EXTENT_F_STATS)
         };
         let mut shm_regions = Vec::new();
-        let window_addr = match making {
-            Making::Boot => None,
-            Making::Restore { window_addr, .. } => window_addr,
-        };
         let window = match config.dax_window_size {
             Some(size) => {
-                let window = match window_addr {
-                    Some(addr) => DaxWindow::at(vm, addr, size)?,
-                    None => DaxWindow::new(vm, size)?,
+                let window = match making {
+                    Making::Boot(place) => DaxWindow::new(vm, size, place)?,
+                    Making::Restore {
+                        window_addr: Some(addr),
+                        ..
+                    } => DaxWindow::at(vm, addr, size)?,
+                    Making::Restore {
+                        window_addr: None, ..
+                    } => return Err(ExtentError::WindowNotSaved(config.id.clone())),
                 };
                 shm_regions.push(VirtioShmRegion {
                     id: DAX_WINDOW_SHM_ID,
