@@ -417,7 +417,7 @@ pub fn restore_from_snapshot(
     }
 
     // fxdax: the stores the extent-store devices open, each forked from the snapshot's point of
-    // its store if it doesn't exist.
+    // its store if it doesn't exist; over either transport (TASK-267).
     #[cfg(feature = "fxdax")]
     for entry in &params.extent_overrides {
         microvm_state
@@ -426,6 +426,14 @@ pub fn restore_from_snapshot(
             .extent_devices
             .iter_mut()
             .map(|device| &mut device.device_state)
+            .chain(
+                microvm_state
+                    .device_states
+                    .pci_state
+                    .extent_devices
+                    .iter_mut()
+                    .map(|device| &mut device.device_state),
+            )
             .find(|state| state.config.id == entry.id)
             .map(|state| {
                 state.config.path_on_host.clone_from(&entry.path_on_host);

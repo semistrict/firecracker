@@ -87,7 +87,7 @@ pub enum StartMicrovmError {
     /// Cannot create the vCPU that maps extent-store devices' DAX windows for the guest: {0}
     #[cfg(all(feature = "fxdax", target_arch = "x86_64"))]
     ExtentPrefault(io::Error),
-    /// Extent-store devices need a Firecracker built with its `fxdax` feature, on the MMIO transport
+    /// Extent-store devices need a Firecracker built with its `fxdax` feature
     #[cfg(feature = "fxdax")]
     ExtentDevicesUnsupported,
     /// Cannot start the thread that starts extent-store devices' threads: {0}
@@ -863,22 +863,24 @@ fn attach_extent_devices(
     pci_enabled: bool,
     #[cfg_attr(not(target_arch = "x86_64"), allow(unused))] vcpu_count: u8,
 ) -> Result<(), StartMicrovmError> {
-    use crate::devices::virtio::extent::Extent;
+    use crate::devices::virtio::extent::{Extent, Place};
 
     if configs.is_empty() {
         return Ok(());
     }
-    // The PCI transport has no shared memory regions, which DAX windows are.
-    if pci_enabled {
-        return Err(StartMicrovmError::ExtentDevicesUnsupported);
-    }
+    // fxdax: over PCI, a window is a BAR of its device's (TASK-267).
+    let place = if pci_enabled {
+        Place::PciBar
+    } else {
+        Place::PastMmio64
+    };
     let kvm_vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
     #[cfg(target_arch = "x86_64")]
     let mut prefault = None;
     for config in configs {
         let id = config.id.clone();
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut extent = Extent::new(kvm_vm.clone(), config.clone())?;
+        let mut extent = Extent::new(kvm_vm.clone(), config.clone(), place)?;
         #[cfg(target_arch = "x86_64")]
         if config.dax_window_size.is_some() {
             use crate::devices::virtio::extent::KvmPrefault;

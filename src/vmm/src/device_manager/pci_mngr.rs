@@ -254,6 +254,11 @@ pub struct PciDevicesState {
     pub pmem_devices: Vec<VirtioDeviceState<PmemState>>,
     /// Memory device state.
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
+    /// fxdax: extent-store device states (TASK-267).
+    #[cfg(feature = "fxdax")]
+    #[serde(default)]
+    pub extent_devices:
+        Vec<VirtioDeviceState<crate::devices::virtio::extent::persist::ExtentState>>,
 }
 
 pub struct PciDevicesConstructorArgs<'a> {
@@ -419,10 +424,20 @@ impl<'a> Persist<'a> for PciDevices {
                         transport_state,
                     })
                 }
-                // Extent-store devices are MMIO's only.
+                // Microvm::save_state has each take the snapshot of its store first.
                 #[cfg(feature = "fxdax")]
                 VirtioDeviceType::Extent => {
-                    unreachable!("extent-store devices are not attached over PCI")
+                    let extent = locked_virtio_dev
+                        .as_mut_any()
+                        .downcast_mut::<crate::devices::virtio::extent::Extent>()
+                        .unwrap();
+                    let device_state = extent.save();
+                    state.extent_devices.push(VirtioDeviceState {
+                        device_id: extent.id().to_string(),
+                        sbdf,
+                        device_state,
+                        transport_state,
+                    })
                 }
             }
         }
@@ -599,6 +614,45 @@ impl<'a> Persist<'a> for PciDevices {
                 &pmem_state.transport_state,
                 constructor_args.event_manager,
             )?
+        }
+
+        // fxdax: each window where its BAR is, which the snapshot holds as the device's
+        // `window_addr` and the transport's BARs (TASK-267).
+        #[cfg(feature = "fxdax")]
+        {
+            use crate::devices::virtio::extent::Extent;
+            use crate::devices::virtio::extent::persist::ExtentConstructorArgs;
+
+            let prefault = super::persist::restored_extent_prefault(
+                constructor_args.vm,
+                constructor_args.vm_resources.machine_config.vcpu_count,
+                state
+                    .extent_devices
+                    .iter()
+                    .map(|extent| &extent.device_state),
+            )?;
+            for extent_state in &state.extent_devices {
+                let device = Arc::new(Mutex::new(Extent::restore(
+                    ExtentConstructorArgs {
+                        mem,
+                        vm: constructor_args.vm.clone(),
+                        prefault: prefault.clone(),
+                    },
+                    &extent_state.device_state,
+                )?));
+                constructor_args
+                    .vm_resources
+                    .extent
+                    .configs
+                    .push((&extent_state.device_state.config).into());
+                pci_devices.restore_pci_device(
+                    constructor_args.vm,
+                    device,
+                    &extent_state.device_id,
+                    &extent_state.transport_state,
+                    constructor_args.event_manager,
+                )?
+            }
         }
 
         if let Some(memory_device) = &state.memory_device {

@@ -18,7 +18,7 @@ mod worker;
 pub use self::device::{Extent, ExtentError};
 #[cfg(target_arch = "x86_64")]
 pub use self::window::KvmPrefault;
-pub use self::window::{DaxWindowError, PrefaultGuestMemory, dax_window_at};
+pub use self::window::{DaxWindowError, Place, PrefaultGuestMemory, dax_window_at};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
