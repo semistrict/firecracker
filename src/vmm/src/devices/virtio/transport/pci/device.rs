@@ -23,6 +23,7 @@ use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 use zerocopy::IntoBytes;
 
+use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_ids;
 use crate::devices::virtio::queue::Queue;
@@ -255,6 +256,8 @@ pub enum VirtioPciDeviceError {
     PciConfiguration(#[from] PciConfigurationError),
     /// Invalid restore state: driver_status {0:#x} is inconsistent with device_activated (expected {1:#x})
     InvalidRestoreState(u8, u8),
+    /// Cannot activate the restored device: {0}
+    Activation(#[from] ActivateError),
 }
 
 pub struct VirtioPciDevice {
@@ -471,6 +474,8 @@ impl VirtioPciDevice {
             msix_config_cap_offset: state.msix_config_cap_offset,
         };
 
+        // A device that cannot activate again fails the restore, as over MMIO, rather than
+        // leaving its driver a device that serves nothing.
         if state.device_activated {
             virtio_pci_device
                 .device
@@ -479,7 +484,7 @@ impl VirtioPciDevice {
                 .activate(
                     virtio_pci_device.memory.clone(),
                     virtio_pci_device.virtio_interrupt.as_ref().unwrap().clone(),
-                );
+                )?;
         }
 
         Ok(virtio_pci_device)
@@ -1029,6 +1034,7 @@ mod tests {
     use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
     use crate::devices::virtio::rng::Entropy;
+    use crate::devices::virtio::rng::persist::EntropyConstructorArgs;
     use crate::devices::virtio::transport::pci::common_config_offset::*;
     use crate::devices::virtio::transport::pci::device::{
         COMMON_CONFIG_BAR_OFFSET, COMMON_CONFIG_SIZE, DEVICE_CONFIG_BAR_OFFSET, DEVICE_CONFIG_SIZE,
@@ -1042,6 +1048,7 @@ mod tests {
     use crate::pci::msix::MsixCap;
     use crate::pci::{PciCapabilityId, PciClassCode, PciDevice};
     use crate::rate_limiter::RateLimiter;
+    use crate::snapshot::Persist;
 
     fn create_vmm_with_virtio_pci_device() -> Vmm {
         let mut vmm = default_vmm();
@@ -1720,6 +1727,16 @@ mod tests {
         // device_activated == true and driver_status == INIT is preserved in the
         // snapshot, so the blocking behavior survives restore.
         let saved_state = locked.state();
+        // The device's own state too, which a restore builds the device from, its queues
+        // ready: a device restored without them cannot activate, which fails the restore.
+        let saved_entropy = locked
+            .virtio_device()
+            .lock()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Entropy>()
+            .unwrap()
+            .save();
         drop(locked);
 
         // Fully drop the original device before constructing the restored copy: the restored
@@ -1733,7 +1750,15 @@ mod tests {
         // its `MsixVectorGroup::drop` will succeed when the test ends.
         *kvm_vm.resource_allocator() = saved_allocator;
 
-        let new_entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
+        let new_entropy = Arc::new(Mutex::new(
+            Entropy::restore(
+                EntropyConstructorArgs {
+                    mem: kvm_vm.guest_memory().clone(),
+                },
+                &saved_entropy,
+            )
+            .unwrap(),
+        ));
         let restored =
             VirtioPciDevice::new_from_state("rng".to_string(), &kvm_vm, new_entropy, saved_state)
                 .unwrap();
