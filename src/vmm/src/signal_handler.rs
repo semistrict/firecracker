@@ -80,6 +80,12 @@ fn log_sigsys_err(si_code: c_int, info: *mut siginfo_t) {
 
 fn empty_fn(_si_code: c_int, _info: *mut siginfo_t) {}
 
+#[cfg(feature = "fxdax")]
+use fault::log_fault;
+// Without the fxdax feature, a fault's handler says no more than its signal.
+#[cfg(not(feature = "fxdax"))]
+use self::empty_fn as log_fault;
+
 generate_handler!(
     sigxfsz_handler,
     SIGXFSZ,
@@ -101,7 +107,7 @@ generate_handler!(
     SIGBUS,
     SIGBUS,
     METRICS.signals.sigbus,
-    empty_fn
+    log_fault
 );
 
 generate_handler!(
@@ -109,7 +115,7 @@ generate_handler!(
     SIGSEGV,
     SIGSEGV,
     METRICS.signals.sigsegv,
-    empty_fn
+    log_fault
 );
 
 generate_handler!(
@@ -132,7 +138,7 @@ generate_handler!(
     SIGILL,
     SIGILL,
     METRICS.signals.sigill,
-    empty_fn
+    log_fault
 );
 
 #[inline(always)]
@@ -296,6 +302,8 @@ thread_local! {
 /// stack Rust's standard library gave it: too small for the handlers, which overflow it, and the
 /// kernel kills the process with the signal.
 pub fn install_signal_stack() {
+    #[cfg(feature = "fxdax")]
+    fault::record_thread();
     SIGNAL_STACK.with_borrow_mut(|installed| {
         if installed.is_some() {
             return;
@@ -308,6 +316,125 @@ pub fn install_signal_stack() {
             ),
         }
     });
+}
+
+/// fxdax: what the handlers of faults say of them: on which thread, where, and whether in the
+/// guard below the thread's stack, a stack overflow (fxdax TASK-137).
+#[cfg(feature = "fxdax")]
+mod fault {
+    use std::cell::Cell;
+    use std::ptr::null_mut;
+
+    use libc::{c_int, siginfo_t};
+
+    use crate::arch::host_page_size;
+    use crate::logger::error_unrestricted;
+
+    /// Says on which thread a fault was, where, and whether in the guard below the thread's
+    /// stack: a stack overflow.
+    pub(super) fn log_fault(si_code: c_int, info: *mut siginfo_t) {
+        let thread = THREAD.get();
+        let name = thread.as_ref().map_or("<unknown>", ThreadInfo::name);
+        // A signal sent, by `kill` or the like, rather than raised by a fault, has no address.
+        if si_code <= 0 {
+            error_unrestricted!("Thread {} was sent the signal: no fault.", name);
+            return;
+        }
+        // SAFETY: Safe because `info` is the kernel's, for a fault, which carries its address.
+        let addr = unsafe { (*info).si_addr() } as usize;
+        if thread.is_some_and(|thread| thread.guard.0 <= addr && addr < thread.guard.1) {
+            error_unrestricted!(
+                "Thread {} faulted at {:#x}, in the guard below its stack: it overflowed its stack.",
+                name,
+                addr
+            );
+        } else {
+            error_unrestricted!("Thread {} faulted at {:#x}.", name, addr);
+        }
+    }
+
+    /// What the fatal signals' handlers say of the thread they interrupt, which they can't ask for
+    /// then: recorded as it starts, by [`record_thread`].
+    #[derive(Debug, Clone, Copy)]
+    struct ThreadInfo {
+        /// The thread's name, as much of it as fits, cut at a character's boundary.
+        name: [u8; 32],
+        name_len: usize,
+        /// The addresses, from and up to, of the guard below the thread's stack, where it faults
+        /// as it overflows. On the main thread, with musl, those below the stack as it was when
+        /// recorded, which the kernel grows as it needs: an overflow there faults lower, and is not
+        /// told.
+        guard: (usize, usize),
+    }
+
+    impl ThreadInfo {
+        fn current() -> Self {
+            let mut name = [0; 32];
+            let current = std::thread::current();
+            let whole = current.name().unwrap_or("<unnamed>");
+            let mut name_len = whole.len().min(name.len());
+            while !whole.is_char_boundary(name_len) {
+                name_len -= 1;
+            }
+            name[..name_len].copy_from_slice(&whole.as_bytes()[..name_len]);
+            ThreadInfo {
+                name,
+                name_len,
+                guard: stack_guard().unwrap_or((0, 0)),
+            }
+        }
+
+        fn name(&self) -> &str {
+            std::str::from_utf8(&self.name[..self.name_len]).unwrap_or("<unknown>")
+        }
+    }
+
+    /// The addresses, from and up to, of the guard below the calling thread's stack, found as
+    /// Rust's standard library finds it to tell a stack overflow.
+    fn stack_guard() -> Option<(usize, usize)> {
+        let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::zeroed();
+        // SAFETY: Safe because `attr` is the calling thread's to fill in, and we check the result.
+        if unsafe { libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let mut guard_size = 0;
+        let mut stack = null_mut();
+        let mut stack_size = 0;
+        // SAFETY: Safe because `attr` was filled in, and is destroyed once read.
+        let read = unsafe {
+            let read = libc::pthread_attr_getguardsize(attr.as_ptr(), &mut guard_size) == 0
+                && libc::pthread_attr_getstack(attr.as_ptr(), &mut stack, &mut stack_size) == 0;
+            libc::pthread_attr_destroy(attr.as_mut_ptr());
+            read
+        };
+        if !read {
+            return None;
+        }
+        // musl before 1.1.19 says there is none.
+        let guard_size = match guard_size {
+            0 => host_page_size(),
+            size => size,
+        };
+        let lowest = stack as usize;
+        if cfg!(target_env = "musl") {
+            Some((lowest - guard_size, lowest))
+        } else {
+            // glibc put the guard in the stack before 2.27, and below it since.
+            Some((lowest - guard_size, lowest + guard_size))
+        }
+    }
+
+    thread_local! {
+        /// The calling thread, as [`record_thread`] recorded it. It doesn't drop, so a signal's
+        /// handler reads it with no more than a load: no destructor to register, nor lock to take.
+        static THREAD: Cell<Option<ThreadInfo>> = const { Cell::new(None) };
+    }
+
+    /// Records the calling thread, its name and where its stack's guard is, for the handlers of
+    /// faults to say: [`super::install_signal_stack`] does, as each thread starts.
+    pub(super) fn record_thread() {
+        THREAD.set(Some(ThreadInfo::current()));
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +505,51 @@ mod tests {
         assert!(
             stdout.contains("] Shutting down VM after intercepting signal 11, code "),
             "{output:?}"
+        );
+        // fxdax: and says the thread overflowed its stack.
+        #[cfg(feature = "fxdax")]
+        {
+            let line = fault_line(&output);
+            assert!(
+                line.ends_with(", in the guard below its stack: it overflowed its stack."),
+                "{line}"
+            );
+        }
+    }
+
+    /// fxdax: the line of the handler's log that says where the fault was.
+    #[cfg(feature = "fxdax")]
+    fn fault_line(output: &Output) -> String {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find(|line| line.contains("] Thread fc_fault faulted at "))
+            .unwrap_or_else(|| panic!("No fault logged: {output:?}"))
+            .to_owned()
+    }
+
+    // fxdax: the SIGSEGV handler says where a thread faulted, and doesn't take it for an overflow
+    // (TASK-137).
+    #[cfg(feature = "fxdax")]
+    #[test]
+    fn test_fault_logs_its_address() {
+        if std::env::var_os(FAULT).is_some_and(|fault| fault == "address") {
+            fault_on_a_thread(|| {
+                // SAFETY: The store faults, as the test wants, at an address nothing maps: it
+                // writes nothing.
+                unsafe { std::ptr::without_provenance_mut::<u8>(0x10).write_volatile(1) };
+            });
+        }
+        let output = run_alone("test_fault_logs_its_address", "address");
+        assert_eq!(
+            output.status.code(),
+            Some(FcExitCode::SIGSEGV as i32),
+            "{output:?}"
+        );
+        let line = fault_line(&output);
+        assert!(
+            line.ends_with("] Thread fc_fault faulted at 0x10."),
+            "{line}"
         );
     }
 }
