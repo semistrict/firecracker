@@ -13,6 +13,10 @@ default = []
 tracing = ["log-instrument"]
 gdb = ["arrayvec", "gdbstub", "gdbstub_arch"]
 fuzzing = []
+# cladefs's extent-store device and what it needs of the VMM, none of which a build without the
+# feature has. It builds against cladefs's crate, which cladefs's build adds as a dependency here, with
+# cladefs's Cargo.lock (resources/cladefs/README.md).
+cladefs = []
 
 [dependencies]
 

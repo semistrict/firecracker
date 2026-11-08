@@ -12,6 +12,12 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::blanket_clippy_restriction_lints)]
 
+// cladefs's crate, which the `cladefs` feature builds against: no dependency of this crate's, but one
+// cladefs's build adds (resources/cladefs/README.md), so that a build without the feature needs nothing
+// of cladefs's, nor fetches it. Without it, the feature fails here.
+#[cfg(feature = "cladefs")]
+extern crate cladefs;
+
 /// Implements platform specific functionality.
 /// Supported platforms: x86_64 and aarch64.
 pub mod arch;

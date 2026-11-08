@@ -19,6 +19,8 @@ bench = false
 tracing = ["log-instrument", "utils/tracing", "vmm/tracing"]
 fuzzing = ["vmm/fuzzing"]
 gdb = ["vmm/gdb"]
+# cladefs's extent-store device (resources/cladefs/README.md).
+cladefs = ["vmm/cladefs"]
 
 [dependencies]
 displaydoc = "0.2.5"
