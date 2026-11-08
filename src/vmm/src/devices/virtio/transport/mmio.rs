@@ -1175,10 +1175,12 @@ pub(crate) mod tests {
     #[test]
     fn test_ack_features_by_page() {
         let mut dummy_dev = DummyDevice::new();
-        dummy_dev.set_acked_features(16);
+        dummy_dev.set_acked_features((1 << 32) | 16);
         dummy_dev.set_avail_features(8);
+        // The page written replaces what the driver wrote to it before; the other page keeps its
+        // own.
         dummy_dev.ack_features_by_page(0, 8);
-        assert_eq!(dummy_dev.acked_features(), 24);
+        assert_eq!(dummy_dev.acked_features(), (1 << 32) | 8);
     }
 
     #[test]
