@@ -559,6 +559,10 @@ pub(crate) mod tests {
         pub fn set_avail_features(&mut self, avail_features: u64) {
             self.avail_features = avail_features;
         }
+
+        pub(crate) fn set_shm_regions(&mut self, shm_regions: Vec<VirtioShmRegion>) {
+            self.shm_regions = shm_regions;
+        }
     }
 
     impl MutEventSubscriber for DummyDevice {
