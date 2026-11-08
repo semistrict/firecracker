@@ -12,6 +12,12 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::blanket_clippy_restriction_lints)]
 
+// fxdax's crate, which the `fxdax` feature builds against: no dependency of this crate's, but one
+// fxdax's build adds (resources/fxdax/README.md), so that a build without the feature needs nothing
+// of fxdax's, nor fetches it. Without it, the feature fails here.
+#[cfg(feature = "fxdax")]
+extern crate fxdax;
+
 /// Implements platform specific functionality.
 /// Supported platforms: x86_64 and aarch64.
 pub mod arch;
