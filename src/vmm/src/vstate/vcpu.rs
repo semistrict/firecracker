@@ -363,19 +363,13 @@ impl Vcpu {
     // Note that this function isn't called when the guest asks for a CPU
     // reset via the i8042 controller on x86.
     fn exit(&mut self, exit_code: FcExitCode) -> StateMachine<Self> {
-        if let Err(err) = self.exit_evt.write(1) {
-            METRICS.vcpu.failures.inc();
-            error!("Failed signaling vcpu exit event: {}", err);
-        }
+        announce_exit(&self.response_sender, exit_code, || self.exit_evt.write(1));
         // From this state we only accept going to finished.
-        loop {
+        // Wait for and only accept 'VcpuEvent::Finish'.
+        while !matches!(self.event_receiver.recv(), Ok(VcpuEvent::Finish)) {
             self.response_sender
                 .send(VcpuResponse::Exited(exit_code))
                 .expect("vcpu channel unexpectedly closed");
-            // Wait for and only accept 'VcpuEvent::Finish'.
-            if let Ok(VcpuEvent::Finish) = self.event_receiver.recv() {
-                break;
-            }
         }
         StateMachine::finish()
     }
@@ -408,6 +402,26 @@ impl Vcpu {
             }
             emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
         }
+    }
+}
+
+/// Tells the VMM that a vCPU exited, with `exit_code`: its response first, then `signal`, the exit
+/// event, on which the VMM reads the vCPUs' responses for their exit codes (`Vmm::process`).
+///
+/// In that order: signalled first, the VMM, woken, could read the responses before this one was
+/// sent, find none, and stop as if every vCPU had exited with `FcExitCode::Ok`, a vCPU's error
+/// making Firecracker exit with 0.
+fn announce_exit(
+    response_sender: &Sender<VcpuResponse>,
+    exit_code: FcExitCode,
+    signal: impl FnOnce() -> io::Result<()>,
+) {
+    response_sender
+        .send(VcpuResponse::Exited(exit_code))
+        .expect("vcpu channel unexpectedly closed");
+    if let Err(err) = signal() {
+        METRICS.vcpu.failures.inc();
+        error!("Failed signaling vcpu exit event: {}", err);
     }
 }
 
@@ -671,6 +685,25 @@ pub(crate) mod tests {
     use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
     use crate::vstate::vcpu::VcpuError as EmulationError;
     use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    /// A vCPU's exit code is sent before the exit event is signalled, on which the VMM reads it:
+    /// signalled first, the VMM could find none and stop with `FcExitCode::Ok`.
+    #[test]
+    fn test_exit_code_sent_before_the_exit_event() {
+        let (sender, receiver) = channel();
+        let mut sent = None;
+        announce_exit(&sender, FcExitCode::GenericError, || {
+            sent = Some(receiver.try_recv());
+            Ok(())
+        });
+        assert!(
+            matches!(
+                sent,
+                Some(Ok(VcpuResponse::Exited(FcExitCode::GenericError)))
+            ),
+            "{sent:?}"
+        );
+    }
 
     struct DummyDevice;
 
