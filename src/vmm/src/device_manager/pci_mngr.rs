@@ -419,6 +419,11 @@ impl<'a> Persist<'a> for PciDevices {
                         transport_state,
                     })
                 }
+                // Extent-store devices are MMIO's only.
+                #[cfg(feature = "fxdax")]
+                VirtioDeviceType::Extent => {
+                    unreachable!("extent-store devices are not attached over PCI")
+                }
             }
         }
 

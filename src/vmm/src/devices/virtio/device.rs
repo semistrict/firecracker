@@ -76,6 +76,9 @@ pub enum VirtioDeviceType {
     Vsock = virtio_ids::VIRTIO_ID_VSOCK as VirtioDeviceTypeRepr,
     Mem = virtio_ids::VIRTIO_ID_MEM as VirtioDeviceTypeRepr,
     Pmem = virtio_ids::VIRTIO_ID_PMEM as VirtioDeviceTypeRepr,
+    /// fxdax's extent-store device: "FX", outside the IDs OASIS assigns.
+    #[cfg(feature = "fxdax")]
+    Extent = 0x4658,
 }
 
 /// fxdax: a shared memory region of a device (virtio 1.2, section 2.10): guest memory the device

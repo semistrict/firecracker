@@ -48,6 +48,8 @@ use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::utils::mib_to_bytes;
+#[cfg(feature = "fxdax")]
+use crate::vmm_config::extent::ExtentDeviceConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -79,6 +81,18 @@ pub enum StartMicrovmError {
     CreatePmemDevice(#[from] crate::devices::virtio::pmem::device::PmemError),
     /// Cannot create RateLimiter: {0}
     CreateRateLimiter(io::Error),
+    /// Cannot create extent-store device: {0}
+    #[cfg(feature = "fxdax")]
+    CreateExtentDevice(#[from] crate::devices::virtio::extent::ExtentError),
+    /// Cannot create the vCPU that maps extent-store devices' DAX windows for the guest: {0}
+    #[cfg(all(feature = "fxdax", target_arch = "x86_64"))]
+    ExtentPrefault(io::Error),
+    /// Extent-store devices need a Firecracker built with its `fxdax` feature, on the MMIO transport
+    #[cfg(feature = "fxdax")]
+    ExtentDevicesUnsupported,
+    /// Cannot start the thread that starts extent-store devices' threads: {0}
+    #[cfg(feature = "fxdax")]
+    ExtentThreads(io::Error),
     /// Error creating legacy device: {0}
     #[cfg(target_arch = "x86_64")]
     CreateLegacyDevice(device_manager::legacy::LegacyDeviceError),
@@ -150,6 +164,8 @@ pub fn build_microvm_for_boot(
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
+    #[cfg(feature = "fxdax")]
+    confine_extent_threads(seccomp_filters)?;
 
     let boot_config = vm_resources
         .boot_source
@@ -251,6 +267,16 @@ pub fn build_microvm_for_boot(
         &mut boot_cmdline,
         &vm_resources.pmem.configs,
         event_manager,
+    )?;
+    #[cfg(feature = "fxdax")]
+    attach_extent_devices(
+        &mut device_manager,
+        &vm,
+        &mut boot_cmdline,
+        &vm_resources.extent.configs,
+        event_manager,
+        vm_resources.pci_enabled,
+        vm_resources.machine_config.vcpu_count,
     )?;
 
     if let Some(unix_vsock) = vm_resources.vsock.get() {
@@ -447,6 +473,8 @@ pub fn build_microvm_from_snapshot(
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
+    #[cfg(feature = "fxdax")]
+    confine_extent_threads(seccomp_filters)?;
 
     let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
         .map_err(StartMicrovmError::Kvm)?;
@@ -751,6 +779,119 @@ fn attach_pmem_devices(
         let pmem = Pmem::new(kvm_vm.clone(), config.clone())?;
         let device = Arc::new(Mutex::new(pmem));
 
+        device_manager.attach_virtio_device(vm, id, device, cmdline, event_manager, false)?;
+    }
+    Ok(())
+}
+
+/// fxdax: starts the threads of extent devices, and those fxdax starts for them, under the VMM
+/// thread's seccomp filter, and that alone (TASK-50.1): from a thread of their own, started here,
+/// before any filter is installed, which installs the VMM's, rather than from the thread that asks
+/// for them, as a vCPU's does as the guest activates a device, whose filter they would inherit
+/// for good. The store's client's thread, which receives its daemon's replies, starts as the
+/// device is made, before the VMM thread installs its filter; the DAX window's and the device's
+/// workers' as the guest activates it.
+#[cfg(feature = "fxdax")]
+fn confine_extent_threads(seccomp_filters: &BpfThreadMap) -> Result<(), StartMicrovmError> {
+    use std::sync::mpsc;
+
+    type Start = (
+        String,
+        Box<dyn FnOnce() + Send>,
+        mpsc::SyncSender<std::io::Result<()>>,
+    );
+
+    /// Asks the spawning thread to start a thread.
+    struct Spawner(Mutex<mpsc::Sender<Start>>);
+
+    impl fxdax::thread::Spawn for Spawner {
+        fn spawn(&self, name: String, run: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+            let (started, start) = mpsc::sync_channel(1);
+            let gone = || std::io::Error::other("the extent threads' spawner is gone");
+            (self
+                .0
+                .lock()
+                .expect("Poisoned lock")
+                .send((name, run, started)))
+            .map_err(|_| gone())?;
+            start.recv().map_err(|_| gone())?
+        }
+    }
+
+    static CONFINED: std::sync::Once = std::sync::Once::new();
+    let filter = seccomp_filters
+        .get("vmm")
+        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+        .clone();
+    let mut spawned = Ok(());
+    CONFINED.call_once(|| {
+        let (asks, asked) = mpsc::channel::<Start>();
+        let spawning = std::thread::Builder::new()
+            .name("fc_extent_spawn".into())
+            .spawn(move || {
+                // An alternate stack for the fatal signals' handlers (TASK-137).
+                crate::signal_handler::install_signal_stack();
+                if let Err(err) = crate::seccomp::apply_filter(&filter) {
+                    panic!("Failed to set the VMM's seccomp filter on the extent spawner: {err}");
+                }
+                // Each thread with an alternate stack for the fatal signals' handlers, which the
+                // VMM's filter lets it map (TASK-137).
+                while let Ok((name, run, started)) = asked.recv() {
+                    let run = move || {
+                        crate::signal_handler::install_signal_stack();
+                        run()
+                    };
+                    let _ =
+                        started.send(std::thread::Builder::new().name(name).spawn(run).map(drop));
+                }
+            });
+        spawned = spawning.map(|_| fxdax::thread::set_spawner(Spawner(Mutex::new(asks))));
+    });
+    spawned.map_err(StartMicrovmError::ExtentThreads)
+}
+
+/// Attaches the extent-store devices `configs` describes, with their DAX windows. On x86-64, KVM
+/// maps the windows' pages for the guest as the extent daemon maps them, with a vCPU of their
+/// own, whose ID follows the guest's `vcpu_count` vCPUs'.
+#[cfg(feature = "fxdax")]
+fn attach_extent_devices(
+    device_manager: &mut DeviceManager,
+    vm: &Vm,
+    cmdline: &mut LoaderKernelCmdline,
+    configs: &[ExtentDeviceConfig],
+    event_manager: &mut EventManager,
+    pci_enabled: bool,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused))] vcpu_count: u8,
+) -> Result<(), StartMicrovmError> {
+    use crate::devices::virtio::extent::Extent;
+
+    if configs.is_empty() {
+        return Ok(());
+    }
+    // The PCI transport has no shared memory regions, which DAX windows are.
+    if pci_enabled {
+        return Err(StartMicrovmError::ExtentDevicesUnsupported);
+    }
+    let kvm_vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
+    #[cfg(target_arch = "x86_64")]
+    let mut prefault = None;
+    for config in configs {
+        let id = config.id.clone();
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut extent = Extent::new(kvm_vm.clone(), config.clone())?;
+        #[cfg(target_arch = "x86_64")]
+        if config.dax_window_size.is_some() {
+            use crate::devices::virtio::extent::KvmPrefault;
+            if prefault.is_none() {
+                let made = KvmPrefault::new(kvm_vm, u64::from(vcpu_count))
+                    .map_err(StartMicrovmError::ExtentPrefault)?;
+                prefault = Some(made.map(Arc::new));
+            }
+            if let Some(Some(prefault)) = &prefault {
+                extent.set_prefault(prefault.clone());
+            }
+        }
+        let device = Arc::new(Mutex::new(extent));
         device_manager.attach_virtio_device(vm, id, device, cmdline, event_manager, false)?;
     }
     Ok(())

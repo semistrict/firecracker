@@ -34,3 +34,9 @@ at `extern crate fxdax` in `src/vmm/src/lib.rs`.
   `src/firecracker/build.rs` compiles the target's filter. The files upstream ships stay as
   they are. The device's threads also use upstream's `sigaltstack` and `mprotect` rules, for
   their alternate signal stacks' guard pages.
+- `swagger.yaml`: the API the feature adds to `src/firecracker/swagger/firecracker.yaml`:
+  `PUT /extent/{id}`, and `extent_overrides` in `PUT /snapshot/load`. Without the feature,
+  the first is an unknown path and the second an unknown field, as upstream has them; so is
+  `extent` in a VM's configuration file.
+- `FcExitCode::ExtentdLost` (158), when an extent device's daemon goes, and
+  `FcExitCode::AccessRefused` (159), when a guest's access to its DAX window stays refused.
