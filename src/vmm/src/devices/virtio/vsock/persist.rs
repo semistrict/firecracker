@@ -190,7 +190,14 @@ pub(crate) mod tests {
         restored_device.ack_features_by_page(0, driver_pages[0]);
         restored_device.ack_features_by_page(1, driver_pages[1]);
         restored_device.ack_features_by_page(2, 0);
+        // A page written again replaces what it said before.
         restored_device.ack_features_by_page(0, !driver_pages[0]);
+        assert_eq!(
+            restored_device.acked_features(),
+            (device_features & driver_features & !0xffff_ffff)
+                | (device_features & u64::from(!driver_pages[0]))
+        );
+        restored_device.ack_features_by_page(0, driver_pages[0]);
         assert_eq!(
             restored_device.acked_features(),
             device_features & driver_features

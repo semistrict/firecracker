@@ -505,10 +505,17 @@ mod tests {
         ctx.device.ack_features_by_page(1, driver_pages[1]);
         // Ack some bogus page (i.e. 2). This should have no side effect.
         ctx.device.ack_features_by_page(2, 0);
-        // Attempt to un-ack the first feature page. This should have no side effect.
+        // Write the first feature page again: what it says replaces what it said before, the
+        // features it no longer says un-acked, those it says the device hasn't left out.
         ctx.device.ack_features_by_page(0, !driver_pages[0]);
-        // Check that no side effect are present, and that the acked features are exactly the same
-        // as the device features.
+        assert_eq!(
+            ctx.device.acked_features,
+            (device_features & driver_features & !0xffff_ffff)
+                | (device_features & u64::from(!driver_pages[0]))
+        );
+        // And written once more as it was, the acked features are exactly the device's that the
+        // driver asked for.
+        ctx.device.ack_features_by_page(0, driver_pages[0]);
         assert_eq!(ctx.device.acked_features, device_features & driver_features);
 
         // Test reading 32-bit chunks.
