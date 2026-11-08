@@ -550,6 +550,7 @@ pub(crate) mod tests {
         config_bytes: [u8; 0xeff],
         activate_should_error: bool,
         shm_regions: Vec<VirtioShmRegion>,
+        resettable: bool,
     }
 
     impl DummyDevice {
@@ -567,6 +568,7 @@ pub(crate) mod tests {
                 config_bytes: [0; 0xeff],
                 activate_should_error: false,
                 shm_regions: Vec::new(),
+                resettable: false,
             }
         }
 
@@ -576,6 +578,11 @@ pub(crate) mod tests {
 
         pub(crate) fn set_shm_regions(&mut self, shm_regions: Vec<VirtioShmRegion>) {
             self.shm_regions = shm_regions;
+        }
+
+        /// Has [`VirtioDevice::reset`] reset the device, rather than say it cannot.
+        pub(crate) fn set_resettable(&mut self) {
+            self.resettable = true;
         }
     }
 
@@ -652,6 +659,19 @@ pub(crate) mod tests {
 
         fn is_activated(&self) -> bool {
             self.device_activated
+        }
+
+        fn reset(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
+            if !self.resettable {
+                return None;
+            }
+            self.device_activated = false;
+            let events = self
+                .queue_evts
+                .iter()
+                .map(|event| event.try_clone().unwrap())
+                .collect();
+            Some((self.interrupt_trigger.take()?, events))
         }
     }
 

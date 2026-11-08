@@ -1101,19 +1101,15 @@ impl PciDevice for VirtioPciDevice {
             let mut device = self.device.lock().unwrap();
             let reset_result = device.reset();
             match reset_result {
+                // The device gives back the transport's interrupt, which stays the transport's: a
+                // driver that sets the device up again activates it with it.
                 Some(_) => {
-                    // Upon reset the device returns its interrupt EventFD
-                    self.virtio_interrupt = None;
                     self.device_activated.store(false, Ordering::SeqCst);
 
                     // Reset queue readiness (changes queue_enable), queue sizes
-                    // and selected_queue as per spec for reset
-                    self.virtio_device()
-                        .lock()
-                        .unwrap()
-                        .queues_mut()
-                        .iter_mut()
-                        .for_each(Queue::reset);
+                    // and selected_queue as per spec for reset. Through the lock held: taking it
+                    // again would wait for itself.
+                    device.queues_mut().iter_mut().for_each(Queue::reset);
                     self.common_config.queue_select = 0;
                 }
                 None => {
@@ -1613,6 +1609,12 @@ mod tests {
             .start();
         let mut dummy = DummyDevice::new();
         dummy.set_shm_regions(regions(addr));
+        attach_dummy(&mut vmm, dummy);
+        (vmm, addr)
+    }
+
+    /// Attaches `dummy` over PCI, as "dummy".
+    fn attach_dummy(vmm: &mut Vmm, dummy: DummyDevice) {
         let mut event_manager = crate::EventManager::new().unwrap();
         vmm.device_manager
             .attach_virtio_device(
@@ -1624,7 +1626,6 @@ mod tests {
                 false,
             )
             .unwrap();
-        (vmm, addr)
     }
 
     /// The vendor capabilities of `device` of type `cfg_type`, at their offsets.
@@ -2064,6 +2065,57 @@ mod tests {
         assert!(!locked.device_activated.load(Ordering::SeqCst));
         let status = read_driver_status(&mut locked);
         assert_eq!(status & DEVICE_NEEDS_RESET, DEVICE_NEEDS_RESET);
+    }
+
+    /// A device that resets resets: the transport, its lock held, resets its queues, and keeps
+    /// its interrupt, which the device is activated with again as the driver sets it up again.
+    #[test]
+    fn test_reset_then_reinitialization() {
+        let mut vmm = default_vmm();
+        vmm.device_manager
+            .enable_pci(&vmm.vm.as_kvm().unwrap().clone())
+            .unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_resettable();
+        attach_dummy(&mut vmm, dummy);
+        let device = vmm
+            .device_manager
+            .pci_devices
+            .get_virtio_device(VirtioDeviceType::Rng, "dummy")
+            .unwrap()
+            .clone();
+        let mut locked = device.lock().unwrap();
+        let initialize = |locked: &mut VirtioPciDevice| {
+            write_driver_status(locked, ACKNOWLEDGE);
+            write_driver_status(locked, ACKNOWLEDGE | DRIVER);
+            let features = read_device_features(locked);
+            write_driver_features(locked, features);
+            write_driver_status(locked, ACKNOWLEDGE | DRIVER | FEATURES_OK);
+            setup_queues(locked);
+            write_driver_status(locked, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+        };
+
+        initialize(&mut locked);
+        assert!(locked.device_activated.load(Ordering::SeqCst));
+        assert!(locked.virtio_device().lock().unwrap().is_activated());
+
+        write_driver_status(&mut locked, 0);
+        assert_eq!(read_driver_status(&mut locked), 0);
+        assert!(!locked.device_activated.load(Ordering::SeqCst));
+        assert!(!locked.virtio_device().lock().unwrap().is_activated());
+        assert!(
+            locked
+                .virtio_device()
+                .lock()
+                .unwrap()
+                .queues()
+                .iter()
+                .all(|queue| !queue.ready)
+        );
+
+        initialize(&mut locked);
+        assert!(locked.device_activated.load(Ordering::SeqCst));
+        assert!(locked.virtio_device().lock().unwrap().is_activated());
     }
 
     #[test]
