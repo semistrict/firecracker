@@ -622,8 +622,13 @@ impl VsockMuxer {
     fn handle_peer_request_pkt(&mut self, pkt: &VsockPacketTx) {
         let port_path = format!("{}_{}", self.host_sock_path, pkt.hdr.dst_port());
 
-        UnixStream::connect(port_path)
-            .and_then(|stream| stream.set_nonblocking(true).map(|_| stream))
+        let connected = UnixStream::connect(&port_path)
+            .and_then(|stream| stream.set_nonblocking(true).map(|_| stream));
+        // fxdax: why the guest's connection is reset, which it says nothing more of.
+        #[cfg(feature = "fxdax")]
+        let connected =
+            connected.inspect_err(|err| info!("vsock: connecting to {port_path}: {err}"));
+        connected
             .map_err(VsockUnixBackendError::UnixConnect)
             .and_then(|stream| {
                 self.add_connection(
