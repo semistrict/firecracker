@@ -101,10 +101,10 @@ struct Shared {
 }
 
 impl Shared {
-    /// The type of the request `chain` holds, from its header.
-    fn request_type(&self, chain: &DescriptorChain) -> Option<u32> {
+    /// The header of the request `chain` holds, if it can be read.
+    fn request_header(&self, chain: &DescriptorChain) -> Option<RequestHeader> {
         use vm_memory::Bytes;
-        self.mem.read_obj::<u32>(chain.addr).ok().map(u32::from_le)
+        self.mem.read_obj::<RequestHeader>(chain.addr).ok()
     }
 
     /// Serves the request in `chain`, and returns it to the driver, on this thread until it
@@ -112,11 +112,15 @@ impl Shared {
     fn serve(self: &Arc<Self>, chain: DescriptorChain) {
         *self.serving.lock().expect("Poisoned lock") += 1;
         let shared = self.clone();
-        let (index, type_) = (chain.index, self.request_type(&chain));
+        let header = self.request_header(&chain);
+        let (index, type_) = (chain.index, header.map(|header| u32::from_le(header.type_)));
+        // fxdax: served with the guest's number of it current, which the daemon's client's calls
+        // for it carry to the daemon's log (`fxdax::request`, TASK-260): 0, none, if unread.
+        let unique = header.map_or(0, |header| u64::from_le(header.unique));
         let start = Instant::now();
         // Its descriptors read now, the future holds its buffers alone.
         let buffers = Buffers::new(&self.mem, chain);
-        fxdax::extentd::spawn_on_replies(async move {
+        fxdax::extentd::spawn_on_replies(fxdax::request::guest_request(unique, async move {
             let len = match buffers {
                 Ok(buffers) => handle(&shared.store, &shared.notices, buffers).await,
                 Err(err) => {
@@ -132,7 +136,7 @@ impl Shared {
             if *serving == 0 {
                 shared.idle.notify_all();
             }
-        });
+        }));
     }
 
     /// Waits until the requests taken off the queue are returned to the driver.
