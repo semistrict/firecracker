@@ -212,6 +212,10 @@ pub enum FcExitCode {
     /// its store asks is served any more, nor its DAX window's faults (TASK-50.2).
     #[cfg(feature = "cladefs")]
     CladefsdLost = 158,
+    /// cladefs: a vCPU's access stayed refused (`KVM_RUN` failing with `EFAULT` for a second): the
+    /// guest's, of a page of its DAX window nothing maps, or that it may not store to (TASK-70).
+    #[cfg(feature = "cladefs")]
+    AccessRefused = 159,
 }
 
 /// Timeout used in recv_timeout, when waiting for a vcpu response on
