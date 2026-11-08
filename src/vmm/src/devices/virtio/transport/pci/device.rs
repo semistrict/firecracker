@@ -313,6 +313,22 @@ const NOTIFY_OFF_MULTIPLIER: u32 = 4; // A dword per notification address.
 const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_ID_BASE: u16 = 0x1040; // Add to device type to get device ID.
 
+/// The PCI device ID of a device whose type is past the 63 the modern IDs, 0x1040 to 0x107f, name:
+/// the last transitional ID, whose subsystem device ID says the device's type (virtio 1.2,
+/// section 4.1.2.1). Linux's virtio_pci claims PCI device IDs 0x1000 to 0x107f alone, and takes a
+/// transitional one's type from its subsystem device ID, which a modern ID's 0x1040 plus the type
+/// would have left outside.
+const VIRTIO_PCI_TRANSITIONAL_DEVICE_ID: u16 = 0x103f;
+
+/// The PCI device ID and subsystem device ID of a virtio device of type `device_type`.
+fn pci_device_ids(device_type: VirtioDeviceType) -> (u16, u16) {
+    let device_type = device_type as u16;
+    match VIRTIO_PCI_DEVICE_ID_BASE.checked_add(device_type) {
+        Some(id) if id <= 0x107f => (id, id),
+        _ => (VIRTIO_PCI_TRANSITIONAL_DEVICE_ID, device_type),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtioPciDeviceState {
     pub sbdf: PciSBDF,
@@ -389,7 +405,7 @@ impl VirtioPciDevice {
         device_type: VirtioDeviceType,
         msix_config: &Arc<Mutex<MsixConfig>>,
     ) -> PciConfiguration {
-        let pci_device_id = VIRTIO_PCI_DEVICE_ID_BASE + device_type as u16;
+        let (pci_device_id, subsystem_id) = pci_device_ids(device_type);
         let (class, subclass) = match device_type {
             VirtioDeviceType::Net => (
                 PciClassCode::NetworkController,
@@ -412,7 +428,7 @@ impl VirtioPciDevice {
             class,
             subclass,
             VIRTIO_PCI_VENDOR_ID,
-            pci_device_id,
+            subsystem_id,
         )
     }
 
@@ -1147,8 +1163,8 @@ mod tests {
     use vm_allocator::AllocPolicy;
 
     use super::{
-        CAPABILITY_BAR_SIZE, PciCapabilityType, VirtioPciCap64, VirtioPciDevice, shm_bar,
-        shm_bar_size,
+        CAPABILITY_BAR_SIZE, PciCapabilityType, VirtioPciCap64, VirtioPciDevice, pci_device_ids,
+        shm_bar, shm_bar_size,
     };
     use crate::Vmm;
     use crate::arch::MEM_64BIT_DEVICES_START;
@@ -1656,6 +1672,18 @@ mod tests {
         device.write_config_register(hi, 0, &[0xff; 4]);
         let size_hi = u64::from(device.read_config_register(hi));
         (addr, (!((size_hi << 32) | size_lo)).wrapping_add(1))
+    }
+
+    /// A device type the modern IDs name has its modern ID as both; one past them, such as the
+    /// fxdax extent device's 0x4658, the last transitional ID, its type the subsystem device ID,
+    /// which is how Linux's virtio_pci finds its type.
+    #[test]
+    fn test_pci_device_ids() {
+        assert_eq!(pci_device_ids(VirtioDeviceType::Net), (0x1041, 0x1041));
+        assert_eq!(pci_device_ids(VirtioDeviceType::Rng), (0x1044, 0x1044));
+        assert_eq!(pci_device_ids(VirtioDeviceType::Pmem), (0x105b, 0x105b));
+        #[cfg(feature = "fxdax")]
+        assert_eq!(pci_device_ids(VirtioDeviceType::Extent), (0x103f, 0x4658));
     }
 
     #[test]
