@@ -168,6 +168,10 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // fxdax: the extent-store devices' stores first, at points beside the snapshot.
+    #[cfg(feature = "fxdax")]
+    vmm.take_extent_snapshots(&params.snapshot_path)
+        .map_err(CreateSnapshotError::MicrovmState)?;
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -412,6 +416,29 @@ pub fn restore_from_snapshot(
             .clone_from(&vsock_override.uds_path);
     }
 
+    // fxdax: the stores the extent-store devices open, each forked from the snapshot's point of
+    // its store if it doesn't exist.
+    #[cfg(feature = "fxdax")]
+    for entry in &params.extent_overrides {
+        microvm_state
+            .device_states
+            .pci_state
+            .extent_devices
+            .iter_mut()
+            .map(|device| &mut device.device_state)
+            .find(|state| state.config.id == entry.id)
+            .map(|state| {
+                state.config.path_on_host.clone_from(&entry.path_on_host);
+                if let Some(point) = &entry.point_on_host {
+                    state.point = point.into();
+                }
+                if let Some(socket) = &entry.extentd_socket {
+                    state.config.extentd_socket.clone_from(socket);
+                }
+            })
+            .ok_or_else(|| SnapshotStateFromFileError::UnknownExtentDevice(entry.id.clone()))?;
+    }
+
     let track_dirty_pages = params.track_dirty_pages;
 
     let vcpu_count = microvm_state
@@ -486,6 +513,9 @@ pub enum SnapshotStateFromFileError {
     UnknownNetworkDevice,
     /// Unknown Vsock Device.
     UnknownVsockDevice,
+    /// fxdax: unknown extent-store device {0}.
+    #[cfg(feature = "fxdax")]
+    UnknownExtentDevice(String),
 }
 
 fn snapshot_state_from_file(

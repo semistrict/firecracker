@@ -672,6 +672,12 @@ pub enum DevicePersistError {
     Pmem(#[from] PmemPersistError),
     /// virtio-mem: {0}
     VirtioMem(#[from] VirtioMemPersistError),
+    /// Extent-store device: {0}
+    #[cfg(feature = "fxdax")]
+    Extent(#[from] crate::devices::virtio::extent::persist::ExtentPersistError),
+    /// Cannot create the vCPU that maps extent-store devices' DAX windows for the guest: {0}
+    #[cfg(all(feature = "fxdax", target_arch = "x86_64"))]
+    ExtentPrefault(std::io::Error),
     /// Could not activate device: {0}
     DeviceActivation(#[from] ActivateError),
 }

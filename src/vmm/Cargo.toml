@@ -16,7 +16,7 @@ fuzzing = []
 # fxdax's extent-store device and what it needs of the VMM, none of which a build without the
 # feature has. It builds against fxdax's crate, which fxdax's build adds as a dependency here, with
 # fxdax's Cargo.lock (resources/fxdax/README.md).
-fxdax = []
+fxdax = ["dep:futures"]
 
 [dependencies]
 
@@ -35,6 +35,7 @@ derive_more = { version = "2.1.1", default-features = false, features = [
 ] }
 displaydoc = "0.2.5"
 event-manager = "0.4.2"
+futures = { version = "0.3.32", default-features = false, features = ["executor"], optional = true }
 gdbstub = { version = "0.7.10", optional = true }
 gdbstub_arch = { version = "0.3.3", optional = true }
 kvm-bindings = { version = "0.14.0", features = ["fam-wrappers", "serde"] }

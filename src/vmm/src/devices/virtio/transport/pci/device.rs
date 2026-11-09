@@ -1675,14 +1675,16 @@ mod tests {
         (addr, (!((size_hi << 32) | size_lo)).wrapping_add(1))
     }
 
-    /// A device type the modern IDs name has its modern ID as both. (One past them, the last
-    /// transitional ID and its type the subsystem device ID, is the fxdax feature's extent device,
-    /// which its commit tests here.)
+    /// A device type the modern IDs name has its modern ID as both; one past them, such as the
+    /// fxdax extent device's 0x4658, the last transitional ID, its type the subsystem device ID,
+    /// which is how Linux's virtio_pci finds its type.
     #[test]
     fn test_pci_device_ids() {
         assert_eq!(pci_device_ids(VirtioDeviceType::Net), (0x1041, 0x1041));
         assert_eq!(pci_device_ids(VirtioDeviceType::Rng), (0x1044, 0x1044));
         assert_eq!(pci_device_ids(VirtioDeviceType::Pmem), (0x105b, 0x105b));
+        #[cfg(feature = "fxdax")]
+        assert_eq!(pci_device_ids(VirtioDeviceType::Extent), (0x103f, 0x4658));
     }
 
     #[test]

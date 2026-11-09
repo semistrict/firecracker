@@ -7,6 +7,8 @@ pub mod boot_source;
 pub mod cpu_configuration;
 pub mod drive;
 pub mod entropy;
+#[cfg(feature = "fxdax")]
+pub mod extent;
 pub mod hotplug;
 pub mod instance_info;
 pub mod logger;

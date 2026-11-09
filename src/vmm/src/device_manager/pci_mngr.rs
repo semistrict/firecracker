@@ -254,6 +254,11 @@ pub struct PciDevicesState {
     pub pmem_devices: Vec<VirtioDeviceState<PmemState>>,
     /// Memory device state.
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
+    /// fxdax: extent-store device states (TASK-267).
+    #[cfg(feature = "fxdax")]
+    #[serde(default)]
+    pub extent_devices:
+        Vec<VirtioDeviceState<crate::devices::virtio::extent::persist::ExtentState>>,
 }
 
 pub struct PciDevicesConstructorArgs<'a> {
@@ -414,6 +419,21 @@ impl<'a> Persist<'a> for PciDevices {
 
                     state.memory_device = Some(VirtioDeviceState {
                         device_id: mem_dev.id().to_string(),
+                        sbdf,
+                        device_state,
+                        transport_state,
+                    })
+                }
+                // Microvm::save_state has each take the snapshot of its store first.
+                #[cfg(feature = "fxdax")]
+                VirtioDeviceType::Extent => {
+                    let extent = locked_virtio_dev
+                        .as_mut_any()
+                        .downcast_mut::<crate::devices::virtio::extent::Extent>()
+                        .unwrap();
+                    let device_state = extent.save();
+                    state.extent_devices.push(VirtioDeviceState {
+                        device_id: extent.id().to_string(),
                         sbdf,
                         device_state,
                         transport_state,
@@ -596,6 +616,45 @@ impl<'a> Persist<'a> for PciDevices {
             )?
         }
 
+        // fxdax: each window where its BAR is, which the snapshot holds as the device's
+        // `window_addr` and the transport's BARs (TASK-267).
+        #[cfg(feature = "fxdax")]
+        {
+            use crate::devices::virtio::extent::Extent;
+            use crate::devices::virtio::extent::persist::ExtentConstructorArgs;
+
+            let prefault = restored_extent_prefault(
+                constructor_args.vm,
+                constructor_args.vm_resources.machine_config.vcpu_count,
+                state
+                    .extent_devices
+                    .iter()
+                    .map(|extent| &extent.device_state),
+            )?;
+            for extent_state in &state.extent_devices {
+                let device = Arc::new(Mutex::new(Extent::restore(
+                    ExtentConstructorArgs {
+                        mem,
+                        vm: constructor_args.vm.clone(),
+                        prefault: prefault.clone(),
+                    },
+                    &extent_state.device_state,
+                )?));
+                constructor_args
+                    .vm_resources
+                    .extent
+                    .configs
+                    .push((&extent_state.device_state.config).into());
+                pci_devices.restore_pci_device(
+                    constructor_args.vm,
+                    device,
+                    &extent_state.device_id,
+                    &extent_state.transport_state,
+                    constructor_args.event_manager,
+                )?
+            }
+        }
+
         if let Some(memory_device) = &state.memory_device {
             let ctor_args = VirtioMemConstructorArgs::new(Arc::clone(constructor_args.vm));
             let device = VirtioMem::restore(ctor_args, &memory_device.device_state)?;
@@ -618,6 +677,30 @@ impl<'a> Persist<'a> for PciDevices {
 
         Ok(pci_devices)
     }
+}
+
+/// fxdax: what maps the windows of extent-store devices restored from `states` for the guest as
+/// the extent daemon maps their pages, on x86-64: a vCPU of their own, as the VM booted with,
+/// whose ID follows the guest's `vcpu_count` vCPUs'; none if no device has a window, or elsewhere.
+#[cfg(feature = "fxdax")]
+fn restored_extent_prefault<'s>(
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused))] vm: &KvmVm,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused))] vcpu_count: u8,
+    mut states: impl Iterator<Item = &'s crate::devices::virtio::extent::persist::ExtentState>,
+) -> Result<Option<Arc<dyn crate::devices::virtio::extent::PrefaultGuestMemory>>, DevicePersistError>
+{
+    if !states.any(|extent| extent.window_addr.is_some()) {
+        return Ok(None);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::devices::virtio::extent::{KvmPrefault, PrefaultGuestMemory};
+        Ok(KvmPrefault::new(vm, u64::from(vcpu_count))
+            .map_err(DevicePersistError::ExtentPrefault)?
+            .map(|prefault| -> Arc<dyn PrefaultGuestMemory> { Arc::new(prefault) }))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    Ok(None)
 }
 
 #[cfg(test)]
