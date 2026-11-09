@@ -4,6 +4,8 @@
 pub mod actions;
 pub mod balloon;
 pub mod boot_source;
+#[cfg(feature = "cladefs")]
+pub mod cladefs;
 pub mod cpu_configuration;
 pub mod drive;
 pub mod entropy;

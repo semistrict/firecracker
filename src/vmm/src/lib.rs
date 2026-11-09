@@ -208,6 +208,10 @@ pub enum FcExitCode {
     BadConfiguration = 152,
     /// Command line arguments parsing error.
     ArgParsing = 153,
+    /// cladefs: the extent daemon serving an extent device went, and the VM can't go on: nothing
+    /// its store asks is served any more, nor its DAX window's faults (TASK-50.2).
+    #[cfg(feature = "cladefs")]
+    CladefsdLost = 158,
 }
 
 /// Timeout used in recv_timeout, when waiting for a vcpu response on
@@ -354,6 +358,8 @@ impl Vmm {
         let mut net = Vec::new();
         let mut net_with_mmds = Vec::new();
         let mut pmem = Vec::new();
+        #[cfg(feature = "cladefs")]
+        let mut extent = Vec::new();
         let mut balloon = None;
         let mut vsock = None;
         let mut entropy = None;
@@ -405,6 +411,15 @@ impl Vmm {
                         memory_hotplug = Some(MemoryHotplugConfig::from(m));
                     }
                 }
+                #[cfg(feature = "cladefs")]
+                VirtioDeviceType::Extent => {
+                    if let Some(e) = device
+                        .as_any()
+                        .downcast_ref::<devices::virtio::extent::Extent>()
+                    {
+                        extent.push(e.config.clone());
+                    }
+                }
             });
 
         let mmds_config = mmds_ref.map(|mmds| {
@@ -433,6 +448,8 @@ impl Vmm {
             vsock,
             entropy,
             pmem_devices: pmem,
+            #[cfg(feature = "cladefs")]
+            cladefs_devices: extent,
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,
@@ -450,6 +467,17 @@ impl Vmm {
                 {
                     tuples.push(("vhost-user-block", b.id().to_owned()));
                 }
+                // cladefs: its store, in cladefs's extent daemon, is snapshotted first
+                // (`Vmm::take_extent_snapshots`).
+                #[cfg(feature = "cladefs")]
+                if let VirtioDeviceType::Extent = device_type
+                    && device
+                        .as_any()
+                        .downcast_ref::<devices::virtio::extent::Extent>()
+                        .is_none_or(|extent| extent.snapshot().is_none())
+                {
+                    tuples.push(("extent", device.id().to_owned()));
+                }
             });
         if tuples.is_empty() {
             Ok(())
@@ -463,6 +491,41 @@ impl Vmm {
                 "Devices without snapshot support are present: {msg}"
             )))
         }
+    }
+
+    /// cladefs: takes the snapshots of the extent-store devices' stores, for a snapshot of the VM,
+    /// paused, at `snapshot_path`: each forks its store to `<snapshot_path>.extent-<id>`, the
+    /// point a VM restored from the snapshot forks its own from (TASK-39.1). The guests'
+    /// filesystems must be frozen.
+    #[cfg(feature = "cladefs")]
+    pub fn take_extent_snapshots(
+        &mut self,
+        snapshot_path: &std::path::Path,
+    ) -> Result<(), MicrovmStateError> {
+        let snapshot_path = std::path::absolute(snapshot_path).map_err(|err| {
+            MicrovmStateError::NotAllowed(format!(
+                "the snapshot's path {}: {err}",
+                snapshot_path.display()
+            ))
+        })?;
+        let mut ids = Vec::new();
+        self.device_manager
+            .for_each_virtio_device(|device_type, device| {
+                if let VirtioDeviceType::Extent = device_type {
+                    ids.push(device.id().to_owned());
+                }
+            });
+        for id in ids {
+            let mut point = snapshot_path.clone().into_os_string();
+            point.push(format!(".extent-{id}"));
+            self.device_manager
+                .with_virtio_device(&id, |extent: &mut devices::virtio::extent::Extent| {
+                    extent.take_snapshot(std::path::Path::new(&point))
+                })
+                .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))?
+                .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Sends a resume command to the vCPUs.

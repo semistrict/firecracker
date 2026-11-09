@@ -345,6 +345,11 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                         device_info,
                     });
                 }
+                // cladefs: builder::attach_extent_devices refuses them on the MMIO transport.
+                #[cfg(feature = "cladefs")]
+                VirtioDeviceType::Extent => {
+                    unreachable!("extent-store devices attach over PCI alone")
+                }
             };
 
             Ok(())
