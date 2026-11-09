@@ -301,7 +301,14 @@ impl VsockEpollListener for VsockMuxer {
     }
 }
 
-impl VsockBackend for VsockMuxer {}
+impl VsockBackend for VsockMuxer {
+    fn reset_connections(&mut self) {
+        let keys: Vec<ConnMapKey> = self.conn_map.keys().copied().collect();
+        for key in keys {
+            self.kill_connection(key);
+        }
+    }
+}
 
 impl VsockMuxer {
     /// Muxer constructor.
@@ -1250,6 +1257,43 @@ mod tests {
         // The muxer should also drop / close the local Unix socket for this connection.
         let mut buf = vec![0u8; 16];
         assert_eq!(stream.read(buf.as_mut_slice()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_reset_connections() {
+        // A guest-initiated connection whose response the guest has not taken yet, and an
+        // established one: each ends with an RST, the response never sent.
+        let mut ctx = MuxerTestContext::new("reset_connections");
+        let local_port = 1026;
+        let (connecting_port, established_port) = (1025, 1027);
+        let mut listener = ctx.create_local_listener(local_port);
+
+        ctx.init_tx_pkt(local_port, established_port, uapi::VSOCK_OP_REQUEST);
+        ctx.send();
+        let mut established = listener.accept();
+        ctx.recv();
+        assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RESPONSE);
+        ctx.init_tx_pkt(local_port, connecting_port, uapi::VSOCK_OP_REQUEST);
+        ctx.send();
+        let mut connecting = listener.accept();
+        assert_eq!(ctx.muxer.conn_map.len(), 2);
+
+        ctx.muxer.reset_connections();
+
+        let mut reset = Vec::new();
+        while ctx.muxer.has_pending_rx() {
+            ctx.recv();
+            assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RST);
+            assert_eq!(ctx.rx_pkt.hdr.src_port(), local_port);
+            reset.push(ctx.rx_pkt.hdr.dst_port());
+        }
+        reset.sort_unstable();
+        assert_eq!(reset, [connecting_port, established_port]);
+        assert!(ctx.muxer.conn_map.is_empty());
+        // The host's ends are closed.
+        let mut buf = [0u8; 16];
+        assert_eq!(established.read(&mut buf).unwrap(), 0);
+        assert_eq!(connecting.read(&mut buf).unwrap(), 0);
     }
 
     #[test]

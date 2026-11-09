@@ -5,7 +5,8 @@
 #![doc(hidden)]
 
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
 
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
@@ -14,13 +15,14 @@ use super::packet::{VsockPacketRx, VsockPacketTx};
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::devices::virtio::test_utils::{VirtQueue as GuestQ, default_interrupt};
-use crate::devices::virtio::transport::VirtioInterrupt;
+use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::devices::virtio::vsock::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX};
 use crate::devices::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
 use crate::devices::virtio::vsock::{
     Vsock, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
 };
 use crate::test_utils::single_region_mem;
+use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 #[derive(Debug)]
@@ -31,6 +33,7 @@ pub struct TestBackend {
     pub rx_ok_cnt: usize,
     pub tx_ok_cnt: usize,
     pub evset: Option<EventSet>,
+    pub reset_cnt: usize,
 }
 
 impl TestBackend {
@@ -42,6 +45,7 @@ impl TestBackend {
             rx_ok_cnt: 0,
             tx_ok_cnt: 0,
             evset: None,
+            reset_cnt: 0,
         }
     }
 
@@ -102,7 +106,47 @@ impl VsockEpollListener for TestBackend {
         self.evset = Some(evset);
     }
 }
-impl VsockBackend for TestBackend {}
+impl VsockBackend for TestBackend {
+    fn reset_connections(&mut self) {
+        self.reset_cnt += 1;
+    }
+}
+
+/// An interrupt that keeps which of the device's queues it was triggered for, as MSI-X vectors of
+/// their own tell apart, which `IrqTrigger`'s one interrupt does not.
+#[derive(Debug, Default)]
+pub struct QueueInterrupts {
+    pub queues: Mutex<Vec<u16>>,
+}
+
+impl VirtioInterrupt for QueueInterrupts {
+    fn trigger(&self, interrupt_type: VirtioInterruptType) -> Result<(), InterruptError> {
+        if let VirtioInterruptType::Queue(queue) = interrupt_type {
+            self.queues.lock().unwrap().push(queue);
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> Arc<AtomicU32> {
+        Arc::new(AtomicU32::new(0))
+    }
+
+    fn has_pending_interrupt(&self, interrupt_type: VirtioInterruptType) -> bool {
+        match interrupt_type {
+            VirtioInterruptType::Queue(queue) => self.queues.lock().unwrap().contains(&queue),
+            VirtioInterruptType::Config => false,
+        }
+    }
+
+    fn ack_interrupt(&self, interrupt_type: VirtioInterruptType) {
+        if let VirtioInterruptType::Queue(queue) = interrupt_type {
+            self.queues
+                .lock()
+                .unwrap()
+                .retain(|&triggered| triggered != queue);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TestContext {
