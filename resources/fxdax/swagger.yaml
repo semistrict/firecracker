@@ -1,0 +1,120 @@
+# The API the fxdax feature adds to src/firecracker/swagger/firecracker.yaml, in its terms: its
+# paths and definitions here go beside that file's, and SnapshotLoadParams gains the property
+# below. A Firecracker built without the feature has none of it: PUT /extent/{id} is refused as
+# an unknown path, and extent_overrides as an unknown field of PUT /snapshot/load.
+swagger: "2.0"
+info:
+  title: Firecracker API, fxdax's additions
+  version: 1.16.1
+paths:
+  /extent/{id}:
+    put:
+      summary: Creates or updates an extent-store device. Pre-boot only.
+      description:
+        Creates fxdax's extent-store device with ID specified by id parameter, on an extent
+        store that fxdax's extent daemon serves, or replaces the one with that ID. Needs a
+        Firecracker built with its fxdax feature, and the virtio-PCI transport (--enable-pci):
+        a VM with the device on the MMIO transport does not start.
+      operationId: putGuestExtentByID
+      parameters:
+        - name: id
+          in: path
+          description: The id of the guest extent-store device
+          required: true
+          type: string
+        - name: body
+          in: body
+          description: Guest extent-store device properties
+          required: true
+          schema:
+            $ref: "#/definitions/Extent"
+      responses:
+        204:
+          description: Extent-store device is created/updated
+        400:
+          description: Extent-store device cannot be created/updated due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
+definitions:
+  Extent:
+    type: object
+    required:
+      - id
+      - tag
+      - path_on_host
+      - capacity
+      - extentd_socket
+    properties:
+      id:
+        type: string
+        description:
+          Identificator for this device.
+      tag:
+        type: string
+        description:
+          The filesystem's name, at most 36 bytes, which the guest mounts it by.
+      path_on_host:
+        type: string
+        description:
+          The extent store's directory, created if it doesn't exist.
+      capacity:
+        type: integer
+        description:
+          The most bytes a store created holds.
+      dax_window_size:
+        type: integer
+        description:
+          The size in bytes of the DAX window, a multiple of 2 MiB, that the guest maps files'
+          data from. None without one.
+      extentd_socket:
+        type: string
+        description:
+          The socket of fxdax's extent daemon, which serves the store.
+      read_only:
+        type: boolean
+        description:
+          Whether the device follows the store, read-only, as another VM writes it. The store must
+          exist, and the guest mounts it read-only.
+
+  ExtentOverride:
+    type: object
+    description:
+      fxdax's extent-store device restored from a snapshot opens the store at
+      path_on_host, forked from the snapshot's point of its store if it doesn't
+      exist, rather than the store the snapshotted VM had.
+    required:
+      - id
+      - path_on_host
+    properties:
+      id:
+        type: string
+        description:
+          The ID of the extent-store device to modify
+      path_on_host:
+        type: string
+        description:
+          The store's directory
+      point_on_host:
+        type: string
+        description:
+          The snapshot's point of the store, if not where the snapshot was taken,
+          which the extent daemon takes from its bucket if it doesn't exist
+      extentd_socket:
+        type: string
+        description:
+          The extent daemon's socket, if not the snapshotted VM's
+
+  # A property of firecracker.yaml's SnapshotLoadParams, beside network_overrides.
+  SnapshotLoadParams:
+    properties:
+      extent_overrides:
+        type: array
+        description:
+          fxdax's extent-store devices whose stores to override on snapshot restore
+        items:
+          $ref: "#/definitions/ExtentOverride"
