@@ -164,9 +164,17 @@ pub const VIRTIO_EXTENT_MAP_AHEAD: u32 = 1 << 2;
 pub const VIRTIO_EXTENT_MAP_ZEROS: u32 = 1 << 3;
 
 /// The device's queues, and their size: request queues, interchangeable, which a driver may use one
-/// per CPU of (fxdax TASK-26.18.5).
-pub const EXTENT_NUM_QUEUES: usize = 4;
+/// per CPU of (fxdax TASK-26.18.5). fxdax: as many as its VM has vCPUs ([`request_queues`]), each
+/// with an MSI-X vector and a worker of its own, so that no two of the guest's CPUs share one; 4,
+/// whatever the VM, before (TASK-276). At most as many as a VM has vCPUs at most.
+pub const EXTENT_MAX_QUEUES: usize = crate::vmm_config::machine_config::MAX_SUPPORTED_VCPUS as usize;
 pub const EXTENT_QUEUE_SIZE: u16 = 256;
+
+/// fxdax: the request queues of the device of a VM of `vcpus` vCPUs: one each, one at least, and
+/// [`EXTENT_MAX_QUEUES`] at most (TASK-276).
+pub fn request_queues(vcpus: u8) -> usize {
+    usize::from(vcpus).clamp(1, EXTENT_MAX_QUEUES)
+}
 
 /// The ID of the DAX window's shared memory region.
 const DAX_WINDOW_SHM_ID: u8 = 0;
@@ -497,6 +505,18 @@ impl From<ExtentIdLe> for fxdax::ExtentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fxdax TASK-276: a queue per vCPU, one at least, as many as a VM has vCPUs at most.
+    #[test]
+    fn a_queue_per_vcpu() {
+        assert_eq!(request_queues(0), 1);
+        assert_eq!(request_queues(1), 1);
+        assert_eq!(request_queues(2), 2);
+        assert_eq!(request_queues(8), 8);
+        assert_eq!(request_queues(32), 32);
+        assert_eq!(request_queues(33), EXTENT_MAX_QUEUES);
+        assert_eq!(EXTENT_MAX_QUEUES, 32);
+    }
 
     /// What the device knows of its store's capacity: the capacity, and the shrink asked.
     fn known(resizing: &Resizing) -> (u64, u64) {

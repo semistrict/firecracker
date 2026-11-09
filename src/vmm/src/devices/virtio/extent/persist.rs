@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::device::{Extent, ExtentError, ExtentSnapshot, Making};
 use super::window::PrefaultGuestMemory;
-use super::{EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, VIRTIO_EXTENT_VERSION};
+use super::{EXTENT_QUEUE_SIZE, VIRTIO_EXTENT_VERSION};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::snapshot::Persist;
@@ -208,10 +208,13 @@ impl<'a> Persist<'a> for Extent {
             activated: false,
             ..state.virtio_state.clone()
         };
+        // fxdax: as many queues as it had, its VM's vCPUs' (TASK-276), which `Extent::make`
+        // bounds.
+        let count = state.virtio_state.queues.len();
         let mut queues = unactivated.build_queues_checked(
             constructor_args.mem,
             VirtioDeviceType::Extent,
-            EXTENT_NUM_QUEUES,
+            count,
             EXTENT_QUEUE_SIZE,
         )?;
         if state.virtio_state.activated {
@@ -235,7 +238,7 @@ impl<'a> Persist<'a> for Extent {
             window_addr: state.window_addr,
         };
         let config = ExtentDeviceConfig::from(&state.config);
-        let mut extent = Extent::make(constructor_args.vm, config, making)?;
+        let mut extent = Extent::make(constructor_args.vm, config, count, making)?;
         if let Some(prefault) = constructor_args.prefault {
             extent.set_prefault(prefault);
         }
