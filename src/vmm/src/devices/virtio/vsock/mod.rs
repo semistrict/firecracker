@@ -183,4 +183,9 @@ pub trait VsockChannel {
 /// The vsock backend, which is basically an epoll-event-driven vsock channel.
 /// Currently, the only implementation we have is `crate::devices::virtio::unix::muxer::VsockMuxer`,
 /// which translates guest-side vsock connections to host-side Unix domain socket connections.
-pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
+pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
+    /// Ends every connection, each with an RST for the driver, which `recv_pkt()` then yields:
+    /// after this, until a new connection is made, every packet the backend has for the driver is
+    /// an RST.
+    fn reset_connections(&mut self);
+}
