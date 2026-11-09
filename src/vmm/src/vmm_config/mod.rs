@@ -20,6 +20,9 @@ pub mod boot_source;
 pub mod drive;
 /// Wrapper for configuring the entropy device attached to the microVM.
 pub mod entropy;
+/// Wrapper for configuring cladefs's extent-store devices attached to the microVM.
+#[cfg(feature = "cladefs")]
+pub mod extent;
 /// Wrapper over the microVM general information attached to the microVM.
 pub mod instance_info;
 /// Wrapper for configuring the memory and CPU of the microVM.
