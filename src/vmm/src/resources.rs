@@ -21,6 +21,8 @@ use crate::vmm_config::balloon::*;
 use crate::vmm_config::boot_source::{
     BootConfig, BootSource, BootSourceConfig, BootSourceConfigError,
 };
+#[cfg(feature = "cladefs")]
+use crate::vmm_config::cladefs::{CladefsBuilder, CladefsConfigError, CladefsDeviceConfig};
 use crate::vmm_config::drive::*;
 use crate::vmm_config::entropy::*;
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -66,6 +68,9 @@ pub enum ResourcesError {
     EntropyConfig(#[from] EntropyDeviceError),
     /// Pmem device error: {0}
     PmemConfig(#[from] PmemConfigError),
+    /// Extent-store device error: {0}
+    #[cfg(feature = "cladefs")]
+    CladefsConfig(#[from] CladefsConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
 }
@@ -97,6 +102,9 @@ pub struct VmmConfig {
     pub entropy: Option<EntropyDeviceConfig>,
     #[serde(default, rename = "pmem")]
     pub pmem_devices: Vec<PmemConfig>,
+    #[cfg(feature = "cladefs")]
+    #[serde(default, rename = "cladefs", skip_serializing_if = "Vec::is_empty")]
+    pub cladefs_devices: Vec<CladefsDeviceConfig>,
     #[serde(skip)]
     pub serial_config: Option<SerialConfig>,
     pub memory_hotplug: Option<MemoryHotplugConfig>,
@@ -122,6 +130,9 @@ pub struct VmResources {
     pub entropy: EntropyDeviceBuilder,
     /// The pmem device configs.
     pub pmem: PmemBuilder,
+    /// The extent-store device configs.
+    #[cfg(feature = "cladefs")]
+    pub cladefs: CladefsBuilder,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
     /// The optional Mmds data store.
@@ -228,6 +239,11 @@ impl VmResources {
 
         for pmem_config in vmm_config.pmem_devices.into_iter() {
             resources.build_pmem_device(pmem_config)?;
+        }
+
+        #[cfg(feature = "cladefs")]
+        for extent_config in vmm_config.cladefs_devices.into_iter() {
+            resources.cladefs.insert(extent_config)?;
         }
 
         if let Some(serial_cfg) = vmm_config.serial_config {
@@ -550,6 +566,8 @@ impl From<&VmResources> for VmmConfig {
             vsock: resources.vsock.config(),
             entropy: resources.entropy.config(),
             pmem_devices: resources.pmem.configs.clone(),
+            #[cfg(feature = "cladefs")]
+            cladefs_devices: resources.cladefs.configs.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
@@ -665,6 +683,8 @@ mod tests {
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             entropy: Default::default(),
             pmem: Default::default(),
+            #[cfg(feature = "cladefs")]
+            cladefs: Default::default(),
             pci_enabled: false,
             serial_out_path: None,
             serial_rate_limiter_cfg: None,
