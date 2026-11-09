@@ -531,9 +531,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::devices::virtio::ActivateError;
-    #[cfg(feature = "fxdax")]
-    use crate::devices::virtio::device::VirtioShmRegion;
-    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType, VirtioShmRegion};
     use crate::devices::virtio::device_status::DEVICE_NEEDS_RESET;
     use crate::impl_device_type;
     use crate::test_utils::single_region_mem;
@@ -551,7 +549,6 @@ pub(crate) mod tests {
         device_activated: bool,
         config_bytes: [u8; 0xeff],
         activate_should_error: bool,
-        #[cfg(feature = "fxdax")]
         shm_regions: Vec<VirtioShmRegion>,
     }
 
@@ -569,13 +566,16 @@ pub(crate) mod tests {
                 device_activated: false,
                 config_bytes: [0; 0xeff],
                 activate_should_error: false,
-                #[cfg(feature = "fxdax")]
                 shm_regions: Vec::new(),
             }
         }
 
         pub fn set_avail_features(&mut self, avail_features: u64) {
             self.avail_features = avail_features;
+        }
+
+        pub(crate) fn set_shm_regions(&mut self, shm_regions: Vec<VirtioShmRegion>) {
+            self.shm_regions = shm_regions;
         }
     }
 
@@ -632,7 +632,6 @@ pub(crate) mod tests {
             }
         }
 
-        #[cfg(feature = "fxdax")]
         fn shm_regions(&self) -> &[VirtioShmRegion] {
             &self.shm_regions
         }

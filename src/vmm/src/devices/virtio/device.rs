@@ -81,9 +81,8 @@ pub enum VirtioDeviceType {
     Extent = 0x4658,
 }
 
-/// fxdax: a shared memory region of a device (virtio 1.2, section 2.10): guest memory the device
-/// and the driver share, which the transport tells the driver of by its ID.
-#[cfg(feature = "fxdax")]
+/// A shared memory region of a device (virtio 1.2, section 2.10): guest memory the device and the
+/// driver share, which the transport tells the driver of by its ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioShmRegion {
     /// The region's ID, which the driver selects it by.
@@ -201,8 +200,7 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
     /// Writes to this device configuration space at `offset`.
     fn write_config(&mut self, offset: u64, data: &[u8]);
 
-    /// fxdax: the device's shared memory regions, which have distinct IDs.
-    #[cfg(feature = "fxdax")]
+    /// The device's shared memory regions, which have distinct IDs: none unless it says so.
     fn shm_regions(&self) -> &[VirtioShmRegion] {
         &[]
     }
