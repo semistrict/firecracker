@@ -16,7 +16,7 @@ use vmm_sys_util::eventfd::EventFd;
 use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefault};
 use super::worker::{Notices, Worker};
 use super::{
-    ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_NUM_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
+    ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_MAX_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
     MAX_TRANSFER, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_FREEZE, VIRTIO_EXTENT_F_RESIZE,
     VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
@@ -55,6 +55,8 @@ pub enum ExtentError {
     Protocol(u32, u32),
     /// The snapshot's extent device {0} has a DAX window configured but no address saved for it
     WindowNotSaved(String),
+    /// The extent device {0} has {1} request queues: it has one at least, and as many as a VM has vCPUs at most
+    Queues(String, usize),
 }
 
 /// Errors taking a snapshot of an extent-store device (TASK-39.1).
@@ -145,25 +147,32 @@ impl fmt::Debug for Extent {
 
 impl Extent {
     /// A device as `config` describes, in `vm`, which opens its store, creating it if it doesn't
-    /// exist, in the extent daemon, and maps its DAX window, if it has one, into the guest.
-    pub fn new(vm: Arc<KvmVm>, config: ExtentDeviceConfig) -> Result<Self, ExtentError> {
-        Self::make(vm, config, Making::Boot)
+    /// exist, in the extent daemon, and maps its DAX window, if it has one, into the guest. fxdax:
+    /// with `queues` request queues, its VM's vCPUs' ([`super::request_queues`], TASK-276).
+    pub fn new(
+        vm: Arc<KvmVm>,
+        config: ExtentDeviceConfig,
+        queues: usize,
+    ) -> Result<Self, ExtentError> {
+        Self::make(vm, config, queues, Making::Boot)
     }
 
-    /// A device as `config` describes, made as `making` says: its store opened, or, restored from
-    /// a snapshot, forked from the snapshot's point if it doesn't exist; its window in guest memory
-    /// where the snapshot had it.
+    /// A device as `config` describes, with `queues` request queues, made as `making` says: its
+    /// store opened, or, restored from a snapshot, forked from the snapshot's point if it doesn't
+    /// exist; its window in guest memory where the snapshot had it.
     pub(super) fn make(
         vm: Arc<KvmVm>,
         config: ExtentDeviceConfig,
+        queues: usize,
         making: Making<'_>,
     ) -> Result<Self, ExtentError> {
+        if !(1..=EXTENT_MAX_QUEUES).contains(&queues) {
+            return Err(ExtentError::Queues(config.id.clone(), queues));
+        }
         let mut config_space = ConfigSpace {
             version: VIRTIO_EXTENT_VERSION.to_le(),
             tag: [0; 36],
-            num_request_queues: u32::try_from(EXTENT_NUM_QUEUES)
-                .expect("the queues are few")
-                .to_le(),
+            num_request_queues: u32::try_from(queues).expect("the queues are few").to_le(),
             block_size: ExtentStore::BLOCK_SIZE.to_le(),
             map_alignment: u32::try_from(fxdax::pages::page_size())
                 .expect("a page is small")
@@ -283,10 +292,8 @@ impl Extent {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
-            queues: (0..EXTENT_NUM_QUEUES)
-                .map(|_| Queue::new(EXTENT_QUEUE_SIZE))
-                .collect(),
-            queue_events: (0..EXTENT_NUM_QUEUES)
+            queues: (0..queues).map(|_| Queue::new(EXTENT_QUEUE_SIZE)).collect(),
+            queue_events: (0..queues)
                 .map(|_| EventFd::new(libc::EFD_NONBLOCK).map_err(ExtentError::EventFd))
                 .collect::<Result<_, _>>()?,
             workers: Vec::new(),

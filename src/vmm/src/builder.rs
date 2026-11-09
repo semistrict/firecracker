@@ -854,7 +854,7 @@ fn confine_extent_threads(seccomp_filters: &BpfThreadMap) -> Result<(), StartMic
 /// which `pci_enabled` says the VM's devices are on: a window is a BAR of its device's, which the
 /// MMIO transport has no way to describe, so the devices are refused on it. On x86-64, KVM maps the
 /// windows' pages for the guest as the extent daemon maps them, with a vCPU of their own, whose ID
-/// follows the guest's `vcpu_count` vCPUs'.
+/// follows the guest's `vcpu_count` vCPUs'. Each device has a request queue per vCPU (TASK-276).
 #[cfg(feature = "fxdax")]
 fn attach_extent_devices(
     device_manager: &mut DeviceManager,
@@ -863,7 +863,7 @@ fn attach_extent_devices(
     configs: &[ExtentDeviceConfig],
     event_manager: &mut EventManager,
     pci_enabled: bool,
-    #[cfg_attr(not(target_arch = "x86_64"), allow(unused))] vcpu_count: u8,
+    vcpu_count: u8,
 ) -> Result<(), StartMicrovmError> {
     use crate::devices::virtio::extent::Extent;
 
@@ -878,8 +878,10 @@ fn attach_extent_devices(
     let mut prefault = None;
     for config in configs {
         let id = config.id.clone();
+        // fxdax: a request queue per vCPU (TASK-276).
+        let queues = crate::devices::virtio::extent::request_queues(vcpu_count);
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut extent = Extent::new(kvm_vm.clone(), config.clone())?;
+        let mut extent = Extent::new(kvm_vm.clone(), config.clone(), queues)?;
         #[cfg(target_arch = "x86_64")]
         if config.dax_window_size.is_some() {
             use crate::devices::virtio::extent::KvmPrefault;
