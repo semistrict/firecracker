@@ -6,6 +6,10 @@
                 "comment": "fxdax: a page made private filled with its source's bytes, read from the extent daemon's memory (doc-13)"
             },
             {
+                "syscall": "pwrite64",
+                "comment": "fxdax: a page made private filled with its source's bytes, written to the window's private memory, which no mapping but the window's then reaches (doc-13, TASK-276.6)"
+            },
+            {
                 "syscall": "memfd_create",
                 "comment": "fxdax: a copy-on-write DAX window's private pages, laid out like the window (doc-13)",
                 "args": [
@@ -28,19 +32,6 @@
                         "op": "eq",
                         "val": 3,
                         "comment": "FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "comment": "fxdax: a private page filled before it is mapped (doc-13)",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 3223890435,
-                        "comment": "UFFDIO_COPY"
                     }
                 ]
             },
