@@ -57,6 +57,8 @@ pub enum ExtentError {
     WindowNotSaved(String),
     /// The extent device {0} has {1} request queues: it has one at least, and as many as a VM has vCPUs at most
     Queues(String, usize),
+    /// The extent device {0} has a DAX window, which cannot take its guest's faults: {1:#}
+    Userfaultfd(String, fxdax::Error),
 }
 
 /// Errors taking a snapshot of an extent-store device (TASK-39.1).
@@ -196,6 +198,13 @@ impl Extent {
 
         if config.read_only && matches!(making, Making::Restore { .. }) {
             return Err(ExtentError::ReadOnlyRestored(config.id.clone()));
+        }
+        // fxdax: a window's faults come through /dev/userfaultfd, which the device opens as the
+        // driver activates it: a host that denies it fails the VM now, saying what it lacks, not
+        // the guest's activation, after which the VM has no disk (TASK-308).
+        if config.dax_window_size.is_some() {
+            fxdax::userfaultfd_accessible()
+                .map_err(|err| ExtentError::Userfaultfd(config.id.clone(), err))?;
         }
         let store = connect_stopping(&config.extentd_socket, &config.id)
             .and_then(|daemon| match &making {
