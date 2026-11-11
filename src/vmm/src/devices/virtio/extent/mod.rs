@@ -121,6 +121,16 @@ pub const VIRTIO_EXTENT_WRITE_COMMIT: u32 = 1 << 1;
 pub const VIRTIO_EXTENT_WRITE_DURABLE: u32 = 1 << 2;
 pub const VIRTIO_EXTENT_WRITE_ROOT: u32 = 1 << 3;
 
+/// fxdax: a request's `flags`, of type `type_`, as a device whose cache is `Unsafe` serves them
+/// (TASK-363): a `COMMIT` or a `WRITE`'s commit ordered, not durable.
+pub fn undurable(type_: u32, flags: u32) -> u32 {
+    match type_ {
+        VIRTIO_EXTENT_T_COMMIT => flags & !VIRTIO_EXTENT_COMMIT_DURABLE,
+        VIRTIO_EXTENT_T_WRITE => flags & !VIRTIO_EXTENT_WRITE_DURABLE,
+        _ => flags,
+    }
+}
+
 /// The barriers a `WRITE`'s `flags` order it with, unless they are not a `WRITE`'s; the root that
 /// `WRITE_ROOT` sets the caller reads, after the data.
 pub fn write_barriers(flags: u32) -> Option<fxdax::WriteBarriers<'static>> {
@@ -505,6 +515,20 @@ impl From<ExtentIdLe> for fxdax::ExtentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fxdax TASK-363: an Unsafe device's commits and writes' commits are ordered, not durable,
+    /// and nothing else of their flags, nor any other request's, changes.
+    #[test]
+    fn unsafe_requests_are_undurable() {
+        let commit = VIRTIO_EXTENT_COMMIT_DURABLE | VIRTIO_EXTENT_COMMIT_ROOT;
+        assert_eq!(undurable(VIRTIO_EXTENT_T_COMMIT, commit), VIRTIO_EXTENT_COMMIT_ROOT);
+        let write = VIRTIO_EXTENT_WRITE_COMMIT | VIRTIO_EXTENT_WRITE_DURABLE | VIRTIO_EXTENT_WRITE_ROOT;
+        assert_eq!(
+            undurable(VIRTIO_EXTENT_T_WRITE, write),
+            VIRTIO_EXTENT_WRITE_COMMIT | VIRTIO_EXTENT_WRITE_ROOT
+        );
+        assert_eq!(undurable(VIRTIO_EXTENT_T_READ, u32::MAX), u32::MAX);
+    }
 
     /// fxdax TASK-276: a queue per vCPU, one at least, as many as a VM has vCPUs at most.
     #[test]
