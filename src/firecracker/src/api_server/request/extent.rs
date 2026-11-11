@@ -51,6 +51,7 @@ mod tests {
             dax_private_max: None,
             extentd_socket: "/extentd.sock".into(),
             read_only: false,
+            cache_type: vmm::vmm_config::extent::CacheType::Writeback,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_extent(&Body::new(BODY), Some("extents")).unwrap()),

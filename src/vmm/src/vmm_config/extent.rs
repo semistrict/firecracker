@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::devices::virtio::block::CacheType;
+
 /// The DAX window's sizes, and guest addresses, are multiples of this: huge pages'.
 pub const DAX_WINDOW_ALIGNMENT: u64 = 2 << 20;
 
@@ -49,6 +51,23 @@ pub struct ExtentDeviceConfig {
     /// backlog doc-8): the store must exist, and the guest mounts it read-only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
+    /// fxdax: what the device does with the guest's asks for durability, as a block device's
+    /// `cache_type` does with its flushes (TASK-363): `Writeback`, the default, waits for each, the
+    /// store's commits durable as the extent daemon makes them, uploaded; `Unsafe` answers them once
+    /// ordered, as a block device's dropped flushes are, the daemon making them durable soon after,
+    /// without the guest waiting: sync, syncfs, a freeze and an unmount wait for nothing past the
+    /// host, and what a host's crash takes since its last upload is lost, as it is of a disk image
+    /// whose flushes the host drops.
+    #[serde(default = "writeback", skip_serializing_if = "is_writeback")]
+    pub cache_type: CacheType,
+}
+
+fn writeback() -> CacheType {
+    CacheType::Writeback
+}
+
+fn is_writeback(cache: &CacheType) -> bool {
+    *cache == CacheType::Writeback
 }
 
 /// The extent-store devices' configs.
@@ -101,7 +120,20 @@ mod tests {
             dax_private_max: None,
             extentd_socket: "/extentd.sock".into(),
             read_only: false,
+            cache_type: CacheType::Writeback,
         }
+    }
+
+    /// fxdax: a device's cache is Writeback unless its configuration says Unsafe (TASK-363).
+    #[test]
+    fn test_cache_type() {
+        let json = r#"{"id":"a","tag":"fxfs","path_on_host":"/s","capacity":1,"extentd_socket":"/e"}"#;
+        let config: ExtentDeviceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cache_type, CacheType::Writeback);
+        let unsafe_json = json.replace('}', r#","cache_type":"Unsafe"}"#);
+        let config: ExtentDeviceConfig = serde_json::from_str(&unsafe_json).unwrap();
+        assert_eq!(config.cache_type, CacheType::Unsafe);
+        assert_eq!(serde_json::to_string(&config).unwrap(), unsafe_json);
     }
 
     #[test]

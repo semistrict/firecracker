@@ -80,6 +80,18 @@ definitions:
         description:
           Whether the device follows the store, read-only, as another VM writes it. The store must
           exist, and the guest mounts it read-only.
+      cache_type:
+        type: string
+        enum:
+          - Writeback
+          - Unsafe
+        default: Writeback
+        description:
+          What the device does with the guest's asks for durability, as a drive's cache_type does
+          with its flushes. Writeback waits for each, as the extent daemon makes the store's
+          commits durable, uploaded. Unsafe answers them once ordered, the daemon making them
+          durable soon after without the guest waiting; what a host's crash takes since the last
+          upload is lost, as of a disk image whose flushes the host drops.
 
   ExtentOverride:
     type: object

@@ -15,6 +15,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use fxdax::{Commit, Errno, RemoteExtentStore};
+
+use crate::devices::virtio::block::CacheType;
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{GuestMemory, GuestMemoryError};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -26,7 +28,7 @@ use super::{
     VIRTIO_EXTENT_COMMIT_ROOT, VIRTIO_EXTENT_MAP_AHEAD, VIRTIO_EXTENT_MAP_MANY,
     VIRTIO_EXTENT_T_COMMIT, VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO, VIRTIO_EXTENT_T_MAP,
     VIRTIO_EXTENT_T_READ, VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP, VIRTIO_EXTENT_T_WRITE,
-    VIRTIO_EXTENT_WRITE_ROOT, write_barriers,
+    VIRTIO_EXTENT_WRITE_ROOT, undurable, write_barriers,
 };
 use super::{
     Epoch, ResizedArgs, Resizing, VIRTIO_EXTENT_FREE_MANY, VIRTIO_EXTENT_FREEZE_FROZEN,
@@ -93,6 +95,8 @@ struct Shared {
     mem: GuestMemoryMmap,
     store: Arc<RemoteExtentStore>,
     notices: Arc<Notices>,
+    /// fxdax: what it does with the guest's asks for durability (TASK-363).
+    cache: CacheType,
     served: Served,
     /// The requests taken off the queue and not yet returned to the driver.
     serving: Mutex<usize>,
@@ -122,7 +126,9 @@ impl Shared {
         let buffers = Buffers::new(&self.mem, chain);
         fxdax::extentd::spawn_on_replies(fxdax::request::guest_request(unique, async move {
             let len = match buffers {
-                Ok(buffers) => handle(&shared.store, &shared.notices, buffers).await,
+                Ok(buffers) => {
+                    handle(&shared.store, &shared.notices, shared.cache, buffers).await
+                }
                 Err(err) => {
                     error!("extent device: {err}");
                     0
@@ -187,6 +193,7 @@ impl Worker {
         mem: GuestMemoryMmap,
         store: Arc<RemoteExtentStore>,
         notices: Arc<Notices>,
+        cache: CacheType,
     ) -> io::Result<Self> {
         let stop = EventFd::new(libc::EFD_NONBLOCK)?;
         let stop_theirs = stop.try_clone()?;
@@ -197,6 +204,7 @@ impl Worker {
             mem,
             store,
             notices,
+            cache,
             served: Served::default(),
             serving: Mutex::new(0),
             idle: Condvar::new(),
@@ -470,7 +478,12 @@ impl Writer<'_> {
 /// Serves the request whose buffers are `buffers` ([`Buffers::new`]) with `store`, and returns the
 /// length of what the device writes to it: its writable buffers, whose last bytes hold the
 /// response.
-pub(super) async fn handle(store: &RemoteExtentStore, notices: &Notices, buffers: Buffers) -> u32 {
+pub(super) async fn handle(
+    store: &RemoteExtentStore,
+    notices: &Notices,
+    cache: CacheType,
+    buffers: Buffers,
+) -> u32 {
     // The response is the chain's last bytes, after what the request returns.
     let writable = buffers.writable_len();
     let Some(room) = writable.checked_sub(size_of::<Response>()) else {
@@ -484,7 +497,7 @@ pub(super) async fn handle(store: &RemoteExtentStore, notices: &Notices, buffers
     let writer = Writer {
         segments: &buffers.writable,
     };
-    let (status, written) = match serve(store, notices, &mut reader, &writer, room).await {
+    let (status, written) = match serve(store, notices, cache, &mut reader, &writer, room).await {
         Ok(written) => (0, written),
         Err(errno) => (errno.raw().cast_unsigned(), 0),
     };
@@ -504,13 +517,18 @@ pub(super) async fn handle(store: &RemoteExtentStore, notices: &Notices, buffers
 async fn serve(
     store: &RemoteExtentStore,
     notices: &Notices,
+    cache: CacheType,
     reader: &mut Reader<'_>,
     writer: &Writer<'_>,
     room: usize,
 ) -> Result<usize, Errno> {
     let header: RequestHeader = reader.obj()?;
-    let flags = u32::from_le(header.flags);
-    match u32::from_le(header.type_) {
+    let type_ = u32::from_le(header.type_);
+    let flags = match cache {
+        CacheType::Writeback => u32::from_le(header.flags),
+        CacheType::Unsafe => undurable(type_, u32::from_le(header.flags)),
+    };
+    match type_ {
         VIRTIO_EXTENT_T_READ => {
             let args: IoArgs = reader.obj()?;
             let len = u32::from_le(args.len);
@@ -931,7 +949,8 @@ mod tests {
         let chain = queue.pop().unwrap().unwrap();
         let buffers = Buffers::new(&mem, chain).unwrap();
         let used =
-            futures::executor::block_on(handle(store, &Notices::default(), buffers)) as usize;
+            futures::executor::block_on(handle(store, &Notices::default(), CacheType::Writeback, buffers))
+                as usize;
         let mut written = vec![0; writable];
         mem.read_slice(&mut written, WRITABLE).unwrap();
         (used, written)
