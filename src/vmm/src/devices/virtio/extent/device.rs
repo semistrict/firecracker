@@ -407,6 +407,7 @@ impl Extent {
         let store = self.store.as_ref().expect("the device's store is closed");
         let queue_events = &self.queue_events;
         let notices = &self.notices;
+        let cache = self.config.cache_type;
         let spawn = |index: usize| {
             // The worker serves the queue from here on, notified through a copy of its event.
             let queue_event = queue_events[index]
@@ -420,6 +421,7 @@ impl Extent {
                 mem.clone(),
                 store.clone(),
                 notices.clone(),
+                cache,
             )
             .map_err(|err| ActivateError::Extent(format!("starting a worker: {err}")))
         };
