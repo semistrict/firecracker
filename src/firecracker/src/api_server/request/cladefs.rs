@@ -51,6 +51,7 @@ mod tests {
             dax_private_max: None,
             cladefsd_socket: "/cladefsd.sock".into(),
             read_only: false,
+            cache_type: vmm::vmm_config::cladefs::CacheType::Writeback,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_cladefs(&Body::new(BODY), Some("extents")).unwrap()),

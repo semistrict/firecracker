@@ -20,7 +20,7 @@ use super::{EXTENT_QUEUE_SIZE, VIRTIO_EXTENT_VERSION};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::snapshot::Persist;
-use crate::vmm_config::cladefs::CladefsDeviceConfig;
+use crate::vmm_config::cladefs::{CacheType, CladefsDeviceConfig};
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
 
@@ -57,6 +57,8 @@ pub struct ExtentConfigState {
     /// cladefs: the window's private pages at most, as configured (doc-13).
     pub dax_private_max: Option<u64>,
     pub cladefsd_socket: String,
+    /// cladefs: what it does with the guest's asks for durability (TASK-363).
+    pub cache_type: CacheType,
 }
 
 impl From<&CladefsDeviceConfig> for ExtentConfigState {
@@ -69,6 +71,7 @@ impl From<&CladefsDeviceConfig> for ExtentConfigState {
             dax_window_size: config.dax_window_size,
             dax_private_max: config.dax_private_max,
             cladefsd_socket: config.cladefsd_socket.clone(),
+            cache_type: config.cache_type,
         }
     }
 }
@@ -86,6 +89,7 @@ impl From<&ExtentConfigState> for CladefsDeviceConfig {
             dax_private_max: config.dax_private_max,
             cladefsd_socket: config.cladefsd_socket.clone(),
             read_only: false,
+            cache_type: config.cache_type,
         }
     }
 }

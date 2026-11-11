@@ -1313,6 +1313,7 @@ mod tests {
                 dax_private_max: None,
                 cladefsd_socket: String::new(),
                 read_only: false,
+                cache_type: crate::vmm_config::cladefs::CacheType::Writeback,
             },
         )));
         check_unsupported(runtime_request(VmmAction::ConfigureBootSource(
