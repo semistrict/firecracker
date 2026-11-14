@@ -1,29 +1,23 @@
 // Copyright 2026 cladefs authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The extent-store device: its configuration, features and DAX window, and the worker that
-//! serves its requests once the driver activates it.
+//! The extent-store device as a virtio device of Firecracker's: cladefs's `virtio_extent::Device`,
+//! its queues and their workers, which serve its requests once the driver activates it, and its
+//! window's shared memory region.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
-use cladefs::{DaemonConnection, ExtentStore, RemoteExtentStore};
+use virtio_extent::Workers;
+use virtio_extent::persist::SnapshotError;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::window::{DaxWindow, DaxWindowError, PrefaultGuestMemory, WindowPrefault};
-use super::worker::{Notices, Worker};
-use super::{
-    ConfigSpace, DAX_WINDOW_SHM_ID, EXTENT_MAX_QUEUES, EXTENT_QUEUE_SIZE, MAX_EXTENT, MAX_ROOT,
-    MAX_TRANSFER, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_FREEZE, VIRTIO_EXTENT_F_RESIZE,
-    VIRTIO_EXTENT_F_WRITE_COMMIT,
-};
-use super::{
-    Following, VIRTIO_EXTENT_F_FREE_MANY, VIRTIO_EXTENT_F_MAP_AHEAD, VIRTIO_EXTENT_F_MAP_MANY,
-    VIRTIO_EXTENT_F_READ_ONLY, VIRTIO_EXTENT_F_STATS, VIRTIO_EXTENT_VERSION,
-};
+use super::window::ExtentVm;
+use super::worker::{ExtentQueue, QueueVector};
+use super::{ConfigInterrupt, EXTENT_MAX_QUEUES, EXTENT_QUEUE_SIZE, PrefaultGuestMemory};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{
     ActiveState, DeviceState, VirtioDevice, VirtioDeviceType, VirtioShmRegion,
@@ -33,88 +27,35 @@ use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
-use crate::logger::{error, info, warn};
+use crate::logger::error;
 use crate::vmm_config::extent::ExtentDeviceConfig;
-use crate::vstate::memory::{ByteValued, GuestMemoryMmap};
+use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
 
 /// Errors making an extent-store device.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ExtentError {
-    /// Cannot open the extent store {0}: {1:#}
-    Store(String, cladefs::Error),
-    /// The read-only extent device {0} is restored from no snapshot: it takes none
-    ReadOnlyRestored(String),
-    /// The tag {0:?} is longer than 36 bytes
-    TagTooLong(String),
-    /// Cannot make the DAX window: {0}
-    DaxWindow(#[from] DaxWindowError),
+    /// {0}
+    Device(#[from] virtio_extent::Error),
     /// Error with EventFd: {0}
     EventFd(std::io::Error),
-    /// The snapshot's extent device is of protocol version {0}, this VMM's {1}: its guest's driver is of another
-    Protocol(u32, u32),
-    /// The snapshot's extent device {0} has a DAX window configured but no address saved for it
-    WindowNotSaved(String),
+    /// {0}
+    Protocol(#[from] virtio_extent::protocol::VersionRefused),
     /// The extent device {0} has {1} request queues: it has one at least, and as many as a VM has vCPUs at most
     Queues(String, usize),
-    /// The extent device {0} has a DAX window, which cannot take its guest's faults: {1:#}
-    Userfaultfd(String, cladefs::Error),
 }
 
-/// Errors taking a snapshot of an extent-store device (TASK-39.1).
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum ExtentSnapshotError {
-    /// Extent device {0}: its guest's filesystem is not frozen (fsfreeze it before the snapshot, and thaw it after)
-    NotFrozen(String),
-    /// Extent device {0}: it follows a store read-only, which a snapshot doesn't hold
-    ReadOnly(String),
-    /// Extent device {0}: cannot fork its store to {1}: {2}
-    Fork(String, String, cladefs::Errno),
-    /// Extent device {0}: cannot list its DAX window's mappings: {1}
-    Mappings(String, cladefs::Errno),
-}
-
-/// What a snapshot of the device holds of its store (TASK-39.1): the point it was taken at, a fork
-/// of the store, which each VM restored from it forks again, and the window's mappings then, which
-/// the restored VM's window maps again.
-#[derive(Debug, Clone)]
-pub struct ExtentSnapshot {
-    pub point: PathBuf,
-    /// The point's branch: a restore on another host takes it from the extent daemon's bucket.
-    pub point_branch: u64,
-    pub mappings: Vec<cladefs::WindowMapping>,
-}
-
-/// How a device is made: as its VM boots, or restored from a snapshot ([`ExtentSnapshot`]), its
-/// window where the snapshot had it in guest memory.
+/// How a device is made: as its VM boots, or restored from a snapshot's state.
 pub(super) enum Making<'a> {
     Boot,
-    Restore {
-        snapshot: &'a ExtentSnapshot,
-        window_addr: Option<u64>,
-    },
+    Restore(&'a virtio_extent::persist::State),
 }
 
 /// A virtio extent-store device, on an extent store that cladefs's extent daemon serves.
 pub struct Extent {
-    pub config: ExtentDeviceConfig,
-    // The store before the window, whose host memory the store's fault thread serves: the store
-    // is dropped first.
-    // cladefs: none from a follower's reset until it is activated again.
-    store: Option<Arc<RemoteExtentStore>>,
-    window: Option<DaxWindow>,
+    device: virtio_extent::Device,
     /// The window's shared memory region, if the device has a window.
     shm_regions: Vec<VirtioShmRegion>,
-    /// Whether the store's window is created, which it is on the first activation.
-    window_created: bool,
-    /// Maps the window's pages for the guest as the store maps them.
-    prefault: Option<Arc<dyn PrefaultGuestMemory>>,
-    config_space: ConfigSpace,
-    /// The store's capacity, as the daemon changes it; cladefs: and whether the guest's filesystem is
-    /// frozen (`VIRTIO_EXTENT_T_FREEZE`), as a snapshot needs it.
-    notices: Arc<Notices>,
-    /// cladefs: a follower's writer's commits, as the daemon tells of them.
-    following: Arc<Following>,
 
     // VirtIO fields
     avail_features: u64,
@@ -125,20 +66,15 @@ pub struct Extent {
     queues: Vec<Queue>,
     queue_events: Vec<EventFd>,
 
-    /// The workers serving the queues the driver set up, by index, while the device is activated,
-    /// and not paused for a snapshot (`pause_worker`).
-    workers: Vec<(usize, Worker)>,
-    /// cladefs: the snapshot taken of the device's store, or restored from (TASK-39.1).
-    snapshot: Option<ExtentSnapshot>,
-    /// cladefs: the window's mappings to map again as the window is created: those of the snapshot
-    /// the device was restored from.
-    mappings: Vec<cladefs::WindowMapping>,
+    /// The workers serving the queues the driver set up, while the device is activated, and not
+    /// paused for a snapshot (`pause_worker`).
+    workers: Option<Workers<ExtentQueue>>,
 }
 
 impl fmt::Debug for Extent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Extent")
-            .field("config", &self.config)
+            .field("device", &self.device)
             .field("shm_regions", &self.shm_regions)
             .field("device_state", &self.device_state)
             .finish_non_exhaustive()
@@ -169,133 +105,32 @@ impl Extent {
         if !(1..=EXTENT_MAX_QUEUES).contains(&queues) {
             return Err(ExtentError::Queues(config.id.clone(), queues));
         }
-        let mut config_space = ConfigSpace {
-            version: VIRTIO_EXTENT_VERSION.to_le(),
-            tag: [0; 36],
-            num_request_queues: u32::try_from(queues).expect("the queues are few").to_le(),
-            block_size: ExtentStore::BLOCK_SIZE.to_le(),
-            map_alignment: u32::try_from(cladefs::pages::page_size())
-                .expect("a page is small")
-                .to_le(),
-            max_transfer: MAX_TRANSFER.to_le(),
-            max_segments: (u32::from(EXTENT_QUEUE_SIZE) - 2).to_le(),
-            max_root: MAX_ROOT.to_le(),
-            branch: 0,
-            max_extent: MAX_EXTENT.to_le(),
-            capacity: 0,
-            asked: 0,
-            committed: 0,
-            private_max: 0,
-            stats_asked: 0,
-        };
-        let tag = config.tag.as_bytes();
-        if tag.len() > config_space.tag.len() {
-            return Err(ExtentError::TagTooLong(config.tag.clone()));
-        }
-        config_space.tag[..tag.len()].copy_from_slice(tag);
-
-        if config.read_only && matches!(making, Making::Restore { .. }) {
-            return Err(ExtentError::ReadOnlyRestored(config.id.clone()));
-        }
-        // cladefs: a window's faults come through /dev/userfaultfd, which the device opens as the
-        // driver activates it: a host that denies it fails the VM now, saying what it lacks, not
-        // the guest's activation, after which the VM has no disk (TASK-308).
-        if config.dax_window_size.is_some() {
-            cladefs::userfaultfd_accessible()
-                .map_err(|err| ExtentError::Userfaultfd(config.id.clone(), err))?;
-        }
-        let store = connect_stopping(&config.extentd_socket, &config.id)
-            .and_then(|daemon| match &making {
-                Making::Boot if config.read_only => daemon.open_read_only(&config.path_on_host),
-                Making::Boot => daemon.open(&config.path_on_host, config.capacity),
-                Making::Restore { snapshot, .. } => daemon.open_forked(
-                    &config.path_on_host,
-                    &snapshot.point,
-                    snapshot.point_branch,
-                    config.capacity,
-                ),
-            })
-            .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err))?;
-        config_space.branch = store.branch().to_le();
-        let notices = Arc::new(Notices::default());
-        let info = store
-            .info()
-            .map_err(|err| ExtentError::Store(config.path_on_host.clone(), err.into()))?;
-        notices
-            .resizing
-            .capacity
-            .store(info.capacity, std::sync::atomic::Ordering::Release);
-        let changes = notices.clone();
-        store.on_capacity(move |capacity, ask| changes.resizing.changed(capacity, ask));
-        hear_stats_asks(&store, &notices);
-        let following = Arc::new(Following::default());
-        hear_commits(&store, &following);
-
-        // A follower's device writes nothing (doc-4's F_READ_ONLY). cladefs: notifications are
-        // suppressed while the device takes the requests queued, and interrupts while the driver
-        // takes the ones done (EVENT_IDX): each costs an exit, which nested virtualization makes
-        // dear (TASK-41).
-        // cladefs: and the daemon asks the guest for its stats, a follower's as a writer's
-        // (TASK-111.4).
-        let mut avail_features = if config.read_only {
-            (1u64 << VIRTIO_F_VERSION_1)
-                | (1u64 << VIRTIO_RING_F_EVENT_IDX)
-                | (1 << VIRTIO_EXTENT_F_FREEZE)
-                | (1 << VIRTIO_EXTENT_F_READ_ONLY)
-                | (1 << VIRTIO_EXTENT_F_STATS)
-        } else {
-            (1u64 << VIRTIO_F_VERSION_1)
-                | (1u64 << VIRTIO_RING_F_EVENT_IDX)
-                | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT)
-                | (1 << VIRTIO_EXTENT_F_RESIZE)
-                | (1 << VIRTIO_EXTENT_F_FREEZE)
-                | (1 << VIRTIO_EXTENT_F_FREE_MANY)
-                | (1 << VIRTIO_EXTENT_F_STATS)
-        };
-        let mut shm_regions = Vec::new();
-        let window = match config.dax_window_size {
-            Some(size) => {
-                let window = match making {
-                    Making::Boot => DaxWindow::new(vm, size)?,
-                    Making::Restore {
-                        window_addr: Some(addr),
-                        ..
-                    } => DaxWindow::at(vm, addr, size)?,
-                    Making::Restore {
-                        window_addr: None, ..
-                    } => return Err(ExtentError::WindowNotSaved(config.id.clone())),
-                };
-                shm_regions.push(VirtioShmRegion {
-                    id: DAX_WINDOW_SHM_ID,
-                    guest_addr: window.guest_addr(),
-                    len: window.len(),
-                });
-                // cladefs: a MAP may carry a chunk's pieces (doc-4's MAP_MANY, TASK-91.4), and say
-                // the guest reads them next (MAP_AHEAD, TASK-112.1).
-                avail_features |= (1 << VIRTIO_EXTENT_F_DAX)
-                    | (1 << VIRTIO_EXTENT_F_MAP_MANY)
-                    | (1 << VIRTIO_EXTENT_F_MAP_AHEAD);
-                // cladefs: a writer's window copies on write (backlog doc-13); a follower's copies
-                // nothing.
-                if !config.read_only {
-                    config_space.private_max =
-                        private_max(window.len(), config.dax_private_max).to_le();
-                }
-                Some(window)
+        let count = u16::try_from(queues).expect("the queues are few");
+        let window_vm = Arc::new(ExtentVm::new(vm));
+        let lost = on_lost(&config.id);
+        let device = match making {
+            Making::Boot => virtio_extent::Device::new(config, count, window_vm, lost)?,
+            Making::Restore(state) => {
+                virtio_extent::Device::restore(state, count, window_vm, lost)?
             }
-            None => None,
         };
-
+        let shm_regions = device
+            .shm_region()
+            .map(|region| VirtioShmRegion {
+                id: region.id,
+                guest_addr: region.guest_addr,
+                len: region.len,
+            })
+            .into_iter()
+            .collect();
+        // cladefs: notifications are suppressed while the device takes the requests queued, and
+        // interrupts while the driver takes the ones done (EVENT_IDX): each costs an exit, which
+        // nested virtualization makes dear (TASK-41).
+        let avail_features =
+            (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX) | device.features();
         Ok(Self {
-            config,
-            store: Some(Arc::new(store)),
-            window,
+            device,
             shm_regions,
-            window_created: false,
-            prefault: None,
-            config_space,
-            notices,
-            following,
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
@@ -303,78 +138,29 @@ impl Extent {
             queue_events: (0..queues)
                 .map(|_| EventFd::new(libc::EFD_NONBLOCK).map_err(ExtentError::EventFd))
                 .collect::<Result<_, _>>()?,
-            workers: Vec::new(),
-            snapshot: None,
-            mappings: Vec::new(),
+            workers: None,
         })
+    }
+
+    /// Its configuration.
+    pub fn config(&self) -> &ExtentDeviceConfig {
+        self.device.config()
+    }
+
+    /// The device, but its transport.
+    pub(super) fn device(&self) -> &virtio_extent::Device {
+        &self.device
     }
 
     /// Has `prefault` map the DAX window's pages for the guest as the store maps them, rather
     /// than the guest faulting on each.
     pub fn set_prefault(&mut self, prefault: Arc<dyn PrefaultGuestMemory>) {
-        self.prefault = Some(prefault);
-    }
-
-    /// Its store: open, but from a follower's reset until it is activated again.
-    fn store(&self) -> &Arc<RemoteExtentStore> {
-        self.store.as_ref().expect("the device's store is closed")
-    }
-
-    /// Creates the store's DAX window in the window's host memory, unless the device has no
-    /// window, or it exists.
-    fn create_dax_window(&mut self) -> Result<(), cladefs::Error> {
-        let Some(window) = &self.window else {
-            return Ok(());
-        };
-        if self.window_created {
-            return Ok(());
-        }
-        let prefault = self
-            .prefault
-            .clone()
-            .map(|prefault| -> Arc<dyn cladefs::Prefault> {
-                Arc::new(WindowPrefault {
-                    guest_addr: window.guest_addr(),
-                    prefault,
-                })
-            });
-        // cladefs: a writer's copies on write, of `private_max` pages at most; a follower's, of
-        // none, copies nothing (backlog doc-13).
-        let private_max = u64::from_le(self.config_space.private_max);
-        // SAFETY: The window's host memory is the device's, which only the guest accesses, and
-        // which outlives the store's connection, as the store is dropped first.
-        unsafe {
-            self.store().create_dax_window_in_host_memory(
-                window.host_memory(),
-                window.len(),
-                prefault,
-                private_max,
-            )
-        }?;
-        self.window_created = true;
-        Ok(())
-    }
-
-    /// cladefs: opens a follower's store anew, as of its writer's latest commit, with a window of
-    /// its own, created as the driver activates the device: after a reset, its guest remounting
-    /// on a new view, as it does once it was cut off (`ESTALE`). The old connection went as it
-    /// reset (`reset_confined`), with its window's faults, before the new one creates its window
-    /// in the same memory, which it left inaccessible meanwhile (TASK-79.8).
-    fn reopen(&mut self) -> Result<(), cladefs::Error> {
-        let store = connect_stopping(&self.config.extentd_socket, &self.config.id)?
-            .open_read_only(&self.config.path_on_host)?;
-        self.following = Arc::new(Following::default());
-        hear_commits(&store, &self.following);
-        hear_stats_asks(&store, &self.notices);
-        self.config_space.branch = store.branch().to_le();
-        self.store = Some(Arc::new(store));
-        self.window_created = false;
-        Ok(())
+        self.device.set_prefault(prefault);
     }
 
     fn stop_worker(&mut self) {
-        for (_, worker) in self.workers.drain(..) {
-            worker.stop();
+        if let Some(workers) = self.workers.take() {
+            workers.stop();
         }
     }
 
@@ -382,67 +168,59 @@ impl Extent {
     /// they left them, for a snapshot: the VM is paused, and the workers start again as it resumes
     /// (`VirtioDevice::kick`).
     fn pause_worker(&mut self) {
-        for (index, worker) in std::mem::take(&mut self.workers) {
-            if let Some(queue) = worker.stop() {
-                self.queues[index] = queue;
-            }
-        }
+        pause(&mut self.workers, &mut self.queues);
     }
 
     /// Starts the workers again, if the device is activated and they are paused (`pause_worker`):
-    /// one for each queue the driver set up.
+    /// one for each queue the driver set up, notified through a copy of its event, all or none.
     fn resume_worker(&mut self) -> Result<(), ActivateError> {
         let DeviceState::Activated(ActiveState { mem, interrupt }) = &self.device_state else {
             return Ok(());
         };
-        if !self.workers.is_empty() {
+        if self.workers.is_some() {
             return Ok(());
         }
-        let ready: Vec<usize> = (0..self.queues.len())
-            .filter(|index| self.queues[*index].ready)
-            .collect();
-        let queues = self.queues.clone();
-        let store = self.store.as_ref().expect("the device's store is closed");
-        let queue_events = &self.queue_events;
-        let notices = &self.notices;
-        let cache = self.config.cache_type;
-        let spawn = |index: usize| {
-            // The worker serves the queue from here on, notified through a copy of its event.
-            let queue_event = queue_events[index]
+        let mut queues = Vec::new();
+        for (index, queue) in self
+            .queues
+            .iter()
+            .enumerate()
+            .filter(|(_, queue)| queue.ready)
+        {
+            let index = u16::try_from(index).expect("the queues are few");
+            let event = self.queue_events[usize::from(index)]
                 .try_clone()
                 .map_err(|_| ActivateError::EventFd)?;
-            Worker::spawn(
-                queues[index].clone(),
-                u16::try_from(index).expect("the queues are few"),
-                queue_event,
-                interrupt.clone(),
-                mem.clone(),
-                store.clone(),
-                notices.clone(),
-                cache,
-            )
-            .map_err(|err| ActivateError::Extent(format!("starting a worker: {err}")))
-        };
-        let own = &mut self.queues;
-        let workers = start_all(&ready, spawn, |index, worker: Worker| {
-            if let Some(queue) = worker.stop() {
-                own[index] = queue;
-            }
-        })?;
-        self.workers = workers;
+            queues.push(virtio_extent::WorkerQueue {
+                index,
+                queue: ExtentQueue::new(queue.clone(), mem.clone()),
+                // SAFETY: The copy's descriptor, which the worker owns from here on.
+                event: unsafe { OwnedFd::from_raw_fd(event.into_raw_fd()) },
+                interrupt: Arc::new(QueueVector {
+                    interrupt: interrupt.clone(),
+                    index,
+                }),
+            });
+        }
+        let workers = self
+            .device
+            .start_workers(queues, "fc_extent_q")
+            .map_err(|err| ActivateError::Extent(format!("starting a worker: {err}")))?;
+        self.workers = Some(workers);
         Ok(())
     }
 
     /// Activates the device (`VirtioDevice::activate`), on a thread under the VMM's seccomp filter:
-    /// opens the store anew if a snapshot left it, initializes the queues the driver set up, makes
-    /// the DAX window, and starts the workers.
+    /// initializes the queues the driver set up, activates the device, which opens the store anew
+    /// if a reset let it go and makes the DAX window, and starts the workers.
     fn activate_confined(
         &mut self,
         mem: GuestMemoryMmap,
         interrupt: Arc<dyn VirtioInterrupt>,
     ) -> Result<(), ActivateError> {
         assert!(!self.is_activated());
-        took_every_feature(self.avail_features, self.acked_features)?;
+        virtio_extent::protocol::check_acked(self.avail_features, self.acked_features)
+            .map_err(|refused| ActivateError::Extent(refused.to_string()))?;
         // cladefs: those the driver set up, one per CPU of the guest's, up to the device's.
         let event_idx = self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         for queue in self.queues.iter_mut().filter(|queue| queue.ready) {
@@ -453,29 +231,10 @@ impl Extent {
                 queue.enable_notif_suppression();
             }
         }
-        // cladefs: once the queues are, so that an activation failing on them leaves the store
-        // closed, to open anew at the next (TASK-79.8), its guest remounting on a new view
-        // (doc-4).
-        if self.store.is_none() {
-            self.reopen()
-                .map_err(|err| ActivateError::Extent(format!("opening the store anew: {err:#}")))?;
-        }
-        self.create_dax_window()
-            .map_err(|err| ActivateError::Extent(format!("creating the DAX window: {err:#}")))?;
-        self.map_again().map_err(|errno| {
-            ActivateError::Extent(format!("mapping the snapshot's window again: {errno}"))
-        })?;
-        *self
-            .notices
-            .resizing
-            .interrupt
-            .lock()
-            .expect("Poisoned lock") = Some(interrupt.clone());
-        *self.following.interrupt.lock().expect("Poisoned lock") = Some(interrupt.clone());
-        // cladefs: the guest is asked for its stats if its driver takes asks (TASK-111.4).
-        let asks = self.acked_features & (1 << VIRTIO_EXTENT_F_STATS) != 0;
-        *self.notices.stats.interrupt.lock().expect("Poisoned lock") =
-            asks.then(|| interrupt.clone());
+        let config_interrupt = Arc::new(ConfigInterrupt(interrupt.clone()));
+        self.device
+            .activate(self.acked_features, config_interrupt)
+            .map_err(|err| ActivateError::Extent(err.to_string()))?;
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         self.resume_worker()
     }
@@ -483,115 +242,43 @@ impl Extent {
     /// cladefs: takes a snapshot of the device's store, for a snapshot of the VM, paused, whose
     /// guest's filesystem is frozen, with nothing open (TASK-39.1): forks the store to `point`,
     /// and records the window's mappings, which [`Persist::save`](crate::snapshot::Persist) saves.
-    pub fn take_snapshot(&mut self, point: &Path) -> Result<(), ExtentSnapshotError> {
-        let id = self.config.id.clone();
-        if self.config.read_only {
-            return Err(ExtentSnapshotError::ReadOnly(id));
-        }
-        if !self.notices.frozen.load(Ordering::Acquire) {
-            return Err(ExtentSnapshotError::NotFrozen(id));
-        }
-        // No request is in progress, which could change the window meanwhile.
-        self.pause_worker();
-        // cladefs: the point's branch, the extent daemon's to name, its ID one no other branch of its
-        // bucket has (TASK-364).
-        let branch = self.store().fork_quiescent(point).map_err(|errno| {
-            ExtentSnapshotError::Fork(id.clone(), point.display().to_string(), errno)
-        })?;
-        let mappings = self
-            .store()
-            .window_mappings()
-            .map_err(|errno| ExtentSnapshotError::Mappings(id, errno))?;
-        self.snapshot = Some(ExtentSnapshot {
-            point: point.to_owned(),
-            point_branch: branch,
-            mappings,
-        });
-        Ok(())
+    /// No request is in progress meanwhile, which could change the window: the workers stop.
+    pub fn take_snapshot(&mut self, point: &Path) -> Result<(), SnapshotError> {
+        let (workers, queues) = (&mut self.workers, &mut self.queues);
+        self.device.take_snapshot(point, || pause(workers, queues))
     }
 
     /// The snapshot taken of the device's store ([`Extent::take_snapshot`]), or restored from.
-    pub fn snapshot(&self) -> Option<&ExtentSnapshot> {
-        self.snapshot.as_ref()
+    pub fn snapshot(&self) -> Option<&virtio_extent::persist::Snapshot> {
+        self.device.snapshot()
     }
 
-    /// Whether the guest's filesystem is frozen.
-    pub(super) fn frozen(&self) -> bool {
-        self.notices.frozen.load(Ordering::Acquire)
-    }
-
-    /// The window's address in guest memory, if the device has a window.
-    pub(super) fn window_addr(&self) -> Option<u64> {
-        self.window.as_ref().map(DaxWindow::guest_addr)
-    }
-
-    /// The device as restored from a snapshot: its queues, features and the guest's freezing as
-    /// they were, and the window's mappings to map again as it is activated.
-    pub(super) fn restored(
-        &mut self,
-        snapshot: ExtentSnapshot,
-        queues: Vec<Queue>,
-        acked_features: u64,
-        frozen: bool,
-    ) {
+    /// The device as restored from a snapshot: its queues and features as they were.
+    pub(super) fn restored(&mut self, queues: Vec<Queue>, acked_features: u64) {
         self.queues = queues;
         self.acked_features = acked_features;
-        self.notices.frozen.store(frozen, Ordering::Release);
-        self.mappings.clone_from(&snapshot.mappings);
-        self.snapshot = Some(snapshot);
-    }
-
-    /// Maps the window's mappings of the snapshot the device was restored from again. cladefs: all
-    /// at once, in a request of the daemon's or a few, each one change of the window, where a MAP
-    /// each, a round trip apiece, held the restore up (TASK-92.14).
-    fn map_again(&mut self) -> Result<(), cladefs::Errno> {
-        let mappings = std::mem::take(&mut self.mappings);
-        if mappings.is_empty() {
-            return Ok(());
-        }
-        let start = std::time::Instant::now();
-        self.store().map_many(&mappings)?;
-        info!(
-            "extent device {}: the snapshot's {} window mappings mapped again in {:?}",
-            self.config.id,
-            mappings.len(),
-            start.elapsed()
-        );
-        Ok(())
     }
 }
 
-/// cladefs: a connection to the extent daemon listening at `socket`, the device `id`'s, which stops
-/// the VM once the daemon goes: the guest's disk is gone then, and the VM stops at once, its exit
-/// status saying why, rather than going on with every request failing (TASK-50.2). Said before
-/// the store opens over it, so that a daemon going as it opens, as the VM is created, stops it so
-/// too, rather than as a store that failed to open (TASK-232).
-fn connect_stopping(socket: impl AsRef<Path>, id: &str) -> Result<DaemonConnection, cladefs::Error> {
-    let daemon = DaemonConnection::connect(socket)?;
+/// What stops the VM as the extent daemon of the device `id` goes: the guest's disk is gone then,
+/// and the VM stops at once, its exit status saying why, rather than going on with every request
+/// failing (TASK-50.2).
+fn on_lost(id: &str) -> virtio_extent::OnLost {
     let id = id.to_owned();
-    // The VM can't go on, and nothing returns to the VMM's loop to stop it from here.
-    #[allow(clippy::exit)]
-    daemon.on_lost(move || {
-        error!("extent device {id}: the extent daemon went; stopping the VM");
+    Arc::new(move || {
+        error!("extent device {id}: stopping the VM");
+        // The VM can't go on, and nothing returns to the VMM's loop to stop it from here.
+        #[allow(clippy::exit)]
         std::process::exit(crate::FcExitCode::ExtentdLost as i32);
-    });
-    Ok(daemon)
+    })
 }
 
-/// cladefs: has `following` hear of the commits of the writer of `store`, a follower's, from the
-/// one its view is as of.
-fn hear_commits(store: &RemoteExtentStore, following: &Arc<Following>) {
-    let heard = following.clone();
-    store.on_committed(move |epoch| heard.committed(epoch));
-    following.committed(store.committed());
-}
-
-/// cladefs: has the daemon's asks for the stats of `store`'s VM process and guest ask the guest,
-/// through `notices`, while its driver takes asks; otherwise the store answers at once, with none of
-/// the guest's (TASK-111.4).
-fn hear_stats_asks(store: &RemoteExtentStore, notices: &Arc<Notices>) {
-    let notices = notices.clone();
-    store.on_stats_asked(move |ask| notices.stats.ask(ask));
+/// Stops `workers`, once the requests they took are served, and takes back their queues into
+/// `queues`, as they left them.
+fn pause(workers: &mut Option<Workers<ExtentQueue>>, queues: &mut [Queue]) {
+    for (index, queue) in workers.take().map(Workers::stop).unwrap_or_default() {
+        queues[usize::from(index)] = queue.queue;
+    }
 }
 
 impl Drop for Extent {
@@ -604,7 +291,7 @@ impl VirtioDevice for Extent {
     impl_device_type!(VirtioDeviceType::Extent);
 
     fn id(&self) -> &str {
-        &self.config.id
+        &self.config().id
     }
 
     fn avail_features(&self) -> u64 {
@@ -639,35 +326,12 @@ impl VirtioDevice for Extent {
             .as_ref()
     }
 
-    // cladefs: the store's capacity, and the shrink the guest is asked to take, as they are now;
-    // and a follower's writer's latest commit; and the daemon's latest ask for the guest's stats.
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        use std::sync::atomic::Ordering;
-        let config = ConfigSpace {
-            capacity: self
-                .notices
-                .resizing
-                .capacity
-                .load(Ordering::Acquire)
-                .to_le(),
-            asked: self.notices.resizing.asked.load(Ordering::Acquire).to_le(),
-            committed: self.following.committed.load(Ordering::Acquire).to_le(),
-            stats_asked: self.notices.stats.asked.load(Ordering::Acquire).to_le(),
-            ..self.config_space
-        };
-        let config = config.as_slice();
-        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-        if let Some(config_from_offset) = config.get(offset..) {
-            let len = config_from_offset.len().min(data.len());
-            data[..len].copy_from_slice(&config_from_offset[..len]);
-            data[len..].fill(0);
-        } else {
-            data.fill(0);
-        }
+        self.device.read_config(offset, data);
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        warn!(
+        crate::logger::warn!(
             "extent device: the driver wrote {} bytes of config at {offset:#x}",
             data.len()
         );
@@ -710,7 +374,7 @@ impl VirtioDevice for Extent {
     // takes the requests queued meanwhile.
     fn kick(&mut self) {
         if let Err(err) = self.resume_worker() {
-            error!("extent device {}: {err}", self.config.id);
+            error!("extent device {}: {err}", self.config().id);
         }
         if self.is_activated() {
             self.notify_queue_events();
@@ -731,7 +395,7 @@ impl VirtioDevice for Extent {
         reset.unwrap_or_else(|err| {
             error!(
                 "extent device {}: starting its reset: {err}",
-                self.config.id
+                self.config().id
             );
             None
         })
@@ -742,27 +406,7 @@ impl Extent {
     /// Resets the device (`VirtioDevice::reset`), on a thread under the VMM's seccomp filter.
     fn reset_confined(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
         self.stop_worker();
-        // cladefs: a follower lets go of its store now, not as it is activated again: a store its
-        // writer retired, going with writes uncommitted, opens only once it is gone, for its
-        // follower or a new writer, and the guest may not mount for a while (TASK-79.24).
-        // Its guest leaves its window mapped as it unmounts, for the device's going to unmap: this
-        // process would go on mapping pages the daemon, its connection gone, gives others, so they
-        // go first, the daemon's stage operations made as the reply comes (TASK-79.100).
-        if self.config.read_only {
-            if let (Some(store), Some(window), true) =
-                (&self.store, &self.window, self.window_created)
-                && let Err(err) = store.unmap(0, window.len())
-            {
-                error!(
-                    "extent device {}: unmapping its window: {err:#}",
-                    self.config.id
-                );
-            }
-            self.store = None;
-        }
-        // cladefs: no guest is asked for its stats until a driver activates it again, the store
-        // answering meanwhile (TASK-111.4).
-        *self.notices.stats.interrupt.lock().expect("Poisoned lock") = None;
+        self.device.reset();
         let DeviceState::Activated(ActiveState { interrupt, .. }) =
             std::mem::replace(&mut self.device_state, DeviceState::Inactive)
         else {
@@ -774,20 +418,6 @@ impl Extent {
     }
 }
 
-/// cladefs: `Ok` if a driver that took `acked` of the features the device offers, `offered`, took
-/// every one, as a driver of the device's protocol does (TASK-141.3): its features are no
-/// negotiation, but what the device is configured as, which a driver serving it otherwise, as it
-/// would one of another protocol's, would serve wrong. Refused, naming both.
-fn took_every_feature(offered: u64, acked: u64) -> Result<(), ActivateError> {
-    if acked == offered {
-        return Ok(());
-    }
-    Err(ActivateError::Extent(format!(
-        "the driver took features {acked:#x} of the {offered:#x} offered, where a driver of \
-         protocol version {VIRTIO_EXTENT_VERSION} takes every one: it is of another"
-    )))
-}
-
 /// The device's events are the worker's own: the event manager has none to process.
 impl MutEventSubscriber for Extent {
     fn init(&mut self, _ops: &mut EventOps) {}
@@ -795,115 +425,24 @@ impl MutEventSubscriber for Extent {
     fn process(&mut self, _events: Events, _ops: &mut EventOps) {}
 }
 
-/// cladefs: starts a worker for each of `ready` by `spawn`: all of them, or, one failing, none,
-/// those it started stopped by `stop`. Left running, no stop or reset would reach them, and the
-/// next kick would start others on the same queues (TASK-79.44).
-fn start_all<W, E>(
-    ready: &[usize],
-    mut spawn: impl FnMut(usize) -> Result<W, E>,
-    mut stop: impl FnMut(usize, W),
-) -> Result<Vec<(usize, W)>, E> {
-    let mut started = Vec::with_capacity(ready.len());
-    for &index in ready {
-        match spawn(index) {
-            Ok(worker) => started.push((index, worker)),
-            Err(err) => {
-                started
-                    .into_iter()
-                    .for_each(|(index, worker)| stop(index, worker));
-                return Err(err);
-            }
-        }
-    }
-    Ok(started)
-}
-
-/// cladefs: the most private pages a writer's window of `len` bytes holds as it copies on write
-/// (backlog doc-13): `configured`, if given; otherwise [`PRIVATE_MAX_DEFAULT`]'s pages, or the
-/// window's if fewer, one at least (TASK-227; half its pages before, TASK-164.11).
-fn private_max(len: u64, configured: Option<u64>) -> u64 {
-    let pages = len / cladefs::pages::page_size();
-    configured
-        .unwrap_or_else(|| (PRIVATE_MAX_DEFAULT / cladefs::pages::page_size()).min(pages))
-        .max(1)
-}
-
-/// cladefs: the bytes of private pages a writer's window holds at most unless configured
-/// (`dax_private_max`), whatever its size (TASK-227): enough for a forked pgbench's working set
-/// (GCE r804, forked-dax 0.91), which the daemon reserves against the tenant's memory.
-const PRIVATE_MAX_DEFAULT: u64 = 1 << 30;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// cladefs TASK-227: a writer's window holds 1 GiB of private pages at most unless configured
-    /// otherwise, whatever its size: the window is address space, as large as the data, and its
-    /// private pages are memory, which the daemon reserves against the tenant's. Half a 64 GiB
-    /// window's pages, as TASK-164.11's default had it, would have reserved 32 GiB a VM. A window
-    /// smaller than the default holds as many as it has pages; one of a page, one.
-    #[test]
-    fn a_windows_private_pages_are_not_its_size() {
-        let page = cladefs::pages::page_size();
-        let gib = (1 << 30) / page;
-        assert_eq!(private_max(64 << 30, None), gib);
-        assert_eq!(private_max(2 << 30, None), gib);
-        assert_eq!(private_max(512 << 20, None), (512 << 20) / page);
-        assert_eq!(private_max(64 << 30, Some(16)), 16);
-        assert_eq!(private_max(page, None), 1);
-    }
-
-    /// cladefs TASK-141.3: the configuration says the device's protocol version first, where a
-    /// driver of every version reads it.
-    #[test]
-    fn the_configuration_says_its_version_first() {
-        assert_eq!(std::mem::offset_of!(ConfigSpace, version), 0);
-        assert_eq!(std::mem::offset_of!(ConfigSpace, tag), 4);
-        assert_eq!(std::mem::size_of::<ConfigSpace>(), 120);
-    }
-
     /// cladefs TASK-141.3: a driver activating the device having taken fewer features than it
-    /// offers, or others, is refused, naming them; one taking every one isn't. Before, it was
-    /// served, as negotiation has it, its INFOs short of the branch without F_FREEZE.
+    /// offers is refused, naming them, as the crate's check says.
     #[test]
     fn drivers_take_every_feature_offered() {
-        let offered = (1u64 << VIRTIO_F_VERSION_1)
-            | (1u64 << VIRTIO_RING_F_EVENT_IDX)
-            | (1 << VIRTIO_EXTENT_F_FREEZE)
-            | (1 << VIRTIO_EXTENT_F_DAX);
-        took_every_feature(offered, offered).unwrap();
-        let fewer = offered & !(1 << VIRTIO_EXTENT_F_FREEZE);
-        let refused = took_every_feature(offered, fewer).unwrap_err().to_string();
+        let offered =
+            (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX) | (1 << 4) | 1;
+        let refused = virtio_extent::protocol::check_acked(offered, offered & !(1 << 4))
+            .map_err(|refused| ActivateError::Extent(refused.to_string()))
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             refused,
             "Extent device: the driver took features 0x120000001 of the 0x120000011 offered, \
              where a driver of protocol version 1 takes every one: it is of another"
         );
-        assert!(took_every_feature(offered, offered | (1 << VIRTIO_EXTENT_F_READ_ONLY)).is_err());
-    }
-
-    /// TASK-79.44: a worker failing to start stops those started before it.
-    #[test]
-    fn workers_start_all_or_none() {
-        let mut stopped = Vec::new();
-        let spawn = |index: usize| {
-            if index == 5 {
-                Err("no thread")
-            } else {
-                Ok(index * 10)
-            }
-        };
-        let stop = |index, worker| stopped.push((index, worker));
-        assert_eq!(start_all(&[1, 3, 5, 7], spawn, stop), Err("no thread"));
-        assert_eq!(stopped, vec![(1, 10), (3, 30)]);
-
-        let mut stopped: Vec<(usize, usize)> = Vec::new();
-        let started = start_all(
-            &[1, 3],
-            |index| Ok::<_, ()>(index * 10),
-            |index, worker| stopped.push((index, worker)),
-        );
-        assert_eq!(started, Ok(vec![(1, 10), (3, 30)]));
-        assert_eq!(stopped, vec![]);
     }
 }

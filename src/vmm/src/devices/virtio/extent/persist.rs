@@ -1,153 +1,34 @@
 // Copyright 2026 cladefs authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The extent-store device in a snapshot of its VM (TASK-39.1). The snapshot is taken with the
-//! guest's filesystem frozen, nothing open on the device: the device forks its store then, to the
-//! point the snapshot holds of it ([`Extent::take_snapshot`]), and saves the window's mappings. A
-//! VM restored from the snapshot opens a store of its own, forked from that point if it doesn't
-//! exist (each restore its own, given its path in the snapshot's load), and maps the window as
-//! it was, where it was in guest memory; its guest learns its store's branch as its filesystem
-//! thaws.
+//! The extent-store device in a snapshot of its VM (TASK-39.1): its protocol version, its virtio
+//! state, and what cladefs's `virtio_extent` saves of it (`virtio_extent::persist`, which says how
+//! the snapshot is taken and restored). A restore by a VMM of another protocol version is refused.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use virtio_extent::protocol::{VIRTIO_EXTENT_VERSION, check_version};
 
-use super::device::{Extent, ExtentError, ExtentSnapshot, Making};
-use super::window::PrefaultGuestMemory;
-use super::{EXTENT_QUEUE_SIZE, VIRTIO_EXTENT_VERSION};
+use super::device::{Extent, ExtentError, Making};
+use super::{EXTENT_QUEUE_SIZE, PrefaultGuestMemory};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::snapshot::Persist;
-use crate::vmm_config::extent::{CacheType, ExtentDeviceConfig};
+use crate::vmm_config::extent::ExtentDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
 
-/// What a snapshot of its VM holds of an extent-store device.
+/// What a snapshot of its VM holds of an extent-store device. Its fields serialize as the
+/// device's did before the crate held them, `device`'s fields after `virtio_state`'s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtentState {
     /// cladefs: the device's protocol version, which its guest's driver checked at probe, and a
     /// restore by a VMM of another refuses (TASK-141.3): the guest's driver goes on as it was.
     pub protocol: u32,
     pub virtio_state: VirtioDeviceState,
-    /// Its configuration: its store's path is the one a restore opens, unless the snapshot's
-    /// load overrides it.
-    pub config: ExtentConfigState,
-    /// Where the window was in guest memory, if the device has one.
-    pub window_addr: Option<u64>,
-    /// The point the snapshot holds of the store: a fork of it.
-    pub point: PathBuf,
-    /// The point's branch, which a restore on another host takes from the extent daemon's bucket.
-    pub point_branch: u64,
-    /// The window's mappings.
-    pub mappings: Vec<MappingState>,
-    /// Whether the guest's filesystem was frozen: it is, as a snapshot is taken.
-    pub frozen: bool,
-}
-
-/// An extent-store device's configuration ([`ExtentDeviceConfig`]), as a snapshot holds it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExtentConfigState {
-    pub id: String,
-    pub tag: String,
-    pub path_on_host: String,
-    pub capacity: u64,
-    pub dax_window_size: Option<u64>,
-    /// cladefs: the window's private pages at most, as configured (doc-13).
-    pub dax_private_max: Option<u64>,
-    pub extentd_socket: String,
-    /// cladefs: what it does with the guest's asks for durability (TASK-363).
-    pub cache_type: CacheType,
-}
-
-impl From<&ExtentDeviceConfig> for ExtentConfigState {
-    fn from(config: &ExtentDeviceConfig) -> Self {
-        Self {
-            id: config.id.clone(),
-            tag: config.tag.clone(),
-            path_on_host: config.path_on_host.clone(),
-            capacity: config.capacity,
-            dax_window_size: config.dax_window_size,
-            dax_private_max: config.dax_private_max,
-            extentd_socket: config.extentd_socket.clone(),
-            cache_type: config.cache_type,
-        }
-    }
-}
-
-// cladefs: a follower's device takes no snapshot (`ExtentSnapshotError::ReadOnly`): a snapshot's
-// is a writer's.
-impl From<&ExtentConfigState> for ExtentDeviceConfig {
-    fn from(config: &ExtentConfigState) -> Self {
-        Self {
-            id: config.id.clone(),
-            tag: config.tag.clone(),
-            path_on_host: config.path_on_host.clone(),
-            capacity: config.capacity,
-            dax_window_size: config.dax_window_size,
-            dax_private_max: config.dax_private_max,
-            extentd_socket: config.extentd_socket.clone(),
-            read_only: false,
-            cache_type: config.cache_type,
-        }
-    }
-}
-
-/// A mapping of the window ([`cladefs::WindowMapping`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MappingState {
-    pub window_offset: u64,
-    pub len: u64,
-    pub contents: MappingContentsState,
-}
-
-/// What a mapping of the window maps ([`cladefs::MappingContents`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MappingContentsState {
-    Extent {
-        branch: u64,
-        sequence: u64,
-        offset: u64,
-    },
-    Zeros,
-}
-
-impl From<&cladefs::WindowMapping> for MappingState {
-    fn from(mapping: &cladefs::WindowMapping) -> Self {
-        Self {
-            window_offset: mapping.window_offset,
-            len: mapping.len,
-            contents: match mapping.contents {
-                cladefs::MappingContents::Extent { extent, offset } => MappingContentsState::Extent {
-                    branch: extent.branch,
-                    sequence: extent.sequence,
-                    offset,
-                },
-                cladefs::MappingContents::Zeros => MappingContentsState::Zeros,
-            },
-        }
-    }
-}
-
-impl From<&MappingState> for cladefs::WindowMapping {
-    fn from(mapping: &MappingState) -> Self {
-        Self {
-            window_offset: mapping.window_offset,
-            len: mapping.len,
-            contents: match mapping.contents {
-                MappingContentsState::Extent {
-                    branch,
-                    sequence,
-                    offset,
-                } => cladefs::MappingContents::Extent {
-                    extent: cladefs::ExtentId { branch, sequence },
-                    offset,
-                },
-                MappingContentsState::Zeros => cladefs::MappingContents::Zeros,
-            },
-        }
-    }
+    /// Its configuration, store, point and window, as the crate saves them.
+    pub device: virtio_extent::persist::State,
 }
 
 /// What restoring an extent-store device needs.
@@ -168,16 +49,6 @@ pub enum ExtentPersistError {
     Extent(#[from] ExtentError),
 }
 
-/// cladefs: `Ok` if a snapshot's device, of protocol version `protocol`, is of this VMM's
-/// (TASK-141.3): its guest's driver, which checked the device's version at probe, goes on as of
-/// that one.
-fn of_this_protocol(protocol: u32) -> Result<(), ExtentError> {
-    match protocol {
-        VIRTIO_EXTENT_VERSION => Ok(()),
-        other => Err(ExtentError::Protocol(other, VIRTIO_EXTENT_VERSION)),
-    }
-}
-
 impl<'a> Persist<'a> for Extent {
     type State = ExtentState;
     type ConstructorArgs = ExtentConstructorArgs<'a>;
@@ -186,18 +57,10 @@ impl<'a> Persist<'a> for Extent {
     /// The device's state, once [`Extent::take_snapshot`] took the snapshot of its store, as
     /// [`Vmm::save_state`](crate::Vmm::save_state) has it do first.
     fn save(&self) -> Self::State {
-        let snapshot = self
-            .snapshot()
-            .expect("an extent device's store is snapshotted before the device is saved");
         ExtentState {
             protocol: VIRTIO_EXTENT_VERSION,
             virtio_state: VirtioDeviceState::from_device(self),
-            config: ExtentConfigState::from(&self.config),
-            window_addr: self.window_addr(),
-            point: snapshot.point.clone(),
-            point_branch: snapshot.point_branch,
-            mappings: snapshot.mappings.iter().map(MappingState::from).collect(),
-            frozen: self.frozen(),
+            device: self.device().state(),
         }
     }
 
@@ -205,7 +68,7 @@ impl<'a> Persist<'a> for Extent {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        of_this_protocol(state.protocol)?;
+        check_version(state.protocol).map_err(ExtentError::from)?;
         // cladefs: built as a device's not activated are, then those the driver set up initialized:
         // it may have set up fewer than the device has, one per CPU of the guest's.
         let unactivated = VirtioDeviceState {
@@ -228,43 +91,31 @@ impl<'a> Persist<'a> for Extent {
                     .map_err(VirtioStateError::QueueConstruction)?;
             }
         }
-        let snapshot = ExtentSnapshot {
-            point: state.point.clone(),
-            point_branch: state.point_branch,
-            mappings: state
-                .mappings
-                .iter()
-                .map(cladefs::WindowMapping::from)
-                .collect(),
-        };
-        let making = Making::Restore {
-            snapshot: &snapshot,
-            window_addr: state.window_addr,
-        };
-        let config = ExtentDeviceConfig::from(&state.config);
+        let config = ExtentDeviceConfig::from(&state.device.config);
+        let making = Making::Restore(&state.device);
         let mut extent = Extent::make(constructor_args.vm, config, count, making)?;
         if let Some(prefault) = constructor_args.prefault {
             extent.set_prefault(prefault);
         }
-        extent.restored(
-            snapshot,
-            queues,
-            state.virtio_state.acked_features,
-            state.frozen,
-        );
+        extent.restored(queues, state.virtio_state.acked_features);
         Ok(extent)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use virtio_extent::CacheType;
+    use virtio_extent::persist::{ConfigState, MappingContentsState, MappingState, State};
+
     use super::*;
 
     /// cladefs TASK-141.3: a snapshot's device of another protocol version is refused, naming both.
     #[test]
     fn snapshots_of_other_protocols_are_refused() {
-        of_this_protocol(VIRTIO_EXTENT_VERSION).unwrap();
-        let refused = of_this_protocol(VIRTIO_EXTENT_VERSION + 1)
+        let refused = check_version(VIRTIO_EXTENT_VERSION + 1)
+            .map_err(ExtentError::from)
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -272,5 +123,83 @@ mod tests {
             "The snapshot's extent device is of protocol version 2, this VMM's 1: its guest's \
              driver is of another"
         );
+    }
+
+    /// The device's state as Firecracker's snapshots held it before cladefs's crate held its
+    /// fields: one struct, the crate's fields after the virtio state's.
+    #[derive(Serialize)]
+    struct Before {
+        protocol: u32,
+        virtio_state: VirtioDeviceState,
+        config: ConfigState,
+        window_addr: Option<u64>,
+        point: PathBuf,
+        point_branch: u64,
+        mappings: Vec<MappingState>,
+        frozen: bool,
+    }
+
+    /// A snapshot's extent device serializes as it did before cladefs's crate held its state: a
+    /// snapshot taken before restores after, and the other way round, as no protocol changed.
+    #[test]
+    fn snapshots_serialize_as_before() {
+        let virtio_state = VirtioDeviceState {
+            device_type: VirtioDeviceType::Extent,
+            avail_features: 0x1_2000_0951,
+            acked_features: 0x1_2000_0951,
+            queues: Vec::new(),
+            activated: true,
+        };
+        let device = State {
+            config: ConfigState {
+                id: "extents".into(),
+                tag: "fxfs".into(),
+                path_on_host: "/store".into(),
+                capacity: 1 << 30,
+                dax_window_size: Some(64 << 20),
+                dax_private_max: None,
+                extentd_socket: "/extentd.sock".into(),
+                cache_type: CacheType::Unsafe,
+            },
+            window_addr: Some(1 << 40),
+            point: "/snapshot.extent-extents".into(),
+            point_branch: 77,
+            mappings: vec![
+                MappingState {
+                    window_offset: 4096,
+                    len: 8192,
+                    contents: MappingContentsState::Extent {
+                        branch: 3,
+                        sequence: 9,
+                        offset: 0,
+                    },
+                },
+                MappingState {
+                    window_offset: 1 << 21,
+                    len: 4096,
+                    contents: MappingContentsState::Zeros,
+                },
+            ],
+            frozen: true,
+        };
+        let before = Before {
+            protocol: VIRTIO_EXTENT_VERSION,
+            virtio_state: virtio_state.clone(),
+            config: device.config.clone(),
+            window_addr: device.window_addr,
+            point: device.point.clone(),
+            point_branch: device.point_branch,
+            mappings: device.mappings.clone(),
+            frozen: device.frozen,
+        };
+        let now = ExtentState {
+            protocol: VIRTIO_EXTENT_VERSION,
+            virtio_state,
+            device,
+        };
+        let before = bitcode::serialize(&before).unwrap();
+        assert_eq!(bitcode::serialize(&now).unwrap(), before);
+        let read: ExtentState = bitcode::deserialize(&before).unwrap();
+        assert_eq!(read.device, now.device);
     }
 }

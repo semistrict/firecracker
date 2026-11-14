@@ -115,30 +115,24 @@ pub enum VmError {
     NoKvmSlotAvailable,
 }
 
-/// cladefs: RAII wrapper for a KVM memory slot mapping host memory into the guest, for any device,
-/// as pmem's maps its own. Removes the slot on drop.
+/// cladefs: KVM memory slots mapping host memory into the guest while it runs, for any device, as
+/// pmem's maps its own: an extent device's DAX window (cladefs's `virtio_extent::WindowVm`).
 #[cfg(feature = "cladefs")]
-#[derive(Debug)]
-pub struct KvmMemSlot {
-    vm: Arc<KvmVm>,
-    slot: u32,
-}
-
-#[cfg(feature = "cladefs")]
-impl KvmMemSlot {
-    /// Maps the `memory_size` bytes of host memory at `hva` into the guest at `gpa`.
-    pub fn new(
-        vm: Arc<KvmVm>,
+impl KvmVm {
+    /// Maps the `memory_size` bytes of host memory at `hva` into the guest at `gpa`, with KVM's
+    /// `flags`: the slot, which [`KvmVm::remove_memory_slot`] removes.
+    pub fn add_memory_slot(
+        &self,
         gpa: u64,
         memory_size: u64,
         hva: u64,
         flags: u32,
-    ) -> Result<Self, VmError> {
+    ) -> Result<u32, VmError> {
         // FIXME: The KVM slot number itself is not returned. This is not an
         // issue currently since there are at least 32K slots available. But we
         // could improve this by implementing a slot allocator that allows us
         // to free slot numbers.
-        let slot = vm.next_kvm_slot(1).ok_or(VmError::NoKvmSlotAvailable)?;
+        let slot = self.next_kvm_slot(1).ok_or(VmError::NoKvmSlotAvailable)?;
         let region = kvm_userspace_memory_region {
             slot,
             guest_phys_addr: gpa,
@@ -146,22 +140,21 @@ impl KvmMemSlot {
             userspace_addr: hva,
             flags,
         };
-        vm.set_user_memory_region(region)?;
-        Ok(Self { vm, slot })
+        self.set_user_memory_region(region)?;
+        Ok(slot)
     }
-}
 
-#[cfg(feature = "cladefs")]
-impl Drop for KvmMemSlot {
-    fn drop(&mut self) {
+    /// Removes the memory slot `slot` that [`KvmVm::add_memory_slot`] added: KVM lets go of its
+    /// host memory.
+    pub fn remove_memory_slot(&self, slot: u32) {
         let region = kvm_userspace_memory_region {
-            slot: self.slot,
+            slot,
             guest_phys_addr: 0,
             memory_size: 0,
             userspace_addr: 0,
             flags: 0,
         };
-        _ = self.vm.set_user_memory_region(region);
+        _ = self.set_user_memory_region(region);
     }
 }
 
