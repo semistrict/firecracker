@@ -644,7 +644,7 @@ impl<'a> Persist<'a> for PciDevices {
                     .vm_resources
                     .cladefs
                     .configs
-                    .push((&extent_state.device_state.config).into());
+                    .push((&extent_state.device_state.device.config).into());
                 pci_devices.restore_pci_device(
                     constructor_args.vm,
                     device,
@@ -689,7 +689,7 @@ fn restored_extent_prefault<'s>(
     mut states: impl Iterator<Item = &'s crate::devices::virtio::extent::persist::ExtentState>,
 ) -> Result<Option<Arc<dyn crate::devices::virtio::extent::PrefaultGuestMemory>>, DevicePersistError>
 {
-    if !states.any(|extent| extent.window_addr.is_some()) {
+    if !states.any(|extent| extent.device.window_addr.is_some()) {
         return Ok(None);
     }
     #[cfg(target_arch = "x86_64")]

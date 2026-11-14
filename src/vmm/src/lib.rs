@@ -12,11 +12,14 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::blanket_clippy_restriction_lints)]
 
-// cladefs's crate, which the `cladefs` feature builds against: no dependency of this crate's, but one
-// cladefs's build adds (resources/cladefs/README.md), so that a build without the feature needs nothing
-// of cladefs's, nor fetches it. Without it, the feature fails here.
+// cladefs's crates, which the `cladefs` feature builds against, cladefs's and its extent device's: no
+// dependencies of this crate's, but ones cladefs's build adds (resources/cladefs/README.md), so that a
+// build without the feature needs nothing of cladefs's, nor fetches it. Without them, the feature
+// fails here.
 #[cfg(feature = "cladefs")]
 extern crate cladefs;
+#[cfg(feature = "cladefs")]
+extern crate virtio_extent;
 
 /// Implements platform specific functionality.
 /// Supported platforms: x86_64 and aarch64.
@@ -421,7 +424,7 @@ impl Vmm {
                         .as_any()
                         .downcast_ref::<devices::virtio::extent::Extent>()
                     {
-                        extent.push(e.config.clone());
+                        extent.push(e.config().clone());
                     }
                 }
             });

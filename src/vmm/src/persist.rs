@@ -426,14 +426,14 @@ pub fn restore_from_snapshot(
             .extent_devices
             .iter_mut()
             .map(|device| &mut device.device_state)
-            .find(|state| state.config.id == entry.id)
+            .find(|state| state.device.config.id == entry.id)
             .map(|state| {
-                state.config.path_on_host.clone_from(&entry.path_on_host);
+                state.device.config.path_on_host.clone_from(&entry.path_on_host);
                 if let Some(point) = &entry.point_on_host {
-                    state.point = point.into();
+                    state.device.point = point.into();
                 }
                 if let Some(socket) = &entry.cladefsd_socket {
-                    state.config.cladefsd_socket.clone_from(socket);
+                    state.device.config.cladefsd_socket.clone_from(socket);
                 }
             })
             .ok_or_else(|| SnapshotStateFromFileError::UnknownCladefsDevice(entry.id.clone()))?;
