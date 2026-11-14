@@ -7,16 +7,20 @@ alone and change nothing of fxdax's.
 
 ## Building with the feature
 
-The feature builds against fxdax's crate, `crates/fxdax` in an fxdax checkout, which no
-manifest here names: Cargo resolves every dependency a manifest declares, optional or not, so a
-declared one would break, or fetch fxdax for, every build outside fxdax's tree. fxdax's build
-supplies it, from a copy of this tree:
+The feature builds against fxdax's crates, `crates/fxdax` and `crates/virtio_extent` in an
+fxdax checkout, which no manifest here names: Cargo resolves every dependency a manifest
+declares, optional or not, so a declared one would break, or fetch fxdax for, every build
+outside fxdax's tree. `virtio_extent` is the extent device but its transport, which every VMM
+hosting the device shares; `src/vmm/src/devices/virtio/extent` is Firecracker's adapter, what
+the crate's README asks of one. fxdax's build supplies them, from a copy of this tree:
 
 1. appends to `src/vmm/Cargo.toml`
 
    ```toml
    [dependencies.fxdax]
    path = "<fxdax checkout>/crates/fxdax"
+   [dependencies.virtio_extent]
+   path = "<fxdax checkout>/crates/virtio_extent"
    ```
 
 2. replaces `Cargo.lock` with fxdax's, which holds fxdax's dependencies too;
