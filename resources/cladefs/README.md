@@ -7,16 +7,20 @@ alone and change nothing of cladefs's.
 
 ## Building with the feature
 
-The feature builds against cladefs's crate, `crates/cladefs` in an cladefs checkout, which no
-manifest here names: Cargo resolves every dependency a manifest declares, optional or not, so a
-declared one would break, or fetch cladefs for, every build outside cladefs's tree. cladefs's build
-supplies it, from a copy of this tree:
+The feature builds against cladefs's crates, `crates/cladefs` and `crates/virtio_extent` in an
+cladefs checkout, which no manifest here names: Cargo resolves every dependency a manifest
+declares, optional or not, so a declared one would break, or fetch cladefs for, every build
+outside cladefs's tree. `virtio_extent` is the extent device but its transport, which every VMM
+hosting the device shares; `src/vmm/src/devices/virtio/extent` is Firecracker's adapter, what
+the crate's README asks of one. cladefs's build supplies them, from a copy of this tree:
 
 1. appends to `src/vmm/Cargo.toml`
 
    ```toml
    [dependencies.cladefs]
    path = "<cladefs checkout>/crates/cladefs"
+   [dependencies.virtio_extent]
+   path = "<cladefs checkout>/crates/virtio_extent"
    ```
 
 2. replaces `Cargo.lock` with cladefs's, which holds cladefs's dependencies too;
