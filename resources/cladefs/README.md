@@ -41,7 +41,8 @@ at `extern crate cladefs` in `src/vmm/src/lib.rs`.
 - `swagger.yaml`: the API the feature adds to `src/firecracker/swagger/firecracker.yaml`:
   `PUT /cladefs/{id}`, and `cladefs_overrides` in `PUT /snapshot/load`. Without the feature,
   the first is an unknown path and the second an unknown field, as upstream has them; so is
-  `cladefs` in a VM's configuration file.
+  `cladefs` in a VM's configuration file. With it, a configuration file's `extent`, the key
+  until cladefs TASK-503, is refused rather than ignored.
 - The extent device attaches over virtio-PCI alone (`--enable-pci`): its DAX window is a BAR
   of its own, which a shared memory capability describes. Upstream's MMIO transport is as
   upstream has it, with no way to describe the window, and a VM with the device on it does not
