@@ -71,6 +71,9 @@ pub enum ResourcesError {
     /// Extent-store device error: {0}
     #[cfg(feature = "cladefs")]
     CladefsConfig(#[from] CladefsConfigError),
+    /// `extent` is `cladefs` since cladefs TASK-501: the extent-store devices' key
+    #[cfg(feature = "cladefs")]
+    CladefsRenamed,
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
 }
@@ -170,6 +173,15 @@ impl VmResources {
         mmds_size_limit: usize,
         metadata_json: Option<&str>,
     ) -> Result<Self, ResourcesError> {
+        // cladefs: the extent-store devices' old key refused, as upstream would ignore it, a key it
+        // doesn't know, and the VM boot without its disk.
+        #[cfg(feature = "cladefs")]
+        if serde_json::from_str::<serde_json::Value>(config_json)?
+            .get("extent")
+            .is_some()
+        {
+            return Err(ResourcesError::CladefsRenamed);
+        }
         let vmm_config = serde_json::from_str::<VmmConfig>(config_json)?;
 
         if let Some(logger_config) = vmm_config.logger {
@@ -690,6 +702,19 @@ mod tests {
             serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
         }
+    }
+
+    #[cfg(feature = "cladefs")]
+    #[test]
+    fn test_from_json_refuses_the_extent_devices_old_key() {
+        let json = r#"{"boot-source": {"kernel_image_path": "/vmlinux"}, "extent": []}"#;
+        let error =
+            VmResources::from_json(json, &InstanceInfo::default(), HTTP_MAX_PAYLOAD_SIZE, None)
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "`extent` is `cladefs` since cladefs TASK-501: the extent-store devices' key"
+        );
     }
 
     #[test]
