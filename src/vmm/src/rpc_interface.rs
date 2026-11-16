@@ -1310,7 +1310,7 @@ mod tests {
                 path_on_host: String::new(),
                 capacity: 0,
                 dax_window_size: None,
-                dax_private_max: None,
+                dax_private_max_bytes: None,
                 cladefsd_socket: String::new(),
                 read_only: false,
                 cache_type: crate::vmm_config::cladefs::CacheType::Writeback,
