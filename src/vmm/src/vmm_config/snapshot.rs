@@ -31,6 +31,12 @@ pub enum MemBackendType {
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// cladefs: guest memory is a memory vdisk of the snapshot's cell, its store the backend's
+    /// path, served by the extent daemon (TASK-456.3): its pages shared with every VM restored
+    /// from the same snapshot on the host, a page the guest stores to a private copy of its own.
+    /// `memory_vdisk` says where the snapshot's memory is and which daemon serves it.
+    #[cfg(feature = "cladefs")]
+    Vdisk,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -78,6 +84,20 @@ pub struct CladefsOverride {
     pub cladefsd_socket: Option<String>,
 }
 
+/// cladefs: the memory vdisk a VM restored with `Vdisk` memory takes its memory from: its store,
+/// the backend's path, forked from the snapshot's memory point at `point_on_host` if it doesn't
+/// exist, which the VM manager makes on each host that restores the snapshot, as a disk's point;
+/// served by the extent daemon at `cladefsd_socket` (TASK-456.3).
+#[cfg(feature = "cladefs")]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryVdiskConfig {
+    /// The snapshot's memory point.
+    pub point_on_host: PathBuf,
+    /// The extent daemon's socket.
+    pub cladefsd_socket: PathBuf,
+}
+
 /// Allows for changing the host UDS of the vsock backend during snapshot restore
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub struct VsockOverride {
@@ -105,6 +125,9 @@ pub struct LoadSnapshotParams {
     /// cladefs: the extent-store devices whose stores to override on load.
     #[cfg(feature = "cladefs")]
     pub cladefs_overrides: Vec<CladefsOverride>,
+    /// cladefs: with a `Vdisk` memory backend, the memory vdisk it takes its memory from.
+    #[cfg(feature = "cladefs")]
+    pub memory_vdisk: Option<MemoryVdiskConfig>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore,
     /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
     /// (default), kvmclock resumes from where it was at snapshot time.
@@ -145,6 +168,10 @@ pub struct LoadSnapshotConfig {
     #[cfg(feature = "cladefs")]
     #[serde(default)]
     pub cladefs_overrides: Vec<CladefsOverride>,
+    /// cladefs: with a `Vdisk` memory backend, the memory vdisk it takes its memory from.
+    #[cfg(feature = "cladefs")]
+    #[serde(default)]
+    pub memory_vdisk: Option<MemoryVdiskConfig>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
     #[serde(default)]
     pub clock_realtime: bool,

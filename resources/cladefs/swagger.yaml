@@ -1,7 +1,8 @@
 # The API the cladefs feature adds to src/firecracker/swagger/firecracker.yaml, in its terms: its
-# paths and definitions here go beside that file's, and SnapshotLoadParams gains the property
-# below. A Firecracker built without the feature has none of it: PUT /cladefs/{id} is refused as
-# an unknown path, and cladefs_overrides as an unknown field of PUT /snapshot/load.
+# paths and definitions here go beside that file's, SnapshotLoadParams gains the properties
+# below, and MemoryBackend's backend_type the value Vdisk. A Firecracker built without the
+# feature has none of it: PUT /cladefs/{id} is refused as an unknown path, cladefs_overrides and
+# memory_vdisk as unknown fields of PUT /snapshot/load, and Vdisk as an unknown backend_type.
 swagger: "2.0"
 info:
   title: Firecracker API, cladefs's additions
@@ -121,7 +122,29 @@ definitions:
         description:
           The extent daemon's socket, if not the snapshotted VM's
 
-  # A property of firecracker.yaml's SnapshotLoadParams, beside network_overrides.
+  MemoryVdisk:
+    type: object
+    description:
+      With a Vdisk memory backend, the memory vdisk a VM restored from a snapshot takes its
+      memory from (cladefs TASK-456.3) - its store, the backend's path, forked from the
+      snapshot's memory point if it doesn't exist. Its pages are the extent daemon's, shared
+      with every VM restored from the same snapshot on the host; a page the guest stores to is
+      a private copy of its own.
+    required:
+      - point_on_host
+      - cladefsd_socket
+    properties:
+      point_on_host:
+        type: string
+        description:
+          The snapshot's memory point, which the VM manager makes on each host that restores
+          the snapshot, as a disk's point
+      cladefsd_socket:
+        type: string
+        description:
+          The extent daemon's socket
+
+  # Properties of firecracker.yaml's SnapshotLoadParams, beside network_overrides.
   SnapshotLoadParams:
     properties:
       cladefs_overrides:
@@ -130,3 +153,16 @@ definitions:
           cladefs's extent-store devices whose stores to override on snapshot restore
         items:
           $ref: "#/definitions/CladefsOverride"
+      memory_vdisk:
+        $ref: "#/definitions/MemoryVdisk"
+
+  # A value of firecracker.yaml's MemoryBackend backend_type, beside File and Uffd.
+  MemoryBackend:
+    properties:
+      backend_type:
+        type: string
+        enum:
+          - Vdisk
+        description:
+          Vdisk - guest memory is a memory vdisk of the snapshot's cell, its store at
+          backend_path, served by the extent daemon (see memory_vdisk)

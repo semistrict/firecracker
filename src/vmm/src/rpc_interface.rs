@@ -1372,6 +1372,8 @@ mod tests {
                 vsock_override: None,
                 #[cfg(feature = "cladefs")]
                 cladefs_overrides: vec![],
+                #[cfg(feature = "cladefs")]
+                memory_vdisk: None,
                 clock_realtime: false,
             },
         )));
