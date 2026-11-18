@@ -1,38 +1,38 @@
 // Copyright 2026 The cladefs Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! cladefs: a VM's memory restored from a memory vdisk of its snapshot's cell (TASK-456.3),
+//! cladefs: a VM's memory restored from a memory cell of its snapshot's cell (TASK-456.3),
 //! rather than from a file or through a userfaultfd handler of another process.
 //!
 //! Guest memory is one reservation of the whole of it, its regions carved from it in order, as a
 //! snapshot's memory file lays them out: so that one window of the extent daemon's covers it,
-//! offset for offset the memory vdisk's image. The window, a copy-on-write one
-//! (`cladefs::memory_vdisk`), maps the daemon's pages of the image's extents as the guest first
+//! offset for offset the memory cell's image. The window, a copy-on-write one
+//! (`cladefs::memory_cell`), maps the daemon's pages of the image's extents as the guest first
 //! touches them, shared with every VM restored from the same snapshot on the host, and gives the
 //! guest a private copy of a page it stores to: so no page is in memory more than once but those
-//! VMs wrote. The VM's memory vdisk is a fork of the snapshot's memory's copy, its own, which its
+//! VMs wrote. The VM's memory cell is a fork of the snapshot's memory's copy, its own, which its
 //! next snapshot writes its private pages into.
 //!
 //! The window is made before anything touches guest memory, as restoring its devices does. The
-//! vdisk and the reservation live as long as the process, a VM's: kept here, the vdisk going
+//! cell and the reservation live as long as the process, a VM's: kept here, the cell going
 //! first, which lets go of the window's memory, then the reservation.
 
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
-use cladefs::memory_vdisk::MemoryVdisk;
+use cladefs::memory_cell::MemoryCell;
 use vm_memory::mmap::NewBitmap;
 
-use crate::vmm_config::snapshot::MemoryVdiskConfig;
+use crate::vmm_config::snapshot::MemoryCellConfig;
 use crate::vstate::memory::{AtomicBitmap, GuestAddress, GuestRegionMmap, MmapRegionBuilder};
 
-/// Errors restoring guest memory from a memory vdisk.
+/// Errors restoring guest memory from a memory cell.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
-pub enum VdiskMemoryError {
-    /// A `Vdisk` memory backend needs `memory_vdisk`, naming the copy and the daemon.
-    NoMemoryVdisk,
-    /// Guest memory restored from a memory vdisk can't be of huge pages.
+pub enum CellMemoryError {
+    /// A `Cell` memory backend needs `memory_cell`, naming the copy and the daemon.
+    NoMemoryCell,
+    /// Guest memory restored from a memory cell can't be of huge pages.
     HugePages,
     /// Reserving {0} bytes for guest memory: {1}
     Reserve(usize, std::io::Error),
@@ -40,23 +40,23 @@ pub enum VdiskMemoryError {
     Region(vm_memory::mmap::MmapRegionError),
     /// A guest memory region at {0:#x} of {1} bytes past what vm-memory allows.
     RegionPlace(u64, usize),
-    /// Opening the memory vdisk at {0}: {1}
+    /// Opening the memory cell at {0}: {1}
     Open(String, cladefs::Error),
-    /// Making the memory vdisk the guest's memory: {0}
+    /// Making the memory cell the guest's memory: {0}
     Window(cladefs::Error),
 }
 
-/// The memory a VM was restored with, kept for the process's life: the vdisk first, as it goes
+/// The memory a VM was restored with, kept for the process's life: the cell first, as it goes
 /// first, letting go of the window's memory, then the reservation it is in.
 struct Restored {
-    _vdisk: MemoryVdisk,
+    _memory_cell: MemoryCell,
     _reservation: Reservation,
 }
 
 // SAFETY: the reservation's memory is the guest's, which the window serves from any thread.
 unsafe impl Send for Restored {}
 
-/// The VM's memory restored from a memory vdisk, if it was.
+/// The VM's memory restored from a memory cell, if it was.
 static RESTORED: Mutex<Option<Restored>> = Mutex::new(None);
 
 /// A reservation of memory, unmapped when dropped.
@@ -66,7 +66,7 @@ struct Reservation {
 }
 
 impl Reservation {
-    fn new(len: usize) -> Result<Self, VdiskMemoryError> {
+    fn new(len: usize) -> Result<Self, CellMemoryError> {
         // SAFETY: new anonymous memory, reserving none, which the reservation owns.
         let base = unsafe {
             libc::mmap(
@@ -79,7 +79,7 @@ impl Reservation {
             )
         };
         if base == libc::MAP_FAILED {
-            return Err(VdiskMemoryError::Reserve(
+            return Err(CellMemoryError::Reserve(
                 len,
                 std::io::Error::last_os_error(),
             ));
@@ -98,18 +98,18 @@ impl Drop for Reservation {
     }
 }
 
-/// Guest memory of `regions`, restored from the memory vdisk at `store`, as `config` says, its
+/// Guest memory of `regions`, restored from the memory cell at `store`, as `config` says, its
 /// window made over it.
 pub fn guest_memory(
     store: &Path,
-    config: Option<&MemoryVdiskConfig>,
+    config: Option<&MemoryCellConfig>,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
     huge_pages: bool,
-) -> Result<Vec<GuestRegionMmap>, VdiskMemoryError> {
-    let config = config.ok_or(VdiskMemoryError::NoMemoryVdisk)?;
+) -> Result<Vec<GuestRegionMmap>, CellMemoryError> {
+    let config = config.ok_or(CellMemoryError::NoMemoryCell)?;
     if huge_pages {
-        return Err(VdiskMemoryError::HugePages);
+        return Err(CellMemoryError::HugePages);
     }
     let regions: Vec<_> = regions.collect();
     let size: usize = regions.iter().map(|(_, size)| size).sum();
@@ -127,25 +127,25 @@ pub fn guest_memory(
                 .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
                 .with_mmap_flags(libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE)
         };
-        let region = builder.build().map_err(VdiskMemoryError::Region)?;
+        let region = builder.build().map_err(CellMemoryError::Region)?;
         let region = GuestRegionMmap::new(region, start)
-            .ok_or(VdiskMemoryError::RegionPlace(start.0, len))?;
+            .ok_or(CellMemoryError::RegionPlace(start.0, len))?;
         guest.push(region);
         offset += len;
     }
-    let vdisk = MemoryVdisk::open_forked(
+    let memory_cell = MemoryCell::open_forked(
         &config.cladefsd_socket,
         store,
         &config.copy_on_host,
         size as u64,
     )
-    .map_err(|error| VdiskMemoryError::Open(store.display().to_string(), error))?;
+    .map_err(|error| CellMemoryError::Open(store.display().to_string(), error))?;
     // SAFETY: the reservation is the guest's memory, which nothing else of the process uses, and
-    // which outlives the vdisk (`Restored`).
-    unsafe { vdisk.window(reservation.base, size as u64, None) }
-        .map_err(VdiskMemoryError::Window)?;
+    // which outlives the memory_cell (`Restored`).
+    unsafe { memory_cell.window(reservation.base, size as u64, None) }
+        .map_err(CellMemoryError::Window)?;
     *RESTORED.lock().unwrap() = Some(Restored {
-        _vdisk: vdisk,
+        _memory_cell: memory_cell,
         _reservation: reservation,
     });
     Ok(guest)

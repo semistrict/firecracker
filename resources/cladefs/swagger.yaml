@@ -1,8 +1,8 @@
 # The API the cladefs feature adds to src/firecracker/swagger/firecracker.yaml, in its terms: its
 # paths and definitions here go beside that file's, SnapshotLoadParams gains the properties
-# below, and MemoryBackend's backend_type the value Vdisk. A Firecracker built without the
+# below, and MemoryBackend's backend_type the value Cell. A Firecracker built without the
 # feature has none of it: PUT /cladefs/{id} is refused as an unknown path, cladefs_overrides and
-# memory_vdisk as unknown fields of PUT /snapshot/load, and Vdisk as an unknown backend_type.
+# memory_cell as unknown fields of PUT /snapshot/load, and Cell as an unknown backend_type.
 swagger: "2.0"
 info:
   title: Firecracker API, cladefs's additions
@@ -122,10 +122,10 @@ definitions:
         description:
           The extent daemon's socket, if not the snapshotted VM's
 
-  MemoryVdisk:
+  MemoryCell:
     type: object
     description:
-      With a Vdisk memory backend, the memory vdisk a VM restored from a snapshot takes its
+      With a Cell memory backend, the memory cell a VM restored from a snapshot takes its
       memory from (cladefs TASK-456.3) - its store, the backend's path, forked from the
       snapshot's copy of its memory's version if it doesn't exist. Its pages are the extent daemon's, shared
       with every VM restored from the same snapshot on the host; a page the guest stores to is
@@ -153,8 +153,8 @@ definitions:
           cladefs's extent-store devices whose stores to override on snapshot restore
         items:
           $ref: "#/definitions/CladefsOverride"
-      memory_vdisk:
-        $ref: "#/definitions/MemoryVdisk"
+      memory_cell:
+        $ref: "#/definitions/MemoryCell"
 
   # A value of firecracker.yaml's MemoryBackend backend_type, beside File and Uffd.
   MemoryBackend:
@@ -162,7 +162,7 @@ definitions:
       backend_type:
         type: string
         enum:
-          - Vdisk
+          - Cell
         description:
-          Vdisk - guest memory is a memory vdisk of the snapshot's cell, its store at
-          backend_path, served by the extent daemon (see memory_vdisk)
+          Cell - guest memory is a memory cell of the snapshot's cell, its store at
+          backend_path, served by the extent daemon (see memory_cell)

@@ -21,7 +21,7 @@ extern crate cladefs;
 #[cfg(feature = "cladefs")]
 extern crate virtio_extent;
 
-/// cladefs: a VM's memory restored from a memory vdisk of its snapshot's cell (TASK-456.3).
+/// cladefs: a VM's memory restored from a memory cell of its snapshot's cell (TASK-456.3).
 #[cfg(feature = "cladefs")]
 pub mod cladefs_memory;
 

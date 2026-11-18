@@ -114,7 +114,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         #[cfg(feature = "cladefs")]
         cladefs_overrides: snapshot_config.cladefs_overrides,
         #[cfg(feature = "cladefs")]
-        memory_vdisk: snapshot_config.memory_vdisk,
+        memory_cell: snapshot_config.memory_cell,
         clock_realtime: snapshot_config.clock_realtime,
     };
 
@@ -197,7 +197,7 @@ mod tests {
             #[cfg(feature = "cladefs")]
             cladefs_overrides: vec![],
             #[cfg(feature = "cladefs")]
-            memory_vdisk: None,
+            memory_cell: None,
             clock_realtime: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -233,7 +233,7 @@ mod tests {
             #[cfg(feature = "cladefs")]
             cladefs_overrides: vec![],
             #[cfg(feature = "cladefs")]
-            memory_vdisk: None,
+            memory_cell: None,
             clock_realtime: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -269,7 +269,7 @@ mod tests {
             #[cfg(feature = "cladefs")]
             cladefs_overrides: vec![],
             #[cfg(feature = "cladefs")]
-            memory_vdisk: None,
+            memory_cell: None,
             clock_realtime: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -314,7 +314,7 @@ mod tests {
             #[cfg(feature = "cladefs")]
             cladefs_overrides: vec![],
             #[cfg(feature = "cladefs")]
-            memory_vdisk: None,
+            memory_cell: None,
             clock_realtime: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -347,7 +347,7 @@ mod tests {
             #[cfg(feature = "cladefs")]
             cladefs_overrides: vec![],
             #[cfg(feature = "cladefs")]
-            memory_vdisk: None,
+            memory_cell: None,
             clock_realtime: false,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();

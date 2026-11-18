@@ -1373,7 +1373,7 @@ mod tests {
                 #[cfg(feature = "cladefs")]
                 cladefs_overrides: vec![],
                 #[cfg(feature = "cladefs")]
-                memory_vdisk: None,
+                memory_cell: None,
                 clock_realtime: false,
             },
         )));

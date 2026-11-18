@@ -319,7 +319,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             #[cfg(feature = "cladefs")]
             cladefs_overrides: vec![],
             #[cfg(feature = "cladefs")]
-            memory_vdisk: None,
+            memory_cell: None,
             clock_realtime: false,
         }))
         .unwrap();
@@ -409,7 +409,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         #[cfg(feature = "cladefs")]
         cladefs_overrides: vec![],
         #[cfg(feature = "cladefs")]
-        memory_vdisk: None,
+        memory_cell: None,
         clock_realtime: false,
     });
     let err = preboot_api_controller.handle_preboot_request(req);

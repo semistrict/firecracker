@@ -360,9 +360,9 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     File(#[from] GuestMemoryFromFileError),
     /// Error creating guest memory from uffd: {0}
     Uffd(#[from] GuestMemoryFromUffdError),
-    /// cladefs: error restoring guest memory from a memory vdisk: {0}
+    /// cladefs: error restoring guest memory from a memory cell: {0}
     #[cfg(feature = "cladefs")]
-    Vdisk(#[from] crate::cladefs_memory::VdiskMemoryError),
+    Cell(#[from] crate::cladefs_memory::CellMemoryError),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -491,17 +491,17 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
-        // cladefs: from a memory vdisk of the snapshot's cell (TASK-456.3).
+        // cladefs: from a memory cell of the snapshot's cell (TASK-456.3).
         #[cfg(feature = "cladefs")]
-        MemBackendType::Vdisk => (
+        MemBackendType::Cell => (
             crate::cladefs_memory::guest_memory(
                 mem_backend_path,
-                params.memory_vdisk.as_ref(),
+                params.memory_cell.as_ref(),
                 mem_state.regions(),
                 track_dirty_pages,
                 vm_resources.machine_config.huge_pages.is_hugetlbfs(),
             )
-            .map_err(RestoreFromSnapshotGuestMemoryError::Vdisk)?,
+            .map_err(RestoreFromSnapshotGuestMemoryError::Cell)?,
             None,
         ),
     };
