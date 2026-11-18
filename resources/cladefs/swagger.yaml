@@ -98,7 +98,7 @@ definitions:
     type: object
     description:
       cladefs's extent-store device restored from a snapshot opens the store at
-      path_on_host, forked from the snapshot's point of its store if it doesn't
+      path_on_host, forked from the snapshot's copy of its store's version if it doesn't
       exist, rather than the store the snapshotted VM had.
     required:
       - id
@@ -112,11 +112,11 @@ definitions:
         type: string
         description:
           The store's directory
-      point_on_host:
+      copy_on_host:
         type: string
         description:
-          The snapshot's point of the store, if not where the snapshot was taken,
-          which the extent daemon takes from its bucket if it doesn't exist
+          The snapshot's copy of the store's version, if not where the snapshot was
+          taken, which the VM manager makes first on a host without it
       cladefsd_socket:
         type: string
         description:
@@ -127,18 +127,18 @@ definitions:
     description:
       With a Vdisk memory backend, the memory vdisk a VM restored from a snapshot takes its
       memory from (cladefs TASK-456.3) - its store, the backend's path, forked from the
-      snapshot's memory point if it doesn't exist. Its pages are the extent daemon's, shared
+      snapshot's copy of its memory's version if it doesn't exist. Its pages are the extent daemon's, shared
       with every VM restored from the same snapshot on the host; a page the guest stores to is
       a private copy of its own.
     required:
-      - point_on_host
+      - copy_on_host
       - cladefsd_socket
     properties:
-      point_on_host:
+      copy_on_host:
         type: string
         description:
-          The snapshot's memory point, which the VM manager makes on each host that restores
-          the snapshot, as a disk's point
+          The snapshot's copy of its memory's version, which the VM manager makes on each host
+          that restores the snapshot, as a disk's
       cladefsd_socket:
         type: string
         description:

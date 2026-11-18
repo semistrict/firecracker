@@ -10,7 +10,7 @@
 //! (`cladefs::memory_vdisk`), maps the daemon's pages of the image's extents as the guest first
 //! touches them, shared with every VM restored from the same snapshot on the host, and gives the
 //! guest a private copy of a page it stores to: so no page is in memory more than once but those
-//! VMs wrote. The VM's memory vdisk is a fork of the snapshot's memory point, its own, which its
+//! VMs wrote. The VM's memory vdisk is a fork of the snapshot's memory's copy, its own, which its
 //! next snapshot writes its private pages into.
 //!
 //! The window is made before anything touches guest memory, as restoring its devices does. The
@@ -30,7 +30,7 @@ use crate::vstate::memory::{AtomicBitmap, GuestAddress, GuestRegionMmap, MmapReg
 /// Errors restoring guest memory from a memory vdisk.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VdiskMemoryError {
-    /// A `Vdisk` memory backend needs `memory_vdisk`, naming the point and the daemon.
+    /// A `Vdisk` memory backend needs `memory_vdisk`, naming the copy and the daemon.
     NoMemoryVdisk,
     /// Guest memory restored from a memory vdisk can't be of huge pages.
     HugePages,
@@ -136,7 +136,7 @@ pub fn guest_memory(
     let vdisk = MemoryVdisk::open_forked(
         &config.cladefsd_socket,
         store,
-        &config.point_on_host,
+        &config.copy_on_host,
         size as u64,
     )
     .map_err(|error| VdiskMemoryError::Open(store.display().to_string(), error))?;

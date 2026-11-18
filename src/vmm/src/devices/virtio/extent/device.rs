@@ -94,7 +94,7 @@ impl Extent {
     }
 
     /// A device as `config` describes, with `queues` request queues, made as `making` says: its
-    /// store opened, or, restored from a snapshot, forked from the snapshot's point if it doesn't
+    /// store opened, or, restored from a snapshot, forked from the snapshot's copy if it doesn't
     /// exist; its window in guest memory where the snapshot had it.
     pub(super) fn make(
         vm: Arc<KvmVm>,
@@ -240,12 +240,13 @@ impl Extent {
     }
 
     /// cladefs: takes a snapshot of the device's store, for a snapshot of the VM, paused, whose
-    /// guest's filesystem is frozen, with nothing open (TASK-39.1): forks the store to `point`,
-    /// and records the window's mappings, which [`Persist::save`](crate::snapshot::Persist) saves.
+    /// guest's filesystem is frozen, with nothing open (TASK-39.1): makes a version of the store's
+    /// cell, with a copy at `copy`, and records the window's mappings, which
+    /// [`Persist::save`](crate::snapshot::Persist) saves.
     /// No request is in progress meanwhile, which could change the window: the workers stop.
-    pub fn take_snapshot(&mut self, point: &Path) -> Result<(), SnapshotError> {
+    pub fn take_snapshot(&mut self, copy: &Path) -> Result<(), SnapshotError> {
         let (workers, queues) = (&mut self.workers, &mut self.queues);
-        self.device.take_snapshot(point, || pause(workers, queues))
+        self.device.take_snapshot(copy, || pause(workers, queues))
     }
 
     /// The snapshot taken of the device's store ([`Extent::take_snapshot`]), or restored from.

@@ -505,9 +505,9 @@ impl Vmm {
     }
 
     /// cladefs: takes the snapshots of the extent-store devices' stores, for a snapshot of the VM,
-    /// paused, at `snapshot_path`: each forks its store to `<snapshot_path>.extent-<id>`, the
-    /// point a VM restored from the snapshot forks its own from (TASK-39.1). The guests'
-    /// filesystems must be frozen.
+    /// paused, at `snapshot_path`: each makes a version of its store's cell, with a copy at
+    /// `<snapshot_path>.extent-<id>`, which a VM restored from the snapshot forks its own from
+    /// (TASK-39.1). The guests' filesystems must be frozen.
     #[cfg(feature = "cladefs")]
     pub fn take_extent_snapshots(
         &mut self,
@@ -527,11 +527,11 @@ impl Vmm {
                 }
             });
         for id in ids {
-            let mut point = snapshot_path.clone().into_os_string();
-            point.push(format!(".extent-{id}"));
+            let mut copy = snapshot_path.clone().into_os_string();
+            copy.push(format!(".extent-{id}"));
             self.device_manager
                 .with_virtio_device(&id, |extent: &mut devices::virtio::extent::Extent| {
-                    extent.take_snapshot(std::path::Path::new(&point))
+                    extent.take_snapshot(std::path::Path::new(&copy))
                 })
                 .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))?
                 .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))?;

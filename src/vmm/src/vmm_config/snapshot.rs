@@ -64,10 +64,10 @@ pub struct NetworkOverride {
 }
 
 /// cladefs: has an extent-store device restored from a snapshot open the store at `path_on_host`,
-/// forked from the snapshot's point of its store if it doesn't exist, rather than the store the
-/// snapshotted VM had: a store of its own for each VM restored from one snapshot (TASK-39.1). On
-/// another host, the point is at `point_on_host`, which the extent daemon at `cladefsd_socket` takes
-/// from its bucket if it doesn't exist.
+/// forked from the snapshot's copy of its store's version if it doesn't exist, rather than the
+/// store the snapshotted VM had: a store of its own for each VM restored from one snapshot
+/// (TASK-39.1). On another host, the copy is at `copy_on_host`, which the VM manager makes there
+/// first, and the extent daemon at `cladefsd_socket` serves.
 #[cfg(feature = "cladefs")]
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,24 +76,25 @@ pub struct CladefsOverride {
     pub id: String,
     /// The store's directory.
     pub path_on_host: String,
-    /// The snapshot's point of the store, if not where the snapshot was taken.
+    /// The snapshot's copy of the store's version, if not where the snapshot was taken.
     #[serde(default)]
-    pub point_on_host: Option<String>,
+    pub copy_on_host: Option<String>,
     /// The extent daemon's socket, if not the snapshotted VM's.
     #[serde(default)]
     pub cladefsd_socket: Option<String>,
 }
 
 /// cladefs: the memory vdisk a VM restored with `Vdisk` memory takes its memory from: its store,
-/// the backend's path, forked from the snapshot's memory point at `point_on_host` if it doesn't
-/// exist, which the VM manager makes on each host that restores the snapshot, as a disk's point;
+/// the backend's path, forked from the snapshot's copy of its memory's version at `copy_on_host` if
+/// it doesn't exist, which the VM manager makes on each host that restores the snapshot, as a
+/// disk's;
 /// served by the extent daemon at `cladefsd_socket` (TASK-456.3).
 #[cfg(feature = "cladefs")]
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryVdiskConfig {
-    /// The snapshot's memory point.
-    pub point_on_host: PathBuf,
+    /// The snapshot's copy of its memory's version.
+    pub copy_on_host: PathBuf,
     /// The extent daemon's socket.
     pub cladefsd_socket: PathBuf,
 }
