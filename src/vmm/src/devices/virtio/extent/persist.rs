@@ -167,7 +167,7 @@ mod tests {
                     window_offset: 4096,
                     len: 8192,
                     contents: MappingContentsState::Extent {
-                        branch: 3,
+                        cell: 3,
                         sequence: 9,
                         offset: 0,
                     },
