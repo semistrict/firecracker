@@ -27,7 +27,7 @@ pub struct ExtentState {
     /// restore by a VMM of another refuses (TASK-141.3): the guest's driver goes on as it was.
     pub protocol: u32,
     pub virtio_state: VirtioDeviceState,
-    /// Its configuration, store, copy and window, as the crate saves them.
+    /// Its configuration, store, version and window, as the crate saves them.
     pub device: virtio_extent::persist::State,
 }
 
@@ -133,8 +133,7 @@ mod tests {
         virtio_state: VirtioDeviceState,
         config: ConfigState,
         window_addr: Option<u64>,
-        copy: PathBuf,
-        branch: u64,
+        version: cladefs::CellVersion,
         mappings: Vec<MappingState>,
         frozen: bool,
     }
@@ -162,8 +161,7 @@ mod tests {
                 cache_type: CacheType::Unsafe,
             },
             window_addr: Some(1 << 40),
-            copy: "/snapshot.extent-extents".into(),
-            branch: 77,
+            version: cladefs::CellVersion { tenant: 2, cell: 77, version: 5 },
             mappings: vec![
                 MappingState {
                     window_offset: 4096,
@@ -187,8 +185,7 @@ mod tests {
             virtio_state: virtio_state.clone(),
             config: device.config.clone(),
             window_addr: device.window_addr,
-            copy: device.copy.clone(),
-            branch: device.branch,
+            version: device.version,
             mappings: device.mappings.clone(),
             frozen: device.frozen,
         };

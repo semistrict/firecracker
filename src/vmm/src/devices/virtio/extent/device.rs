@@ -241,12 +241,11 @@ impl Extent {
 
     /// cladefs: takes a snapshot of the device's store, for a snapshot of the VM, paused, whose
     /// guest's filesystem is frozen, with nothing open (TASK-39.1): makes a version of the store's
-    /// cell, with a copy at `copy`, and records the window's mappings, which
-    /// [`Persist::save`](crate::snapshot::Persist) saves.
-    /// No request is in progress meanwhile, which could change the window: the workers stop.
-    pub fn take_snapshot(&mut self, copy: &Path) -> Result<(), SnapshotError> {
+    /// cell, and records the window's mappings, which [`Persist::save`](crate::snapshot::Persist)
+    /// saves. No request is in progress meanwhile, which could change the window: the workers stop.
+    pub fn take_snapshot(&mut self) -> Result<(), SnapshotError> {
         let (workers, queues) = (&mut self.workers, &mut self.queues);
-        self.device.take_snapshot(copy, || pause(workers, queues))
+        self.device.take_snapshot(|| pause(workers, queues))
     }
 
     /// The snapshot taken of the device's store ([`Extent::take_snapshot`]), or restored from.

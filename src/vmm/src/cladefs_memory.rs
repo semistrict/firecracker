@@ -21,6 +21,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
+use cladefs::CellVersion;
 use cladefs::memory_cell::MemoryCell;
 use vm_memory::mmap::NewBitmap;
 
@@ -133,12 +134,8 @@ pub fn guest_memory(
         guest.push(region);
         offset += len;
     }
-    let memory_cell = MemoryCell::open_forked(
-        &config.cladefsd_socket,
-        store,
-        &config.copy_on_host,
-        size as u64,
-    )
+    let from = CellVersion { tenant: config.tenant, cell: config.cell, version: config.version };
+    let memory_cell = MemoryCell::open_forked(&config.cladefsd_socket, store, from, size as u64)
     .map_err(|error| CellMemoryError::Open(store.display().to_string(), error))?;
     // SAFETY: the reservation is the guest's memory, which nothing else of the process uses, and
     // which outlives the memory_cell (`Restored`).

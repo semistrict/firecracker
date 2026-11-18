@@ -64,10 +64,9 @@ pub struct NetworkOverride {
 }
 
 /// cladefs: has an extent-store device restored from a snapshot open the store at `path_on_host`,
-/// forked from the snapshot's copy of its store's version if it doesn't exist, rather than the
-/// store the snapshotted VM had: a store of its own for each VM restored from one snapshot
-/// (TASK-39.1). On another host, the copy is at `copy_on_host`, which the VM manager makes there
-/// first, and the extent daemon at `cladefsd_socket` serves.
+/// forked from the snapshot's version of its cell if it doesn't exist, rather than the store the
+/// snapshotted VM had: a store of its own for each VM restored from one snapshot (TASK-39.1), on
+/// any host, served by the extent daemon at `cladefsd_socket`.
 #[cfg(feature = "cladefs")]
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,25 +75,25 @@ pub struct CladefsOverride {
     pub id: String,
     /// The store's directory.
     pub path_on_host: String,
-    /// The snapshot's copy of the store's version, if not where the snapshot was taken.
-    #[serde(default)]
-    pub copy_on_host: Option<String>,
     /// The extent daemon's socket, if not the snapshotted VM's.
     #[serde(default)]
     pub cladefsd_socket: Option<String>,
 }
 
 /// cladefs: the memory cell a VM restored with `Cell` memory takes its memory from: its store,
-/// the backend's path, forked from the snapshot's copy of its memory's version at `copy_on_host` if
-/// it doesn't exist, which the VM manager makes on each host that restores the snapshot, as a
-/// disk's;
-/// served by the extent daemon at `cladefsd_socket` (TASK-456.3).
+/// the backend's path, forked from the version `version` of the memory cell `cell` of `tenant`'s
+/// if it doesn't exist, on any host, as a disk's; served by the extent daemon at
+/// `cladefsd_socket` (TASK-456.3).
 #[cfg(feature = "cladefs")]
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryCellConfig {
-    /// The snapshot's copy of its memory's version.
-    pub copy_on_host: PathBuf,
+    /// The snapshot's memory cell's tenant.
+    pub tenant: u64,
+    /// The memory cell, by its ID.
+    pub cell: u64,
+    /// The version of the memory cell the snapshot holds.
+    pub version: u64,
     /// The extent daemon's socket.
     pub cladefsd_socket: PathBuf,
 }

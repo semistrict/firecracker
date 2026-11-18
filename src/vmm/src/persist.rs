@@ -168,9 +168,9 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    // cladefs: the extent-store devices' stores first, versions with copies beside the snapshot.
+    // cladefs: the extent-store devices' stores first: a version of each one's cell.
     #[cfg(feature = "cladefs")]
-    vmm.take_extent_snapshots(&params.snapshot_path)
+    vmm.take_extent_snapshots()
         .map_err(CreateSnapshotError::MicrovmState)?;
     let microvm_state = vmm
         .save_state(vm_info)
@@ -419,8 +419,8 @@ pub fn restore_from_snapshot(
             .clone_from(&vsock_override.uds_path);
     }
 
-    // cladefs: the stores the extent-store devices open, each forked from the snapshot's copy of
-    // its store's version if it doesn't exist.
+    // cladefs: the stores the extent-store devices open, each forked from the snapshot's version of
+    // its cell if it doesn't exist.
     #[cfg(feature = "cladefs")]
     for entry in &params.cladefs_overrides {
         microvm_state
@@ -432,9 +432,6 @@ pub fn restore_from_snapshot(
             .find(|state| state.device.config.id == entry.id)
             .map(|state| {
                 state.device.config.path_on_host.clone_from(&entry.path_on_host);
-                if let Some(copy) = &entry.copy_on_host {
-                    state.device.copy = copy.into();
-                }
                 if let Some(socket) = &entry.cladefsd_socket {
                     state.device.config.cladefsd_socket.clone_from(socket);
                 }

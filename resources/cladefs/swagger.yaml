@@ -98,7 +98,7 @@ definitions:
     type: object
     description:
       cladefs's extent-store device restored from a snapshot opens the store at
-      path_on_host, forked from the snapshot's copy of its store's version if it doesn't
+      path_on_host, forked from the snapshot's version of its cell if it doesn't
       exist, rather than the store the snapshotted VM had.
     required:
       - id
@@ -112,11 +112,6 @@ definitions:
         type: string
         description:
           The store's directory
-      copy_on_host:
-        type: string
-        description:
-          The snapshot's copy of the store's version, if not where the snapshot was
-          taken, which the VM manager makes first on a host without it
       cladefsd_socket:
         type: string
         description:
@@ -127,18 +122,27 @@ definitions:
     description:
       With a Cell memory backend, the memory cell a VM restored from a snapshot takes its
       memory from (cladefs TASK-456.3) - its store, the backend's path, forked from the
-      snapshot's copy of its memory's version if it doesn't exist. Its pages are the extent daemon's, shared
+      snapshot's version of its memory cell if it doesn't exist. Its pages are the extent daemon's, shared
       with every VM restored from the same snapshot on the host; a page the guest stores to is
       a private copy of its own.
     required:
-      - copy_on_host
+      - tenant
+      - cell
+      - version
       - cladefsd_socket
     properties:
-      copy_on_host:
-        type: string
+      tenant:
+        type: integer
         description:
-          The snapshot's copy of its memory's version, which the VM manager makes on each host
-          that restores the snapshot, as a disk's
+          The tenant of the memory cell whose version the snapshot holds
+      cell:
+        type: integer
+        description:
+          The memory cell, by its ID
+      version:
+        type: integer
+        description:
+          The version of the memory cell the snapshot holds, which every host restores from
       cladefsd_socket:
         type: string
         description:
