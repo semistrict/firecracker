@@ -506,6 +506,7 @@ pub(crate) mod tests {
         device_activated: bool,
         config_bytes: [u8; 0xeff],
         activate_should_error: bool,
+        resettable: bool,
     }
 
     impl DummyDevice {
@@ -522,11 +523,17 @@ pub(crate) mod tests {
                 device_activated: false,
                 config_bytes: [0; 0xeff],
                 activate_should_error: false,
+                resettable: false,
             }
         }
 
         pub fn set_avail_features(&mut self, avail_features: u64) {
             self.avail_features = avail_features;
+        }
+
+        /// Has [`VirtioDevice::reset`] reset the device, rather than say it cannot.
+        pub(crate) fn set_resettable(&mut self) {
+            self.resettable = true;
         }
     }
 
@@ -599,6 +606,19 @@ pub(crate) mod tests {
 
         fn is_activated(&self) -> bool {
             self.device_activated
+        }
+
+        fn reset(&mut self) -> Option<(Arc<dyn VirtioInterrupt>, Vec<EventFd>)> {
+            if !self.resettable {
+                return None;
+            }
+            self.device_activated = false;
+            let events = self
+                .queue_evts
+                .iter()
+                .map(|event| event.try_clone().unwrap())
+                .collect();
+            Some((self.interrupt_trigger.take()?, events))
         }
     }
 
@@ -1175,10 +1195,12 @@ pub(crate) mod tests {
     #[test]
     fn test_ack_features_by_page() {
         let mut dummy_dev = DummyDevice::new();
-        dummy_dev.set_acked_features(16);
+        dummy_dev.set_acked_features((1 << 32) | 16);
         dummy_dev.set_avail_features(8);
+        // The page written replaces what the driver wrote to it before; the other page keeps its
+        // own.
         dummy_dev.ack_features_by_page(0, 8);
-        assert_eq!(dummy_dev.acked_features(), 24);
+        assert_eq!(dummy_dev.acked_features(), (1 << 32) | 8);
     }
 
     #[test]

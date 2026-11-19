@@ -23,6 +23,7 @@ use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 use zerocopy::IntoBytes;
 
+use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_ids;
 use crate::devices::virtio::queue::Queue;
@@ -255,6 +256,8 @@ pub enum VirtioPciDeviceError {
     PciConfiguration(#[from] PciConfigurationError),
     /// Invalid restore state: driver_status {0:#x} is inconsistent with device_activated (expected {1:#x})
     InvalidRestoreState(u8, u8),
+    /// Cannot activate the restored device: {0}
+    Activation(#[from] ActivateError),
 }
 
 pub struct VirtioPciDevice {
@@ -471,6 +474,8 @@ impl VirtioPciDevice {
             msix_config_cap_offset: state.msix_config_cap_offset,
         };
 
+        // A device that cannot activate again fails the restore, as over MMIO, rather than
+        // leaving its driver a device that serves nothing.
         if state.device_activated {
             virtio_pci_device
                 .device
@@ -479,7 +484,7 @@ impl VirtioPciDevice {
                 .activate(
                     virtio_pci_device.memory.clone(),
                     virtio_pci_device.virtio_interrupt.as_ref().unwrap().clone(),
-                );
+                )?;
         }
 
         Ok(virtio_pci_device)
@@ -963,19 +968,15 @@ impl PciDevice for VirtioPciDevice {
             let mut device = self.device.lock().unwrap();
             let reset_result = device.reset();
             match reset_result {
+                // The device gives back the transport's interrupt, which stays the transport's: a
+                // driver that sets the device up again activates it with it.
                 Some(_) => {
-                    // Upon reset the device returns its interrupt EventFD
-                    self.virtio_interrupt = None;
                     self.device_activated.store(false, Ordering::SeqCst);
 
                     // Reset queue readiness (changes queue_enable), queue sizes
-                    // and selected_queue as per spec for reset
-                    self.virtio_device()
-                        .lock()
-                        .unwrap()
-                        .queues_mut()
-                        .iter_mut()
-                        .for_each(Queue::reset);
+                    // and selected_queue as per spec for reset. Through the lock held: taking it
+                    // again would wait for itself.
+                    device.queues_mut().iter_mut().for_each(Queue::reset);
                     self.common_config.queue_select = 0;
                 }
                 None => {
@@ -1029,6 +1030,8 @@ mod tests {
     use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
     use crate::devices::virtio::rng::Entropy;
+    use crate::devices::virtio::rng::persist::EntropyConstructorArgs;
+    use crate::devices::virtio::transport::mmio::tests::DummyDevice;
     use crate::devices::virtio::transport::pci::common_config_offset::*;
     use crate::devices::virtio::transport::pci::device::{
         COMMON_CONFIG_BAR_OFFSET, COMMON_CONFIG_SIZE, DEVICE_CONFIG_BAR_OFFSET, DEVICE_CONFIG_SIZE,
@@ -1042,6 +1045,7 @@ mod tests {
     use crate::pci::msix::MsixCap;
     use crate::pci::{PciCapabilityId, PciClassCode, PciDevice};
     use crate::rate_limiter::RateLimiter;
+    use crate::snapshot::Persist;
 
     fn create_vmm_with_virtio_pci_device() -> Vmm {
         let mut vmm = default_vmm();
@@ -1396,6 +1400,21 @@ mod tests {
         assert_eq!(next, 0);
     }
 
+    /// Attaches `dummy` over PCI, as "dummy".
+    fn attach_dummy(vmm: &mut Vmm, dummy: DummyDevice) {
+        let mut event_manager = crate::EventManager::new().unwrap();
+        vmm.device_manager
+            .attach_virtio_device(
+                &vmm.vm,
+                "dummy".to_string(),
+                Arc::new(Mutex::new(dummy)),
+                &mut Cmdline::new(1024).unwrap(),
+                &mut event_manager,
+                false,
+            )
+            .unwrap();
+    }
+
     fn cap_pci_cfg_read(device: &mut VirtioPciDevice, bar_offset: u32, length: u32) -> u32 {
         let pci_config_cap_offset = capabilities_start(device) as usize
             + 3 * (size_of::<VirtioPciCap>() + 2)
@@ -1688,6 +1707,57 @@ mod tests {
         assert_eq!(status & DEVICE_NEEDS_RESET, DEVICE_NEEDS_RESET);
     }
 
+    /// A device that resets resets: the transport, its lock held, resets its queues, and keeps
+    /// its interrupt, which the device is activated with again as the driver sets it up again.
+    #[test]
+    fn test_reset_then_reinitialization() {
+        let mut vmm = default_vmm();
+        vmm.device_manager
+            .enable_pci(&vmm.vm.as_kvm().unwrap().clone())
+            .unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_resettable();
+        attach_dummy(&mut vmm, dummy);
+        let device = vmm
+            .device_manager
+            .pci_devices
+            .get_virtio_device(VirtioDeviceType::Rng, "dummy")
+            .unwrap()
+            .clone();
+        let mut locked = device.lock().unwrap();
+        let initialize = |locked: &mut VirtioPciDevice| {
+            write_driver_status(locked, ACKNOWLEDGE);
+            write_driver_status(locked, ACKNOWLEDGE | DRIVER);
+            let features = read_device_features(locked);
+            write_driver_features(locked, features);
+            write_driver_status(locked, ACKNOWLEDGE | DRIVER | FEATURES_OK);
+            setup_queues(locked);
+            write_driver_status(locked, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+        };
+
+        initialize(&mut locked);
+        assert!(locked.device_activated.load(Ordering::SeqCst));
+        assert!(locked.virtio_device().lock().unwrap().is_activated());
+
+        write_driver_status(&mut locked, 0);
+        assert_eq!(read_driver_status(&mut locked), 0);
+        assert!(!locked.device_activated.load(Ordering::SeqCst));
+        assert!(!locked.virtio_device().lock().unwrap().is_activated());
+        assert!(
+            locked
+                .virtio_device()
+                .lock()
+                .unwrap()
+                .queues()
+                .iter()
+                .all(|queue| !queue.ready)
+        );
+
+        initialize(&mut locked);
+        assert!(locked.device_activated.load(Ordering::SeqCst));
+        assert!(locked.virtio_device().lock().unwrap().is_activated());
+    }
+
     #[test]
     fn test_failed_reset_blocks_reinitialization() {
         let mut vmm = create_vmm_with_virtio_pci_device();
@@ -1720,6 +1790,16 @@ mod tests {
         // device_activated == true and driver_status == INIT is preserved in the
         // snapshot, so the blocking behavior survives restore.
         let saved_state = locked.state();
+        // The device's own state too, which a restore builds the device from, its queues
+        // ready: a device restored without them cannot activate, which fails the restore.
+        let saved_entropy = locked
+            .virtio_device()
+            .lock()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Entropy>()
+            .unwrap()
+            .save();
         drop(locked);
 
         // Fully drop the original device before constructing the restored copy: the restored
@@ -1733,7 +1813,15 @@ mod tests {
         // its `MsixVectorGroup::drop` will succeed when the test ends.
         *kvm_vm.resource_allocator() = saved_allocator;
 
-        let new_entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
+        let new_entropy = Arc::new(Mutex::new(
+            Entropy::restore(
+                EntropyConstructorArgs {
+                    mem: kvm_vm.guest_memory().clone(),
+                },
+                &saved_entropy,
+            )
+            .unwrap(),
+        ));
         let restored =
             VirtioPciDevice::new_from_state("rng".to_string(), &kvm_vm, new_entropy, saved_state)
                 .unwrap();
