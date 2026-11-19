@@ -248,6 +248,12 @@ impl Extent {
         self.device.take_snapshot(|| pause(workers, queues))
     }
 
+    /// cladefs: drops the snapshot [`Extent::take_snapshot`] took, its version, for a snapshot of
+    /// the VM that failed after it (TASK-575).
+    pub fn drop_snapshot(&mut self) {
+        self.device.drop_snapshot()
+    }
+
     /// The snapshot taken of the device's store ([`Extent::take_snapshot`]), or restored from.
     pub fn snapshot(&self) -> Option<&virtio_extent::persist::Snapshot> {
         self.device.snapshot()

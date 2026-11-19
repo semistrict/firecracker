@@ -506,9 +506,11 @@ impl Vmm {
 
     /// cladefs: takes the snapshots of the extent-store devices' stores, for a snapshot of the VM,
     /// paused: each makes a version of its store's cell, which a VM restored from the snapshot
-    /// forks its own from (TASK-39.1). The guests' filesystems must be frozen.
+    /// forks its own from (TASK-39.1). The guests' filesystems must be frozen. Returns the devices
+    /// that took one, whose snapshots the VM's snapshot failing after drops
+    /// ([`Vmm::drop_extent_snapshots`]); failing itself, it drops those it took (TASK-575).
     #[cfg(feature = "cladefs")]
-    pub fn take_extent_snapshots(&mut self) -> Result<(), MicrovmStateError> {
+    pub fn take_extent_snapshots(&mut self) -> Result<Vec<String>, MicrovmStateError> {
         let mut ids = Vec::new();
         self.device_manager
             .for_each_virtio_device(|device_type, device| {
@@ -516,15 +518,42 @@ impl Vmm {
                     ids.push(device.id().to_owned());
                 }
             });
+        let mut taken = Vec::new();
         for id in ids {
-            self.device_manager
+            let took = self
+                .device_manager
                 .with_virtio_device(&id, |extent: &mut devices::virtio::extent::Extent| {
                     extent.take_snapshot()
                 })
-                .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))?
-                .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))?;
+                .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))
+                .and_then(|took| {
+                    took.map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))
+                });
+            if let Err(err) = took {
+                self.drop_extent_snapshots(&taken);
+                return Err(err);
+            }
+            taken.push(id);
         }
-        Ok(())
+        Ok(taken)
+    }
+
+    /// cladefs: drops the snapshots the extent-store devices `ids` took
+    /// ([`Vmm::take_extent_snapshots`]), for a snapshot of the VM that failed after them: no
+    /// snapshot file names their versions, which their cells would keep, and all they hold, for
+    /// good (TASK-575).
+    #[cfg(feature = "cladefs")]
+    pub fn drop_extent_snapshots(&mut self, ids: &[String]) {
+        for id in ids {
+            let dropped = self
+                .device_manager
+                .with_virtio_device(id, |extent: &mut devices::virtio::extent::Extent| {
+                    extent.drop_snapshot()
+                });
+            if let Err(err) = dropped {
+                error!("extent device {id}: dropping its snapshot: {err}");
+            }
+        }
     }
 
     /// Sends a resume command to the vCPUs.

@@ -168,10 +168,26 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    // cladefs: the extent-store devices' stores first: a version of each one's cell.
+    // cladefs: the extent-store devices' stores first: a version of each one's cell, which the
+    // snapshot failing after drops, as no snapshot file names it then (TASK-575).
     #[cfg(feature = "cladefs")]
-    vmm.take_extent_snapshots()
+    let taken = vmm
+        .take_extent_snapshots()
         .map_err(CreateSnapshotError::MicrovmState)?;
+    let written = write_snapshot(vmm, vm_info, params);
+    #[cfg(feature = "cladefs")]
+    if written.is_err() {
+        vmm.drop_extent_snapshots(&taken);
+    }
+    written
+}
+
+/// Writes a Microvm snapshot: its state, then its memory.
+fn write_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
