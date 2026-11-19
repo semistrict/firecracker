@@ -29,6 +29,8 @@ use crate::vmm_config::balloon::{
     BalloonUpdateStatsConfig,
 };
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
+#[cfg(feature = "cladefs")]
+use crate::vmm_config::cladefs::{CladefsConfigError, CladefsDeviceConfig};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -88,6 +90,10 @@ pub enum VmmAction {
     InsertPmemDevice(PmemConfig),
     /// Update an existing pmem device's rate limiter.
     UpdatePmemDevice(PmemDeviceUpdateConfig),
+    /// Add cladefs's extent-store device, or replace the one with its ID. This action can only be
+    /// called before the microVM has booted.
+    #[cfg(feature = "cladefs")]
+    InsertCladefsDevice(CladefsDeviceConfig),
     /// Add a new network interface config or update one that already exists using the
     /// `NetworkInterfaceConfig` as input. This action can only be called before the microVM has
     /// booted.
@@ -174,6 +180,9 @@ pub enum VmmActionError {
     EntropyConfig(#[from] EntropyDeviceError),
     /// Pmem config error: {0}
     PmemConfig(#[from] PmemConfigError),
+    /// Extent-store device config error: {0}
+    #[cfg(feature = "cladefs")]
+    CladefsConfig(#[from] CladefsConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
     /// Memory hotplug update error: {0}
@@ -473,6 +482,8 @@ impl<'a> PrebootApiController<'a> {
             GetVmmVersion => Ok(VmmData::VmmVersion(self.instance_info.vmm_version.clone())),
             InsertBlockDevice(config) => self.insert_block_device(config),
             InsertPmemDevice(config) => self.insert_pmem_device(config),
+            #[cfg(feature = "cladefs")]
+            InsertCladefsDevice(config) => self.insert_cladefs_device(config),
             InsertNetworkDevice(config) => self.insert_net_device(config),
             LoadSnapshot(config) => self
                 .load_snapshot(&config)
@@ -546,6 +557,19 @@ impl<'a> PrebootApiController<'a> {
             .build_net_device(cfg)
             .map(|()| VmmData::Empty)
             .map_err(VmmActionError::NetworkConfig)
+    }
+
+    #[cfg(feature = "cladefs")]
+    fn insert_cladefs_device(
+        &mut self,
+        cfg: CladefsDeviceConfig,
+    ) -> Result<VmmData, VmmActionError> {
+        self.boot_path = true;
+        self.vm_resources
+            .cladefs
+            .insert(cfg)
+            .map(|()| VmmData::Empty)
+            .map_err(VmmActionError::CladefsConfig)
     }
 
     fn insert_pmem_device(&mut self, cfg: PmemConfig) -> Result<VmmData, VmmActionError> {
@@ -858,6 +882,8 @@ impl RuntimeApiController {
             | SetMemoryHotplugDevice(_)
             | StartMicroVm
             | UpdateMachineConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
+            #[cfg(feature = "cladefs")]
+            InsertCladefsDevice(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
         }
     }
 
@@ -1276,6 +1302,20 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "cladefs")]
+        check_unsupported(runtime_request(VmmAction::InsertCladefsDevice(
+            crate::vmm_config::cladefs::CladefsDeviceConfig {
+                id: String::new(),
+                tag: String::new(),
+                path_on_host: String::new(),
+                capacity: 0,
+                dax_window_size: None,
+                dax_private_max_bytes: None,
+                cladefsd_socket: String::new(),
+                read_only: false,
+                cache_type: crate::vmm_config::cladefs::CacheType::Writeback,
+            },
+        )));
         check_unsupported(runtime_request(VmmAction::ConfigureBootSource(
             BootSourceConfig::default(),
         )));
@@ -1330,6 +1370,10 @@ mod tests {
                 resume_vm: false,
                 network_overrides: vec![],
                 vsock_override: None,
+                #[cfg(feature = "cladefs")]
+                cladefs_overrides: vec![],
+                #[cfg(feature = "cladefs")]
+                memory_cell: None,
                 clock_realtime: false,
             },
         )));

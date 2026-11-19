@@ -168,6 +168,26 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // cladefs: the extent-store devices' stores first: a version of each one's cell, which the
+    // snapshot failing after drops, as no snapshot file names it then (TASK-575).
+    #[cfg(feature = "cladefs")]
+    let taken = vmm
+        .take_extent_snapshots()
+        .map_err(CreateSnapshotError::MicrovmState)?;
+    let written = write_snapshot(vmm, vm_info, params);
+    #[cfg(feature = "cladefs")]
+    if written.is_err() {
+        vmm.drop_extent_snapshots(&taken);
+    }
+    written
+}
+
+/// Writes a Microvm snapshot: its state, then its memory.
+fn write_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -356,6 +376,9 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     File(#[from] GuestMemoryFromFileError),
     /// Error creating guest memory from uffd: {0}
     Uffd(#[from] GuestMemoryFromUffdError),
+    /// cladefs: error restoring guest memory from a memory cell: {0}
+    #[cfg(feature = "cladefs")]
+    Cell(#[from] crate::cladefs_memory::CellMemoryError),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -412,6 +435,26 @@ pub fn restore_from_snapshot(
             .clone_from(&vsock_override.uds_path);
     }
 
+    // cladefs: the stores the extent-store devices open, each forked from the snapshot's version of
+    // its cell if it doesn't exist.
+    #[cfg(feature = "cladefs")]
+    for entry in &params.cladefs_overrides {
+        microvm_state
+            .device_states
+            .pci_state
+            .extent_devices
+            .iter_mut()
+            .map(|device| &mut device.device_state)
+            .find(|state| state.device.config.id == entry.id)
+            .map(|state| {
+                state.device.config.path_on_host.clone_from(&entry.path_on_host);
+                if let Some(socket) = &entry.cladefsd_socket {
+                    state.device.config.cladefsd_socket.clone_from(socket);
+                }
+            })
+            .ok_or_else(|| SnapshotStateFromFileError::UnknownCladefsDevice(entry.id.clone()))?;
+    }
+
     let track_dirty_pages = params.track_dirty_pages;
 
     let vcpu_count = microvm_state
@@ -461,6 +504,19 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        // cladefs: from a memory cell of the snapshot's cell (TASK-456.3).
+        #[cfg(feature = "cladefs")]
+        MemBackendType::Cell => (
+            crate::cladefs_memory::guest_memory(
+                mem_backend_path,
+                params.memory_cell.as_ref(),
+                mem_state.regions(),
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages.is_hugetlbfs(),
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Cell)?,
+            None,
+        ),
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -486,6 +542,9 @@ pub enum SnapshotStateFromFileError {
     UnknownNetworkDevice,
     /// Unknown Vsock Device.
     UnknownVsockDevice,
+    /// cladefs: unknown extent-store device {0}.
+    #[cfg(feature = "cladefs")]
+    UnknownCladefsDevice(String),
 }
 
 fn snapshot_state_from_file(

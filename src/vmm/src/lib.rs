@@ -12,6 +12,19 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::blanket_clippy_restriction_lints)]
 
+// cladefs's crates, which the `cladefs` feature builds against, cladefs's and its extent device's: no
+// dependencies of this crate's, but ones cladefs's build adds (resources/cladefs/README.md), so that a
+// build without the feature needs nothing of cladefs's, nor fetches it. Without them, the feature
+// fails here.
+#[cfg(feature = "cladefs")]
+extern crate cladefs;
+#[cfg(feature = "cladefs")]
+extern crate virtio_extent;
+
+/// cladefs: a VM's memory restored from a memory cell of its snapshot's cell (TASK-456.3).
+#[cfg(feature = "cladefs")]
+pub mod cladefs_memory;
+
 /// Implements platform specific functionality.
 /// Supported platforms: x86_64 and aarch64.
 pub mod arch;
@@ -202,6 +215,14 @@ pub enum FcExitCode {
     BadConfiguration = 152,
     /// Command line arguments parsing error.
     ArgParsing = 153,
+    /// cladefs: the extent daemon serving an extent device went, and the VM can't go on: nothing
+    /// its store asks is served any more, nor its DAX window's faults (TASK-50.2).
+    #[cfg(feature = "cladefs")]
+    CladefsdLost = 158,
+    /// cladefs: a vCPU's access stayed refused (`KVM_RUN` failing with `EFAULT` for a second): the
+    /// guest's, of a page of its DAX window nothing maps, or that it may not store to (TASK-70).
+    #[cfg(feature = "cladefs")]
+    AccessRefused = 159,
 }
 
 /// Timeout used in recv_timeout, when waiting for a vcpu response on
@@ -348,6 +369,8 @@ impl Vmm {
         let mut net = Vec::new();
         let mut net_with_mmds = Vec::new();
         let mut pmem = Vec::new();
+        #[cfg(feature = "cladefs")]
+        let mut extent = Vec::new();
         let mut balloon = None;
         let mut vsock = None;
         let mut entropy = None;
@@ -399,6 +422,15 @@ impl Vmm {
                         memory_hotplug = Some(MemoryHotplugConfig::from(m));
                     }
                 }
+                #[cfg(feature = "cladefs")]
+                VirtioDeviceType::Extent => {
+                    if let Some(e) = device
+                        .as_any()
+                        .downcast_ref::<devices::virtio::extent::Extent>()
+                    {
+                        extent.push(e.config().clone());
+                    }
+                }
             });
 
         let mmds_config = mmds_ref.map(|mmds| {
@@ -427,6 +459,8 @@ impl Vmm {
             vsock,
             entropy,
             pmem_devices: pmem,
+            #[cfg(feature = "cladefs")]
+            cladefs_devices: extent,
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,
@@ -444,6 +478,17 @@ impl Vmm {
                 {
                     tuples.push(("vhost-user-block", b.id().to_owned()));
                 }
+                // cladefs: its store, in cladefs's extent daemon, is snapshotted first
+                // (`Vmm::take_extent_snapshots`).
+                #[cfg(feature = "cladefs")]
+                if let VirtioDeviceType::Extent = device_type
+                    && device
+                        .as_any()
+                        .downcast_ref::<devices::virtio::extent::Extent>()
+                        .is_none_or(|extent| extent.snapshot().is_none())
+                {
+                    tuples.push(("extent", device.id().to_owned()));
+                }
             });
         if tuples.is_empty() {
             Ok(())
@@ -456,6 +501,58 @@ impl Vmm {
             Err(MicrovmStateError::NotAllowed(format!(
                 "Devices without snapshot support are present: {msg}"
             )))
+        }
+    }
+
+    /// cladefs: takes the snapshots of the extent-store devices' stores, for a snapshot of the VM,
+    /// paused: each makes a version of its store's cell, which a VM restored from the snapshot
+    /// forks its own from (TASK-39.1). The guests' filesystems must be frozen. Returns the devices
+    /// that took one, whose snapshots the VM's snapshot failing after drops
+    /// ([`Vmm::drop_extent_snapshots`]); failing itself, it drops those it took (TASK-575).
+    #[cfg(feature = "cladefs")]
+    pub fn take_extent_snapshots(&mut self) -> Result<Vec<String>, MicrovmStateError> {
+        let mut ids = Vec::new();
+        self.device_manager
+            .for_each_virtio_device(|device_type, device| {
+                if let VirtioDeviceType::Extent = device_type {
+                    ids.push(device.id().to_owned());
+                }
+            });
+        let mut taken = Vec::new();
+        for id in ids {
+            let took = self
+                .device_manager
+                .with_virtio_device(&id, |extent: &mut devices::virtio::extent::Extent| {
+                    extent.take_snapshot()
+                })
+                .map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))
+                .and_then(|took| {
+                    took.map_err(|err| MicrovmStateError::NotAllowed(err.to_string()))
+                });
+            if let Err(err) = took {
+                self.drop_extent_snapshots(&taken);
+                return Err(err);
+            }
+            taken.push(id);
+        }
+        Ok(taken)
+    }
+
+    /// cladefs: drops the snapshots the extent-store devices `ids` took
+    /// ([`Vmm::take_extent_snapshots`]), for a snapshot of the VM that failed after them: no
+    /// snapshot file names their versions, which their cells would keep, and all they hold, for
+    /// good (TASK-575).
+    #[cfg(feature = "cladefs")]
+    pub fn drop_extent_snapshots(&mut self, ids: &[String]) {
+        for id in ids {
+            let dropped = self
+                .device_manager
+                .with_virtio_device(id, |extent: &mut devices::virtio::extent::Extent| {
+                    extent.drop_snapshot()
+                });
+            if let Err(err) = dropped {
+                error!("extent device {id}: dropping its snapshot: {err}");
+            }
         }
     }
 

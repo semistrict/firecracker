@@ -339,6 +339,38 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /cladefs/{id}:
+    put:
+      summary: Creates an extent-store device. Pre-boot only. (cladefs)
+      description:
+        Creates a virtio extent-store device with the ID given by the id parameter, served by
+        cladefs's extent daemon (cladefsd), which the guest's Fxfs keeps its filesystem in. Requires
+        Firecracker started with --enable-pci.
+      operationId: putCladefsDeviceByID
+      parameters:
+        - name: id
+          in: path
+          description: The id of the extent-store device
+          required: true
+          type: string
+        - name: body
+          in: body
+          description: Extent-store device properties
+          required: true
+          schema:
+            $ref: "#/definitions/Cladefs"
+      responses:
+        204:
+          description: Extent-store device is created
+        400:
+          description: Extent-store device cannot be created due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
   /pmem/{id}:
     put:
       summary: Creates or updates a pmem device. Pre-boot only.
@@ -1260,6 +1292,70 @@ definitions:
         description:
           Path to the socket of vhost-user-block backend.
           This field is required for vhost-user-block config should be omitted for virtio-block configuration.
+
+  Cladefs:
+    type: object
+    description:
+      An extent-store device (cladefs). Unknown fields are refused.
+    required:
+      - id
+      - tag
+      - path_on_host
+      - capacity
+      - cladefsd_socket
+    properties:
+      id:
+        type: string
+        description: Identificator for this device; the same as the path's id.
+      tag:
+        type: string
+        description: The filesystem's name, which the guest mounts it by. 1 to 36 bytes.
+      path_on_host:
+        type: string
+        description: The extent store's directory, created if it doesn't exist.
+      capacity:
+        type: integer
+        format: int64
+        minimum: 0
+        description: The most bytes a store created holds.
+      dax_window_size:
+        type: integer
+        format: int64
+        minimum: 0
+        description:
+          The size in bytes of the DAX window, guest physical memory the guest maps files' data
+          from, a nonzero multiple of 2 MiB. Address space, not memory; size it to the data, at
+          most 64 GiB. No window without it.
+      dax_private_max_bytes:
+        type: integer
+        format: int64
+        minimum: 0
+        description:
+          With a writer's DAX window, the most bytes of private pages it holds at once, pages the
+          guest wrote through the window and has not written back yet. They are the VM process's
+          memory, charged to it as its guest memory is; the extent daemon reserves none of it. The
+          guest keeps under it, writing back as it nears it; past it, a write(2) fails EIO and a
+          store through a mapping stops the VM (exit 159). A
+          multiple of the page size, a page at least, the window's size at most. Default 1 GiB,
+          or the window's size if less. Size it per VM, for example by its vCPUs or memory. A
+          page count (the former dax_private_max) is refused.
+      cladefsd_socket:
+        type: string
+        description: The socket of the extent daemon, which serves the store.
+      read_only:
+        type: boolean
+        description:
+          Whether the device follows the store, read-only, as another VM writes it. Default false.
+      cache_type:
+        type: string
+        description:
+          What the device does with the guest's asks for uploaded commits, as a block device's
+          cache_type does with flushes. Writeback waits for each upload; Unsafe answers once
+          ordered, and what a host crash takes since the last upload is lost.
+        enum:
+          - Unsafe
+          - Writeback
+        default: Writeback
 
   Pmem:
     type: object
