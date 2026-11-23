@@ -22,7 +22,7 @@ use vmm_sys_util::eventfd::EventFd;
 use zerocopy::IntoBytes;
 
 use crate::devices::virtio::ActivateError;
-use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType, VirtioShmRegion};
 use crate::devices::virtio::transport::pci::common_config::{
     VirtioPciCommonConfig, VirtioPciCommonConfigState,
 };
@@ -48,13 +48,22 @@ pub const VIRTQ_MSI_NO_VECTOR: u16 = 0xffff;
 /// BAR index we are using for VirtIO configuration
 const VIRTIO_BAR_INDEX: u8 = 0;
 
+/// BAR index of a device's shared memory regions (virtio 1.2, section 2.10), which a 64-bit BAR
+/// of its own holds, after the configuration's.
+const VIRTIO_SHM_BAR_INDEX: u8 = 2;
+
+/// The shared memory regions a device may have over PCI: the configuration space's capabilities
+/// end at offset 192 (`PciConfiguration::add_capability`), which leaves room for one
+/// `virtio_pci_cap64` after the transport's own capabilities, and no more.
+pub const MAX_SHM_REGIONS: usize = 1;
+
+#[derive(Debug, Clone, Copy)]
 enum PciCapabilityType {
     Common = 1,
     Notify = 2,
     Isr = 3,
     Device = 4,
     Pci = 5,
-    #[allow(dead_code)] // Defined by the virtio spec, but not used by us
     SharedMemory = 8,
 }
 
@@ -103,6 +112,74 @@ impl VirtioPciCap {
             length: Le32::from(length),
         }
     }
+}
+
+/// A capability of 64-bit offset and length (virtio 1.2, section 4.1.4, `virtio_pci_cap64`): a
+/// shared memory region's, whose `cap.id` is the region's ID.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct VirtioPciCap64 {
+    cap: VirtioPciCap,
+    offset_hi: Le32,
+    length_hi: Le32,
+}
+
+// SAFETY: All members are simple numbers and any value is valid.
+unsafe impl ByteValued for VirtioPciCap64 {}
+
+impl PciCapability for VirtioPciCap64 {
+    fn bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+
+    fn id(&self) -> PciCapabilityId {
+        PciCapabilityId::VendorSpecific
+    }
+}
+
+impl VirtioPciCap64 {
+    /// The capability of the shared memory region `id`, `length` bytes at `offset` in the BAR
+    /// `pci_bar`.
+    fn shared_memory(pci_bar: u8, id: u8, offset: u64, length: u64) -> Self {
+        // The low and high halves of the offset and length.
+        #[allow(clippy::cast_possible_truncation)]
+        let (low, high) = (
+            |v: u64| Le32::from(v as u32),
+            |v: u64| Le32::from((v >> 32) as u32),
+        );
+        VirtioPciCap64 {
+            cap: VirtioPciCap {
+                cap_len: u8::try_from(std::mem::size_of::<VirtioPciCap64>()).unwrap()
+                    + VIRTIO_PCI_CAP_LEN_OFFSET,
+                cfg_type: PciCapabilityType::SharedMemory as u8,
+                pci_bar,
+                id,
+                padding: [0; 2],
+                offset: low(offset),
+                length: low(length),
+            },
+            offset_hi: high(offset),
+            length_hi: high(length),
+        }
+    }
+}
+
+/// The BAR that holds a device's shared memory `regions`, if it has any: the smallest power of two
+/// in size from the first region's start that covers them all, its address and size. A BAR is
+/// naturally aligned, so whoever places the regions places them so (see [`shm_bar_size`]).
+pub fn shm_bar(regions: &[VirtioShmRegion]) -> Option<(u64, u64)> {
+    let start = regions.iter().map(|region| region.guest_addr).min()?;
+    let end = regions
+        .iter()
+        .map(|region| region.guest_addr + region.len)
+        .max()?;
+    Some((start, shm_bar_size(end - start)))
+}
+
+/// The size of the BAR holding shared memory regions of `len` bytes from its start: the guest
+/// addresses to allocate for them, from the 64-bit MMIO range, aligned to this size.
+pub fn shm_bar_size(len: u64) -> u64 {
+    len.next_power_of_two()
 }
 
 #[repr(C, packed)]
@@ -234,6 +311,22 @@ const NOTIFY_OFF_MULTIPLIER: u32 = 4; // A dword per notification address.
 const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_ID_BASE: u16 = 0x1040; // Add to device type to get device ID.
 
+/// The PCI device ID of a device whose type is past the 63 the modern IDs, 0x1040 to 0x107f, name:
+/// the last transitional ID, whose subsystem device ID says the device's type (virtio 1.2,
+/// section 4.1.2.1). Linux's virtio_pci claims PCI device IDs 0x1000 to 0x107f alone, and takes a
+/// transitional one's type from its subsystem device ID, which a modern ID's 0x1040 plus the type
+/// would have left outside.
+const VIRTIO_PCI_TRANSITIONAL_DEVICE_ID: u16 = 0x103f;
+
+/// The PCI device ID and subsystem device ID of a virtio device of type `device_type`.
+fn pci_device_ids(device_type: VirtioDeviceType) -> (u16, u16) {
+    let device_type = device_type as u16;
+    match VIRTIO_PCI_DEVICE_ID_BASE.checked_add(device_type) {
+        Some(id) if id <= 0x107f => (id, id),
+        _ => (VIRTIO_PCI_TRANSITIONAL_DEVICE_ID, device_type),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtioPciDeviceState {
     pub sbdf: PciSBDF,
@@ -298,6 +391,12 @@ pub struct VirtioPciDevice {
     // yet in effect.
     bar_address: u64,
 
+    // GPA base of the shared memory BAR (BAR 2), if the device has shared memory regions.
+    // Shared memory regions are backed by fixed KVM memory slots and are not relocated when
+    // the guest reprograms BAR 2; `maybe_relocate_bar` reverts any attempt to move BAR 2 so
+    // the BAR register always agrees with the backing slot.
+    shm_bar_address: Option<u64>,
+
     // Add a dedicated structure to hold information about the very specific
     // virtio-pci capability VIRTIO_PCI_CAP_PCI_CFG. This is needed to support
     // the legacy/backward compatible mechanism of letting the guest access the
@@ -319,7 +418,7 @@ impl Debug for VirtioPciDevice {
 
 impl VirtioPciDevice {
     fn pci_configuration(device_type: VirtioDeviceType) -> PciConfiguration {
-        let pci_device_id = VIRTIO_PCI_DEVICE_ID_BASE + device_type as u16;
+        let (pci_device_id, subsystem_id) = pci_device_ids(device_type);
         let (class, subclass) = match device_type {
             VirtioDeviceType::Net => (
                 PciClassCode::NetworkController,
@@ -342,7 +441,7 @@ impl VirtioPciDevice {
             class,
             subclass,
             VIRTIO_PCI_VENDOR_ID,
-            pci_device_id,
+            subsystem_id,
         )
     }
 
@@ -351,7 +450,19 @@ impl VirtioPciDevice {
     /// This must happen only during the creation of a brand new VM. When a VM is restored from a
     /// known state, the BARs are already created with the right content, therefore we don't need
     /// to go through this codepath.
+    ///
+    /// The device's shared memory regions, if it has any, are where it placed them: a BAR of
+    /// their own holds them ([`shm_bar`]). They stay at that address (`maybe_relocate_bar` refuses
+    /// guest attempts to relocate BAR 2).
     pub fn allocate_bars(&mut self, mmio64_allocator: &mut AddressAllocator) {
+        let shm_regions = self.device.lock().unwrap().shm_regions().to_vec();
+        assert!(
+            shm_regions.len() <= MAX_SHM_REGIONS,
+            "a device of {} shared memory regions: the PCI transport describes {MAX_SHM_REGIONS} \
+             at most",
+            shm_regions.len()
+        );
+
         // Allocate the virtio-pci capability BAR.
         // See http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-740004
         self.bar_address = mmio64_allocator
@@ -368,7 +479,42 @@ impl VirtioPciDevice {
             CAPABILITY_BAR_SIZE,
             BarPrefetchable::No,
         );
+        let shm_bar = shm_bar(&shm_regions);
+        if let Some((addr, size)) = shm_bar {
+            assert!(
+                addr.is_multiple_of(size),
+                "shared memory regions at {addr:#x} not aligned to their BAR's {size:#x} bytes"
+            );
+            self.bars
+                .set_bar_64(VIRTIO_SHM_BAR_INDEX, addr, size, BarPrefetchable::Yes);
+            self.shm_bar_address = Some(addr);
+        }
         self.add_pci_capabilities();
+        // After the others', which a driver finds by their types, wherever they are.
+        if let Some((addr, _)) = shm_bar {
+            for region in &shm_regions {
+                let cap = VirtioPciCap64::shared_memory(
+                    VIRTIO_SHM_BAR_INDEX,
+                    region.id,
+                    region.guest_addr - addr,
+                    region.len,
+                );
+                self.configuration.add_capability(&cap);
+            }
+        }
+    }
+
+    fn shm_bar_addr_of(bars: &Bars) -> Option<u64> {
+        if !bars.bars[VIRTIO_SHM_BAR_INDEX as usize].is_64bit() {
+            return None;
+        }
+        let bar = bars.get_bar_addr_64(VIRTIO_SHM_BAR_INDEX);
+        (bar != 0).then_some(bar)
+    }
+
+    /// The address of the BAR holding the device's shared memory regions, if it has any.
+    pub fn shm_bar_addr(&self) -> Option<u64> {
+        Self::shm_bar_addr_of(&self.bars)
     }
 
     /// Free the PCI BAR of the VirtIO device.
@@ -427,6 +573,7 @@ impl VirtioPciDevice {
             virtio_interrupt: Some(interrupt),
             vm: vm.clone(),
             bar_address: 0,
+            shm_bar_address: None,
             cap_pci_cfg_info: VirtioPciCfgCapInfo::default(),
             bars: Bars::default(),
             msix_config,
@@ -491,6 +638,7 @@ impl VirtioPciDevice {
             return Err(PciConfigurationError::InvalidBarIdx(VIRTIO_BAR_INDEX).into());
         }
 
+        let shm_bar_address = Self::shm_bar_addr_of(&state.bars);
         let virtio_pci_device = VirtioPciDevice {
             id,
             sub_id: None,
@@ -502,6 +650,7 @@ impl VirtioPciDevice {
             virtio_interrupt: Some(interrupt),
             vm: vm.clone(),
             bar_address: state.bar_address,
+            shm_bar_address,
             cap_pci_cfg_info,
             bars: state.bars,
             msix_config,
@@ -713,6 +862,19 @@ impl VirtioPciDevice {
 
     /// Relocate the PCI bar if a new address was written to the registers
     fn maybe_relocate_bar(&mut self) {
+        if let Some(old_shm) = self.shm_bar_address
+            && self.shm_bar_addr() != Some(old_shm)
+        {
+            error!(
+                "Refusing to relocate virtio-pci shared memory BAR {old_shm:#x} -> {:?}: \
+                 shared memory regions stay at their allocated address",
+                self.shm_bar_addr()
+            );
+            let bar_lo = &mut self.bars.bars[VIRTIO_SHM_BAR_INDEX as usize];
+            bar_lo.encoded_addr = ((old_shm & 0xffff_fff0) as u32) | (bar_lo.encoded_addr & 0xf);
+            self.bars.bars[VIRTIO_SHM_BAR_INDEX as usize + 1].encoded_addr = (old_shm >> 32) as u32;
+        }
+
         let old_base = self.bar_address;
         let new_base = self.config_bar_addr();
         if new_base == old_base {
@@ -1231,14 +1393,18 @@ mod tests {
     use vm_allocator::{AllocPolicy, RangeInclusive};
     use vm_memory::{ByteValued, Le32};
 
-    use super::{EventFd, IoEventAddress, KvmVm, NoDatamatch, PciCapabilityType, VirtioPciDevice};
+    use super::{
+        EventFd, IoEventAddress, KvmVm, NoDatamatch, PciCapabilityType, VirtioPciCap64,
+        VirtioPciDevice, pci_device_ids, shm_bar, shm_bar_size,
+    };
     use crate::Vmm;
     use crate::arch::{MEM_64BIT_DEVICES_SIZE, MEM_64BIT_DEVICES_START};
     use crate::builder::tests::default_vmm_with_pci;
     use crate::device_manager::tests::pci_devices;
-    use crate::devices::virtio::device::VirtioDeviceType;
+    use crate::devices::virtio::device::{VirtioDeviceType, VirtioShmRegion};
     use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
     use crate::devices::virtio::rng::Entropy;
+    use crate::devices::virtio::transport::mmio::tests::DummyDevice;
     use crate::devices::virtio::transport::pci::common_config_offset::*;
     use crate::devices::virtio::transport::pci::device::{
         CAPABILITY_BAR_SIZE, COMMAND_MEMORY_SPACE_ENABLE, COMMAND_REG, COMMON_CONFIG_BAR_OFFSET,
@@ -1374,6 +1540,53 @@ mod tests {
         // We don't specify any of those
         let reg15 = locked_virtio_pci_device.read_config_register(0xf);
         assert_eq!(reg15, 0);
+    }
+
+    /// Firecracker's PCI configuration space, of an entropy device attached over PCI as the first
+    /// device of `create_vmm_with_virtio_pci_device`'s VM: its 64 registers as read, the header,
+    /// BARs and capability chain, then its six BARs' sizes as a guest reads them, all ones written
+    /// first (cladefs TASK-267).
+    const UPSTREAM_RNG_CONFIG_SPACE: [u32; 64] = [
+        0x10441af4, 0x00100000, 0xffff0001, 0x00000000, 0x00000004, 0x00000040, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x10441af4, 0x00000000, 0x00000040,
+        0x00000000, 0x00000000, 0x01105009, 0x00000000, 0x00000000, 0x00000038, 0x03106009,
+        0x00000000, 0x00002000, 0x00000001, 0x04107009, 0x00000000, 0x00004000, 0x00001000,
+        0x02148409, 0x00000000, 0x00006000, 0x00001000, 0x00000004, 0x05149809, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x80010011, 0x00008000, 0x00048000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000,
+    ];
+    const UPSTREAM_RNG_BAR_SIZES: [u32; 6] = [
+        0xfff80004, 0xffffffff, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    ];
+
+    /// A device without shared memory regions is upstream's PCI device: its configuration space,
+    /// register by register, and its BARs' sizes are as upstream makes them (cladefs TASK-267): no
+    /// BAR 2, no capability more, the chain as it was.
+    #[test]
+    fn test_config_space_as_upstream() {
+        let vmm = create_vmm_with_virtio_pci_device();
+        let device = get_virtio_device(&vmm);
+        let mut locked = device.lock().unwrap();
+        let registers: Vec<u32> = (0..64)
+            .map(|reg| locked.read_config_register(reg))
+            .collect();
+        let sizes: Vec<u32> = (0..6)
+            .map(|bar| {
+                locked.write_config_register(4 + bar, 0, &[0xff; 4]);
+                locked.read_config_register(4 + bar)
+            })
+            .collect();
+        assert_eq!(
+            (registers.as_slice(), sizes.as_slice()),
+            (
+                UPSTREAM_RNG_CONFIG_SPACE.as_slice(),
+                UPSTREAM_RNG_BAR_SIZES.as_slice()
+            ),
+            "\nregisters: {registers:#010x?}\nsizes: {sizes:#010x?}"
+        );
     }
 
     #[test]
@@ -1740,6 +1953,219 @@ mod tests {
         let (id, next, _cap) = read_msix_cap(&mut locked_virtio_pci_device, msix_cap_offset);
         assert_eq!(id, PciCapabilityId::MsiX);
         assert_eq!(next, 0);
+    }
+
+    /// A device with shared memory regions `regions`, of `len` bytes from the start of a range
+    /// of the 64-bit MMIO gap allocated as [`shm_bar_size`] says, attached over PCI.
+    fn create_vmm_with_shm_regions(
+        len: u64,
+        regions: impl FnOnce(u64) -> Vec<VirtioShmRegion>,
+    ) -> (Vmm, u64) {
+        let mut vmm = default_vmm_with_pci();
+        let size = shm_bar_size(len);
+        let addr = vmm
+            .vm
+            .as_kvm()
+            .unwrap()
+            .resource_allocator()
+            .mmio64_memory
+            .allocate(size, size, AllocPolicy::FirstMatch)
+            .unwrap()
+            .start();
+        let mut dummy = DummyDevice::new();
+        dummy.set_shm_regions(regions(addr));
+        let mut event_manager = crate::EventManager::new().unwrap();
+        vmm.device_manager
+            .attach_boot_virtio_device(
+                &vmm.vm,
+                "dummy".to_string(),
+                Arc::new(Mutex::new(dummy)),
+                &mut Cmdline::new(1024).unwrap(),
+                &mut event_manager,
+                false,
+            )
+            .unwrap();
+        (vmm, addr)
+    }
+
+    /// The vendor capabilities of `device` of type `cfg_type`, at their offsets.
+    fn find_virtio_caps(device: &mut VirtioPciDevice, cfg_type: PciCapabilityType) -> Vec<u32> {
+        let mut found = Vec::new();
+        let mut offset = capabilities_start(device);
+        while offset != 0 {
+            let word1 = device.read_config_register((offset >> 2) as u16);
+            if PciCapabilityId::from((word1 & 0xff) as u8) == PciCapabilityId::VendorSpecific
+                && (word1 >> 24) as u8 == cfg_type as u8
+            {
+                found.push(offset);
+            }
+            offset = (word1 >> 8) & 0xff;
+        }
+        found
+    }
+
+    fn read_virtio_pci_cap64(device: &mut VirtioPciDevice, offset: u32) -> VirtioPciCap64 {
+        let words: Vec<u32> = (0..6)
+            .map(|i| device.read_config_register((offset >> 2) as u16 + i))
+            .collect();
+        VirtioPciCap64 {
+            cap: VirtioPciCap {
+                cap_len: ((words[0] >> 16) & 0xff) as u8,
+                cfg_type: ((words[0] >> 24) & 0xff) as u8,
+                pci_bar: (words[1] & 0xff) as u8,
+                id: ((words[1] >> 8) & 0xff) as u8,
+                padding: [((words[1] >> 16) & 0xff) as u8, (words[1] >> 24) as u8],
+                offset: Le32::from(words[2]),
+                length: Le32::from(words[3]),
+            },
+            offset_hi: Le32::from(words[4]),
+            length_hi: Le32::from(words[5]),
+        }
+    }
+
+    /// The address register's value, and the size, of the 64-bit BAR `bar`, as a guest sizes it,
+    /// restoring the BAR registers afterward.
+    fn read_bar_64(device: &mut VirtioPciDevice, bar: u16) -> (u64, u64) {
+        let (lo, hi) = (0x4 + bar, 0x5 + bar);
+        let orig_lo = device.read_config_register(lo);
+        let orig_hi = device.read_config_register(hi);
+        let addr = u64::from(orig_lo) | (u64::from(orig_hi) << 32);
+        device.write_config_register(lo, 0, &[0xff; 4]);
+        let size_lo = u64::from(device.read_config_register(lo)) & 0xffff_fff0;
+        device.write_config_register(hi, 0, &[0xff; 4]);
+        let size_hi = u64::from(device.read_config_register(hi));
+        device.write_config_register(lo, 0, &orig_lo.to_le_bytes());
+        device.write_config_register(hi, 0, &orig_hi.to_le_bytes());
+        (addr, (!((size_hi << 32) | size_lo)).wrapping_add(1))
+    }
+
+    /// A device type the modern IDs name has its modern ID as both. (One past them, the last
+    /// transitional ID and its type the subsystem device ID, is the cladefs feature's extent device,
+    /// which its commit tests here.)
+    #[test]
+    fn test_pci_device_ids() {
+        assert_eq!(pci_device_ids(VirtioDeviceType::Net), (0x1041, 0x1041));
+        assert_eq!(pci_device_ids(VirtioDeviceType::Rng), (0x1044, 0x1044));
+        assert_eq!(pci_device_ids(VirtioDeviceType::Pmem), (0x105b, 0x105b));
+    }
+
+    #[test]
+    fn test_shm_bar() {
+        assert_eq!(shm_bar(&[]), None);
+        let region = |id, guest_addr, len| VirtioShmRegion {
+            id,
+            guest_addr,
+            len,
+        };
+        assert_eq!(
+            shm_bar(&[region(0, 0x40_0000_0000, 3 << 30)]),
+            Some((0x40_0000_0000, 4 << 30))
+        );
+        assert_eq!(
+            shm_bar(&[
+                region(1, 0x40_4000_0000, 1 << 20),
+                region(0, 0x40_0000_0000, 2 << 20)
+            ]),
+            Some((0x40_0000_0000, 2 << 30))
+        );
+        assert_eq!(shm_bar_size(64 << 30), 64 << 30);
+        assert_eq!(shm_bar_size((64 << 30) + (2 << 20)), 128 << 30);
+    }
+
+    /// A device's shared memory region is a 64-bit prefetchable BAR of its own, BAR 2, which a
+    /// `virtio_pci_cap64` of type SHARED_MEMORY_CFG describes, after the other capabilities
+    /// (virtio 1.2, section 4.1.4.7).
+    #[test]
+    fn test_shared_memory_capabilities() {
+        let (vmm, addr) = create_vmm_with_shm_regions(5 << 30, |addr| {
+            vec![VirtioShmRegion {
+                id: 3,
+                guest_addr: addr,
+                len: 5 << 30,
+            }]
+        });
+        let device = pci_devices(&vmm.device_manager)
+            .get_virtio_device(VirtioDeviceType::Rng, "dummy")
+            .unwrap()
+            .clone();
+        let mut device = device.lock().unwrap();
+
+        // 64-bit (0b100) and prefetchable (0b1000), naturally aligned, 8 GiB: 5 GiB rounded up.
+        let (bar, size) = read_bar_64(&mut device, 2);
+        assert_eq!(bar, addr | 0b1100);
+        assert_eq!(size, 8 << 30);
+        assert_eq!(addr % size, 0);
+        assert_eq!(device.shm_bar_addr(), Some(addr));
+        // The configuration's BAR is where it was.
+        let (bar0, size0) = read_bar_64(&mut device, 0);
+        assert_eq!(bar0 & !0xf, device.config_bar_addr());
+        assert_eq!(size0, CAPABILITY_BAR_SIZE);
+
+        let offsets = find_virtio_caps(&mut device, PciCapabilityType::SharedMemory);
+        let caps: Vec<VirtioPciCap64> = offsets
+            .iter()
+            .map(|&offset| read_virtio_pci_cap64(&mut device, offset))
+            .collect();
+        assert_eq!(caps, vec![VirtioPciCap64::shared_memory(2, 3, 0, 5 << 30)]);
+        // What Linux's virtio_pci_find_shm_cap takes: cap_len of a virtio_pci_cap64's 24 bytes,
+        // and the halves of the offset and length.
+        assert_eq!(caps[0].cap.cap_len, 24);
+        assert_eq!(caps[0].cap.cfg_type, 8);
+        assert_eq!(caps[0].cap.pci_bar, 2);
+        assert_eq!(u32::from(caps[0].cap.offset), 0);
+        assert_eq!(u32::from(caps[0].offset_hi), 0);
+        assert_eq!(u32::from(caps[0].cap.length), 1 << 30);
+        assert_eq!(u32::from(caps[0].length_hi), 1);
+        // After the MSI-X capability, the last of the others.
+        let msix = device.msix_config_cap_offset as u32;
+        assert!(offsets.iter().all(|&offset| offset > msix));
+    }
+
+    /// Reprogramming the shared memory BAR (BAR 2) and re-enabling memory space decoding reverts
+    /// BAR 2 back to its fixed backing slot address so config space never diverges from the slot.
+    #[test]
+    fn test_shared_memory_bar_relocation_refused() {
+        let (vmm, addr) = create_vmm_with_shm_regions(5 << 30, |addr| {
+            vec![VirtioShmRegion {
+                id: 3,
+                guest_addr: addr,
+                len: 5 << 30,
+            }]
+        });
+        let device = pci_devices(&vmm.device_manager)
+            .get_virtio_device(VirtioDeviceType::Rng, "dummy")
+            .unwrap()
+            .clone();
+        let mut device = device.lock().unwrap();
+        let new_addr = addr + (8 << 30);
+
+        set_memory_space_enable(&mut device, false);
+        device.write_config_register(BAR0_REG_IDX + 2, 0, &(new_addr as u32).to_le_bytes());
+        device.write_config_register(
+            BAR0_REG_IDX + 3,
+            0,
+            &((new_addr >> 32) as u32).to_le_bytes(),
+        );
+        set_memory_space_enable(&mut device, true);
+
+        assert_eq!(device.shm_bar_addr(), Some(addr));
+        let (bar, size) = read_bar_64(&mut device, 2);
+        assert_eq!(bar, addr | 0b1100);
+        assert_eq!(size, 8 << 30);
+    }
+
+    /// A device without shared memory regions has no BAR 2, nor a SHARED_MEMORY_CFG capability.
+    #[test]
+    fn test_no_shared_memory_capabilities() {
+        let vmm = create_vmm_with_virtio_pci_device();
+        let device = get_virtio_device(&vmm);
+        let mut device = device.lock().unwrap();
+        assert_eq!(read_bar_64(&mut device, 2), (0, 0));
+        assert_eq!(device.shm_bar_addr(), None);
+        assert_eq!(
+            find_virtio_caps(&mut device, PciCapabilityType::SharedMemory),
+            Vec::<u32>::new()
+        );
     }
 
     fn cap_pci_cfg_read(device: &mut VirtioPciDevice, bar_offset: u32, length: u32) -> u32 {
