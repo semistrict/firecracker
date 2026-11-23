@@ -164,7 +164,12 @@ where
         if self.pending_event_ack {
             return Ok(false);
         }
+        self.fill_rx_queue()
+    }
 
+    /// Fills the driver-provided RX queue buffers with what the backend has pending, as
+    /// `process_rx()` does, but whether or not a TRANSPORT_RESET awaits the guest's ack.
+    fn fill_rx_queue(&mut self) -> Result<bool, InvalidAvailIdx> {
         // This is safe since we checked in the event handler that the device is activated.
         let mem = &self.device_state.active_state().unwrap().mem;
 
@@ -444,6 +449,9 @@ where
                     self.id()
                 );
                 self.signal_used_queue(EVQ_INDEX).unwrap();
+                // The RX queue too, for the RSTs `prepare_save()` put in it ahead of the event: the
+                // guest takes them as it takes any RX it was not yet told of.
+                self.signal_used_queue(RXQ_INDEX).unwrap();
             }
 
             // Replay the TX queue notification, like the default `VirtioDevice::kick`
@@ -479,6 +487,24 @@ where
         // Send Transport event to reset connections if device
         // is activated.
         if self.is_activated() {
+            // The guest resets its connected sockets on TRANSPORT_RESET, but not one still
+            // connecting: one whose OP_RESPONSE is in the RX queue, which the guest has not taken
+            // yet, connects once it does, to a backend the snapshot has none of. Under MSI-X the
+            // guest takes the RX queue and the event queue apart, on vectors of their own, and so
+            // may take that response after the event, its socket then waiting on a connection
+            // nothing ever answers. So the backend's connections end first, each with an RST in
+            // the RX queue, behind any response, which the guest takes in order: the socket the
+            // response connects, the RST resets. The RX gate holds back no RST: every packet the
+            // backend has now is one, and an RST the guest takes before the event resets nothing
+            // the event would not.
+            self.backend.reset_connections();
+            match self.fill_rx_queue() {
+                Ok(true) => self.signal_used_queue(RXQ_INDEX).unwrap_or_else(|err| {
+                    error!("Failed to signal the RX queue's RSTs: {:?}", err);
+                }),
+                Ok(false) => {}
+                Err(err) => error!("Failed to queue the RSTs of the connections: {:?}", err),
+            }
             self.send_transport_reset_event().unwrap_or_else(|err| {
                 error!("Failed to send reset transport event: {:?}", err);
             });
@@ -492,7 +518,9 @@ mod tests {
 
     use super::*;
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
-    use crate::devices::virtio::vsock::test_utils::{EventHandlerContext, TestContext};
+    use crate::devices::virtio::vsock::test_utils::{
+        EventHandlerContext, QueueInterrupts, TestContext,
+    };
     use crate::utils::byte_order;
     use crate::vstate::memory::GuestAddress;
 
@@ -533,10 +561,17 @@ mod tests {
         ctx.device.ack_features_by_page(1, driver_pages[1]);
         // Ack some bogus page (i.e. 2). This should have no side effect.
         ctx.device.ack_features_by_page(2, 0);
-        // Attempt to un-ack the first feature page. This should have no side effect.
+        // Write the first feature page again: what it says replaces what it said before, the
+        // features it no longer says un-acked, those it says the device hasn't left out.
         ctx.device.ack_features_by_page(0, !driver_pages[0]);
-        // Check that no side effect are present, and that the acked features are exactly the same
-        // as the device features.
+        assert_eq!(
+            ctx.device.acked_features,
+            (device_features & driver_features & !0xffff_ffff)
+                | (device_features & u64::from(!driver_pages[0]))
+        );
+        // And written once more as it was, the acked features are exactly the device's that the
+        // driver asked for.
+        ctx.device.ack_features_by_page(0, driver_pages[0]);
         assert_eq!(ctx.device.acked_features, device_features & driver_features);
 
         // Validate config_as_bytes returns the CID in little-endian.
@@ -711,6 +746,53 @@ mod tests {
 
         assert!(ctx.device.pending_event_ack);
         assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+    }
+
+    #[test]
+    fn test_prepare_save_resets_connections_ahead_of_transport_reset() {
+        // The backend's connections end, their RSTs in the RX queue before the event is
+        // published, though the RX gate is up from a TRANSPORT_RESET the guest has not acked.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+        publish_evq_descriptor(&mut ctx);
+        ctx.device.pending_event_ack = true;
+        ctx.device.backend.set_pending_rx(true);
+
+        ctx.device.prepare_save();
+
+        assert_eq!(ctx.device.backend.reset_cnt, 1);
+        assert_eq!(ctx.device.backend.rx_ok_cnt, 1);
+        assert_eq!(
+            ctx.guest_rxvq.used.idx.get(),
+            1,
+            "the RX queue must hold the backend's RSTs"
+        );
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        assert!(ctx.device.pending_event_ack);
+    }
+
+    #[test]
+    fn test_kick_signals_rx_and_event_queues() {
+        // Restored from a snapshot (`pending_event_ack` armed), the guest is told of both: the
+        // RSTs prepare_save put in the RX queue, and the event.
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        let interrupts = Arc::new(QueueInterrupts::default());
+        ctx.mock_activate(test_ctx.mem.clone(), interrupts.clone());
+        ctx.device.pending_event_ack = true;
+
+        ctx.device.kick();
+
+        let mut signaled = interrupts.queues.lock().unwrap().clone();
+        signaled.sort_unstable();
+        assert_eq!(
+            signaled,
+            [
+                u16::try_from(RXQ_INDEX).unwrap(),
+                u16::try_from(EVQ_INDEX).unwrap()
+            ]
+        );
     }
 
     #[test]

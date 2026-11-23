@@ -190,4 +190,9 @@ pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
     /// Reset the backend, dropping all active connections and removing its listeners
     /// from the poll set.
     fn reset(&mut self);
+
+    /// Ends every connection, each with an RST for the driver, which `recv_pkt()` then yields:
+    /// after this, until a new connection is made, every packet the backend has for the driver is
+    /// an RST.
+    fn reset_connections(&mut self);
 }
