@@ -19,7 +19,7 @@ use std::cell::Cell;
 use std::fmt::{self, Write as _};
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::logging::{DEFAULT_INSTANCE_ID, INSTANCE_ID};
 
@@ -27,11 +27,6 @@ use super::logging::{DEFAULT_INSTANCE_ID, INSTANCE_ID};
 /// it is given one, then a duplicate of its target, which a target given later replaces with
 /// `dup3`, at once, so that a handler never writes to a descriptor closed or reused meanwhile.
 static LOG_FD: AtomicI32 = AtomicI32::new(libc::STDOUT_FILENO);
-
-/// Whether a handler's write to [`LOG_FD`] found its reader gone (`EPIPE`): the handlers write
-/// to it no more until the logger is given another target, as each write would raise `SIGPIPE`
-/// again, whose handler would write again, for ever.
-static LOG_BROKEN: AtomicBool = AtomicBool::new(false);
 
 /// The metrics' file, once they are given one: -1 until then.
 static METRICS_FD: AtomicI32 = AtomicI32::new(-1);
@@ -55,7 +50,6 @@ pub(crate) fn set_log_target(target: &File) -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
     }
-    LOG_BROKEN.store(false, Ordering::Release);
     Ok(())
 }
 
@@ -250,13 +244,10 @@ impl Drop for KeptErrno {
 }
 
 /// Writes a line of `args` where the logger writes, as its lines are: the time (UTC), the
-/// instance and the thread, then `args`; async-signal-safe, for a signal handler. Nothing once
-/// a write of it found its reader gone, but the first such write returns true: its `SIGPIPE` is
-/// pending, raised on the calling thread, which its handler is to take for its own.
+/// instance and the thread, then `args`; async-signal-safe, for a signal handler. True if its
+/// write found the reader gone (`EPIPE`): its `SIGPIPE` is pending, raised on the calling
+/// thread, which the handler is to take for its own, rather than write again for it, for ever.
 pub(crate) fn log(args: fmt::Arguments<'_>) -> bool {
-    if LOG_BROKEN.load(Ordering::Acquire) {
-        return false;
-    }
     let mut line = Line::new();
     let instance = INSTANCE_ID
         .get()
@@ -266,7 +257,7 @@ pub(crate) fn log(args: fmt::Arguments<'_>) -> bool {
     // Line's writes never fail: they cut.
     let _ = write!(line, "{} [{instance}:{thread}] {args}", UtcNow::now());
     match write_all(LOG_FD.load(Ordering::Acquire), line.ended()) {
-        Err(libc::EPIPE) => !LOG_BROKEN.swap(true, Ordering::AcqRel),
+        Err(libc::EPIPE) => true,
         // As the logger counts a line it couldn't write, and says nothing of it.
         Err(_) | Ok(()) => false,
     }

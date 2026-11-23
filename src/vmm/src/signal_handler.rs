@@ -692,28 +692,39 @@ mod tests {
         );
     }
 
-    /// The fatal signals the handlers exit for, raised by `raise`, which sends them, and
-    /// the codes they exit with: `SIGSYS` with `UnexpectedError`, sent, not a bad system call.
-    const FATAL: [(c_int, FcExitCode); 7] = [
-        (SIGBUS, FcExitCode::SIGBUS),
-        (SIGSEGV, FcExitCode::SIGSEGV),
-        (SIGILL, FcExitCode::SIGILL),
-        (SIGSYS, FcExitCode::UnexpectedError),
-        (SIGXFSZ, FcExitCode::SIGXFSZ),
-        (SIGXCPU, FcExitCode::SIGXCPU),
-        (SIGHUP, FcExitCode::SIGHUP),
+    /// A metric's group and name, as the metrics' JSON has them.
+    type Metric = (&'static str, &'static str);
+
+    /// The fatal signals the handlers exit for, raised by `raise`, which sends them, the codes
+    /// they exit with, and the metric each writes, by its group and name: `SIGSYS` exits with
+    /// `UnexpectedError`, sent, not a bad system call, before its metric is written.
+    const FATAL: [(c_int, FcExitCode, Option<Metric>); 7] = [
+        (SIGBUS, FcExitCode::SIGBUS, Some(("signals", "sigbus"))),
+        (SIGSEGV, FcExitCode::SIGSEGV, Some(("signals", "sigsegv"))),
+        (SIGILL, FcExitCode::SIGILL, Some(("signals", "sigill"))),
+        (SIGSYS, FcExitCode::UnexpectedError, None),
+        (SIGXFSZ, FcExitCode::SIGXFSZ, Some(("signals", "sigxfsz"))),
+        (SIGXCPU, FcExitCode::SIGXCPU, Some(("signals", "sigxcpu"))),
+        (SIGHUP, FcExitCode::SIGHUP, Some(("signals", "sighup"))),
     ];
 
     // Each fatal signal's handler, on a thread that holds the logger's lock, says so and exits
     // with the signal's code, taking no lock and allocating nothing, as a handler must: it
     // interrupts its thread anywhere, which may hold the logger's lock, or the allocator's. The
-    // handlers logged through the logger, and waited for ever for its lock.
+    // handlers logged through the logger, and waited for ever for its lock. Each writes its
+    // signal's metric to the metrics' file, a line of its own.
     #[test]
     fn test_fatal_signals_take_no_lock() {
         if let Some(fault) = std::env::var_os(FAULT) {
             let fault = fault.to_str().unwrap().to_owned();
-            if let Some(signal) = fault.strip_prefix("locked ") {
+            if let Some(locked) = fault.strip_prefix("locked ") {
+                let (signal, metrics) = locked.split_once(' ').unwrap();
                 let signal: c_int = signal.parse().unwrap();
+                let metrics_path = std::path::PathBuf::from(metrics);
+                crate::vmm_config::metrics::init_metrics(
+                    crate::vmm_config::metrics::MetricsConfig { metrics_path },
+                )
+                .unwrap();
                 fault_on_a_thread(move || {
                     let _held = LOGGER.0.lock().unwrap();
                     forbid_allocation();
@@ -722,10 +733,12 @@ mod tests {
                 });
             }
         }
-        for (signal, code) in FATAL {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        for (signal, code, metric) in FATAL {
+            let metrics = dir.as_path().join(format!("metrics-{signal}"));
             let output = run_alone(
                 "test_fatal_signals_take_no_lock",
-                &format!("locked {signal}"),
+                &format!("locked {signal} {}", metrics.display()),
             );
             assert_eq!(
                 (output.status.code(), output.status.signal()),
@@ -737,31 +750,58 @@ mod tests {
                 " [anonymous-instance:fc_fault] Shutting down VM after intercepting signal {signal}, code "
             );
             assert!(stdout.contains(&said), "signal {signal}: {output:?}");
+            let lines = std::fs::read_to_string(&metrics).unwrap();
+            let written = match lines.lines().last() {
+                Some(line) => {
+                    let line: serde_json::Value = serde_json::from_str(line).unwrap();
+                    let (group, name) = metric.expect("no metric written");
+                    Some((group, name, line[group][name].as_u64()))
+                }
+                None => None,
+            };
+            assert_eq!(
+                written,
+                metric.map(|(group, name)| (group, name, Some(1))),
+                "signal {signal}: metrics {lines:?}"
+            );
         }
     }
 
-    // A SIGPIPE raised by the logger's own write, its target a pipe whose reader went, on the
+    // A SIGPIPE raised by the logger's own write, its target a FIFO whose reader went, on the
     // thread that holds the logger's lock, is counted, and the write fails, which the logger
     // counts as a line missed: the handler took the logger's lock again, and waited for ever. Its
-    // own line, written to the same pipe, raises SIGPIPE again, which it takes
-    // for its own, not counted, and writes there no more.
+    // own line, written to the same FIFO, raises SIGPIPE again, which it takes for its own, not
+    // counted. Once a reader opens the FIFO again, the handlers' lines reach it: a latch that
+    // stopped them at the first EPIPE silenced them for good.
     #[test]
     fn test_sigpipe_from_the_loggers_write_takes_no_lock() {
         if std::env::var_os(FAULT).is_some_and(|fault| fault == "sigpipe") {
             LOGGER.init().unwrap();
             register_signal_handlers().unwrap();
-            let mut fds = [0; 2];
-            // SAFETY: Makes a pipe, whose descriptors it fills in, checking the result.
-            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-            // SAFETY: Closes the pipe's reading end, which nothing else holds, and owns its
-            // writing end: the logger's target, a pipe whose reader went.
-            let target = unsafe {
-                libc::close(fds[0]);
-                std::fs::File::from_raw_fd(fds[1])
+            use std::os::unix::fs::OpenOptionsExt;
+            let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            let fifo = dir.as_path().join("log");
+            let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: Makes a FIFO at a path of the test's, checking the result.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let open_reader = || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                    .unwrap()
             };
+            let reader = open_reader();
+            let target = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap();
             signal_safe::set_log_target(&target).unwrap();
             LOGGER.0.lock().unwrap().target = Some(target);
-            error_unrestricted!("A line to a pipe whose reader went.");
+            // The logger's target, a FIFO whose reader went.
+            drop(reader);
+            error_unrestricted!("A line to a FIFO whose reader went.");
             error_unrestricted!("Another.");
             assert_eq!(
                 (
@@ -770,6 +810,18 @@ mod tests {
                 ),
                 (2, 2),
                 "(SIGPIPEs, lines missed)"
+            );
+            // Its reader back, the handlers' lines reach it again.
+            let mut reader = open_reader();
+            let broke = log_from_signal_handler!("After its reader came back.");
+            assert!(!broke);
+            // All it holds, then EAGAIN, the FIFO's writer open still.
+            let mut read = Vec::new();
+            reader.read_to_end(&mut read).unwrap_err();
+            let read = String::from_utf8_lossy(&read);
+            assert!(
+                read.ends_with("] After its reader came back.\n"),
+                "{read:?}"
             );
             return;
         }
