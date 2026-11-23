@@ -317,6 +317,10 @@ fn verify_load_snapshot(
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages,
         }))
@@ -389,6 +393,10 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
         }))
@@ -462,6 +470,10 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         resume_vm: false,
         network_overrides: vec![],
         vsock_override: None,
+        #[cfg(feature = "cladefs")]
+        cladefs_overrides: vec![],
+        #[cfg(feature = "cladefs")]
+        memory_cell: None,
         clock_realtime: false,
         huge_pages: SnapshotLoadHugePageConfig::Snapshot,
     });
