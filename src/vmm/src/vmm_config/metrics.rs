@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Auxiliary module for configuring the metrics system.
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -25,13 +26,16 @@ pub enum MetricsConfigError {
 
 /// Configures the metrics as described in `metrics_cfg`.
 pub fn init_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError> {
-    let writer = FcLineWriter::new(
-        open_file_nonblock(&metrics_cfg.metrics_path)
-            .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?,
-    );
+    let file = open_file_nonblock(&metrics_cfg.metrics_path)
+        .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?;
+    // The metrics' file, which stays open as long as the process, for the fatal signals'
+    // handlers to write their metric to, as they can't take the metrics' lock.
+    let fd = file.as_raw_fd();
     METRICS
-        .init(writer)
-        .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))
+        .init(FcLineWriter::new(file))
+        .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?;
+    crate::logger::signal_safe::set_metrics_fd(fd);
+    Ok(())
 }
 
 #[cfg(test)]

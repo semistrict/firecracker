@@ -71,6 +71,8 @@ impl Logger {
         );
 
         if let Some(file) = file {
+            // And where the signal handlers write, which can't take the lock.
+            super::signal_safe::set_log_target(&file).map_err(LoggerUpdateError)?;
             guard.target = Some(file);
         }
 

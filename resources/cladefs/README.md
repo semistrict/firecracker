@@ -58,3 +58,12 @@ the series moves there:
   right-aligns a minor in three columns, and one below 100, split at each space, read as
   absent, the jail left without the device, silently. A `/proc/misc` it can't read or parse is
   said, as `/dev/urandom`'s failure is, rather than taken for a host without userfaultfd.
+- The signal handlers are async-signal-safe (`src/vmm/src/logger/signal_safe.rs`): they format
+  their line on the stack and write it with `write(2)` to a duplicate of the logger's target,
+  set metrics by atomic stores, and `_exit`, taking no lock and allocating nothing. Upstream's
+  logged through `LOGGER`, whose lock, or the allocator's, their thread may hold: a `SIGPIPE`
+  raised by the logger's own write to a pipe whose reader went, or a fault in `malloc`, hung the
+  VM for ever. A fatal signal's metric is written as a metrics line of its own,
+  `{"utc_timestamp_ms":...,"signals":{"sigsegv":1}}` (`"seccomp":{"num_faults":1}` for
+  `SIGSYS`), where upstream wrote the whole of `METRICS`, through serde, which takes locks and
+  allocates. Their lines' times are UTC, marked `Z`, as the local time zone takes a lock to read.
