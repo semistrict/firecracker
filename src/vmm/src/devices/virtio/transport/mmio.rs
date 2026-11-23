@@ -477,7 +477,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::devices::virtio::ActivateError;
-    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType, VirtioShmRegion};
     use crate::devices::virtio::device_status::DEVICE_NEEDS_RESET;
     use crate::impl_device_type;
     use crate::test_utils::single_region_mem;
@@ -495,6 +495,7 @@ pub(crate) mod tests {
         device_activated: bool,
         config_bytes: [u8; 0xeff],
         activate_should_error: bool,
+        shm_regions: Vec<VirtioShmRegion>,
         reset_should_fail: bool,
     }
 
@@ -512,12 +513,17 @@ pub(crate) mod tests {
                 device_activated: false,
                 config_bytes: [0; 0xeff],
                 activate_should_error: false,
+                shm_regions: Vec::new(),
                 reset_should_fail: false,
             }
         }
 
         pub fn set_avail_features(&mut self, avail_features: u64) {
             self.avail_features = avail_features;
+        }
+
+        pub(crate) fn set_shm_regions(&mut self, shm_regions: Vec<VirtioShmRegion>) {
+            self.shm_regions = shm_regions;
         }
     }
 
@@ -572,6 +578,10 @@ pub(crate) mod tests {
             for (i, item) in data.iter().enumerate() {
                 self.config_bytes[u64_to_usize(offset) + i] = *item;
             }
+        }
+
+        fn shm_regions(&self) -> &[VirtioShmRegion] {
+            &self.shm_regions
         }
 
         fn activate(
