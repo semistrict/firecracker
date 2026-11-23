@@ -404,6 +404,21 @@ impl GuestRegionMmapExt {
     ) -> Result<(), GuestMemoryError> {
         let phys_address = self.get_host_address(caddr)?;
 
+        // cladefs: memory restored from a memory cell is reclaimed through its window, which ends
+        // its private pages there, their memory emptied: the madvise below frees nothing of it,
+        // the private pages' memory object keeping them (board 8497).
+        #[cfg(feature = "cladefs")]
+        if let Some(reclaimed) = crate::cladefs_memory::reclaim(phys_address, len) {
+            return reclaimed.map_err(|err| {
+                error!(
+                    "discard_range: reclaiming memory cell memory failed: {:#}",
+                    err
+                );
+                let errno = err.errno().map_or(libc::EIO, cladefs::Errno::raw);
+                GuestMemoryError::IOError(std::io::Error::from_raw_os_error(errno))
+            });
+        }
+
         match (self.inner.file_offset(), self.inner.flags()) {
             // If and only if we are resuming from a snapshot file, we have a file and it's mapped
             // private

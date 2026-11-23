@@ -16,6 +16,11 @@
 //! The window is made before anything touches guest memory, as restoring its devices does. The
 //! cell and the reservation live as long as the process, a VM's: kept here, the cell going
 //! first, which lets go of the window's memory, then the reservation.
+//!
+//! What the guest gives back of that memory, a balloon's inflation or a free page report, is
+//! reclaimed through the window ([`reclaim`], board 8497): its private pages there end, their
+//! memory emptied. The `madvise(MADV_DONTNEED)` that `discard_range` makes of other memory
+//! frees nothing of it, the private pages' memory object keeping them.
 
 use std::path::Path;
 use std::ptr::NonNull;
@@ -50,8 +55,8 @@ pub enum CellMemoryError {
 /// The memory a VM was restored with, kept for the process's life: the cell first, as it goes
 /// first, letting go of the window's memory, then the reservation it is in.
 struct Restored {
-    _memory_cell: MemoryCell,
-    _reservation: Reservation,
+    memory_cell: MemoryCell,
+    reservation: Reservation,
 }
 
 // SAFETY: the reservation's memory is the guest's, which the window serves from any thread.
@@ -134,16 +139,38 @@ pub fn guest_memory(
         guest.push(region);
         offset += len;
     }
-    let from = CellVersion { tenant: config.tenant, cell: config.cell, version: config.version };
+    let from = CellVersion {
+        tenant: config.tenant,
+        cell: config.cell,
+        version: config.version,
+    };
     let memory_cell = MemoryCell::open_forked(&config.cladefsd_socket, store, from, size as u64)
-    .map_err(|error| CellMemoryError::Open(store.display().to_string(), error))?;
+        .map_err(|error| CellMemoryError::Open(store.display().to_string(), error))?;
     // SAFETY: the reservation is the guest's memory, which nothing else of the process uses, and
     // which outlives the memory_cell (`Restored`).
     unsafe { memory_cell.window(reservation.base, size as u64, None) }
         .map_err(CellMemoryError::Window)?;
     *RESTORED.lock().unwrap() = Some(Restored {
-        _memory_cell: memory_cell,
-        _reservation: reservation,
+        memory_cell,
+        reservation,
     });
     Ok(guest)
+}
+
+/// Reclaims the `len` bytes of guest memory at host address `addr`, which the guest gave back,
+/// if they are memory restored from a memory cell: through its window, which ends the private
+/// pages there, their memory emptied (`MemoryCell::reclaim`); the guest reads the cell's pages
+/// there next. None for other memory, which `discard_range` discards as upstream does.
+pub(crate) fn reclaim(addr: *const u8, len: usize) -> Option<Result<(), cladefs::Error>> {
+    let restored = RESTORED.lock().unwrap();
+    let Restored {
+        memory_cell,
+        reservation,
+    } = restored.as_ref()?;
+    let offset = (addr as usize).checked_sub(reservation.base.as_ptr() as usize)?;
+    if offset >= reservation.len {
+        return None;
+    }
+    // Within the reservation: a region's, carved from it whole.
+    Some(memory_cell.reclaim(offset as u64, len as u64))
 }

@@ -49,6 +49,14 @@ at `extern crate cladefs` in `src/vmm/src/lib.rs`.
   start (`StartMicrovmError::ExtentDevicesNeedPci`).
 - `FcExitCode::CladefsdLost` (158), when an extent device's daemon goes, and
   `FcExitCode::AccessRefused` (159), when a guest's access to its DAX window stays refused.
+- Guest memory restored from a memory cell (`mem_backend` `Cell`) is the cell's window, its
+  pages the extent daemon's, a page the guest stores to a private copy in a memory object of
+  the window's. What the guest gives back of it, a balloon's inflation or a free page report
+  (`discard_range`), is reclaimed through the window (`cladefs::memory_cell::MemoryCell::reclaim`):
+  its private pages there end, their memory emptied, and the window names the cell's pages there
+  again, which the guest reads next. Upstream's `madvise(MADV_DONTNEED)` freed nothing of that
+  memory, the private pages' memory object keeping them.
+
 ## General fixes after the feature
 
 Fixes of upstream's code, each standing alone as those at the series' base, which a rewrite of
