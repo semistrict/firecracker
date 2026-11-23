@@ -2,8 +2,9 @@
 
 [cladefs](https://github.com/semistrict/cladefs)'s extent-store device and what it needs of
 Firecracker, behind the `cladefs` Cargo feature of the `firecracker` and `vmm` crates. A build
-without the feature is upstream's but for the general fixes at the series' base, which stand
-alone and change nothing of cladefs's.
+without the feature is upstream's but for the general fixes, at the series' base and after the
+feature ([below](#general-fixes-after-the-feature)), which stand alone and change nothing of
+cladefs's.
 
 ## Building with the feature
 
@@ -48,3 +49,12 @@ at `extern crate cladefs` in `src/vmm/src/lib.rs`.
   start (`StartMicrovmError::ExtentDevicesNeedPci`).
 - `FcExitCode::CladefsdLost` (158), when an extent device's daemon goes, and
   `FcExitCode::AccessRefused` (159), when a guest's access to its DAX window stays refused.
+## General fixes after the feature
+
+Fixes of upstream's code, each standing alone as those at the series' base, which a rewrite of
+the series moves there:
+
+- The jailer finds `/dev/userfaultfd`'s minor in `/proc/misc` whatever its padding: Linux
+  right-aligns a minor in three columns, and one below 100, split at each space, read as
+  absent, the jail left without the device, silently. A `/proc/misc` it can't read or parse is
+  said, as `/dev/urandom`'s failure is, rather than taken for a host without userfaultfd.

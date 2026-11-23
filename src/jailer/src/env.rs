@@ -104,14 +104,17 @@ fn clone(child_stack: *mut libc::c_void, flags: libc::c_int) -> Result<libc::c_i
     .map_err(JailerError::Clone)
 }
 
+// The host's misc devices, by minor device number, which /dev/userfaultfd's is found in.
+const PROC_MISC: &str = "/proc/misc";
+
+/// Why /dev/userfaultfd's minor device number could not be found in /proc/misc. A host without
+/// userfaultfd is none of these: /proc/misc lists no `userfaultfd`, and the jail has none.
 #[derive(Debug, thiserror::Error)]
 enum UserfaultfdParseError {
     #[error("Could not read /proc/misc: {0}")]
     ReadProcMisc(#[from] std::io::Error),
     #[error("Could not parse minor number: {0}")]
     ParseDevMinor(#[from] std::num::ParseIntError),
-    #[error("userfaultfd device not loaded")]
-    NotFound,
 }
 
 #[derive(Debug)]
@@ -252,7 +255,16 @@ impl Env {
             Env::parse_resource_limits(&mut resource_limits, args)?;
         }
 
-        let uffd_dev_minor = Self::get_userfaultfd_minor_dev_number().ok();
+        // A /proc/misc the jailer can't read or parse is said, as /dev/urandom's failure is, not
+        // taken silently for a host without userfaultfd: the jail has no /dev/userfaultfd then.
+        let uffd_dev_minor = Self::userfaultfd_minor(Path::new(PROC_MISC)).unwrap_or_else(|err| {
+            println!(
+                "Warning! Could not find /dev/userfaultfd's minor device number: {}.",
+                err
+            );
+            println!("/dev/userfaultfd will not be available inside the jail.");
+            None
+        });
 
         Ok(Env {
             id: id.to_owned(),
@@ -402,21 +414,23 @@ impl Env {
         write!(pid_file, "{}", pid).map_err(|err| JailerError::Write(pid_file_path, err))
     }
 
-    fn get_userfaultfd_minor_dev_number() -> Result<u32, UserfaultfdParseError> {
-        let buf = read_to_string("/proc/misc")?;
+    /// The minor device number of /dev/userfaultfd, as `proc_misc` (/proc/misc) lists the host's
+    /// misc devices; `None` if it lists no `userfaultfd`: the host has none.
+    fn userfaultfd_minor(proc_misc: &Path) -> Result<Option<u32>, UserfaultfdParseError> {
+        Ok(Self::parse_userfaultfd_minor(&read_to_string(proc_misc)?)?)
+    }
 
-        for line in buf.lines() {
-            let dev: Vec<&str> = line.split(' ').collect();
-            if dev.len() < 2 {
-                continue;
-            }
-
-            if dev[1] == "userfaultfd" {
-                return Ok(dev[0].parse::<u32>()?);
+    /// The minor device number of `userfaultfd` in `misc`, /proc/misc's text: a line a device,
+    /// its minor right-aligned in three columns, then its name (`misc_seq_show` in Linux's
+    /// drivers/char/misc.c prints `"%3i %s\n"`), so that a minor below 100 starts with spaces.
+    fn parse_userfaultfd_minor(misc: &str) -> Result<Option<u32>, std::num::ParseIntError> {
+        for line in misc.lines() {
+            let mut fields = line.split_whitespace();
+            if let (Some(minor), Some("userfaultfd")) = (fields.next(), fields.next()) {
+                return minor.parse().map(Some);
             }
         }
-
-        Err(UserfaultfdParseError::NotFound)
+        Ok(None)
     }
 
     fn mknod_and_own_dev(
@@ -1185,6 +1199,47 @@ mod tests {
             let dev_path = dev.to_str().map(CString::new).unwrap().unwrap();
             ensure_mknod_and_own_dev(&env, &dev_path, major, minor);
         }
+    }
+
+    // /proc/misc right-aligns a minor in three columns: one below 100 starts with spaces, which
+    // splitting at each space took for an empty minor, and the jail had no /dev/userfaultfd.
+    #[test]
+    fn test_parse_userfaultfd_minor() {
+        let parse = |misc| Env::parse_userfaultfd_minor(misc).unwrap();
+        assert_eq!(parse(" 59 userfaultfd\n"), Some(59));
+        assert_eq!(parse("123 userfaultfd\n"), Some(123));
+        assert_eq!(parse("  5 userfaultfd"), Some(5));
+        assert_eq!(
+            parse("183 hw_random\n 59 userfaultfd\n241 vhost-vsock\n"),
+            Some(59)
+        );
+        // No userfaultfd: a device whose name only starts with it is another.
+        assert_eq!(parse("183 hw_random\n229 fuse\n 59 userfaultfd2\n"), None);
+        assert_eq!(parse(""), None);
+        // A minor that isn't a number is an error, not a host without userfaultfd.
+        Env::parse_userfaultfd_minor("5x userfaultfd\n").unwrap_err();
+        Env::parse_userfaultfd_minor("-1 userfaultfd\n").unwrap_err();
+    }
+
+    // A /proc/misc that can't be read, or parsed, is an error, which the jailer says, not a host
+    // without userfaultfd.
+    #[test]
+    fn test_userfaultfd_minor_errors() {
+        let dir = TempDir::new().unwrap();
+        let misc = dir.as_path().join("misc");
+        assert!(matches!(
+            Env::userfaultfd_minor(&misc),
+            Err(UserfaultfdParseError::ReadProcMisc(_))
+        ));
+        fs::write(&misc, "10 userfaultfd\nx\n").unwrap();
+        assert_eq!(Env::userfaultfd_minor(&misc).unwrap(), Some(10));
+        fs::write(&misc, "1o userfaultfd\n").unwrap();
+        assert!(matches!(
+            Env::userfaultfd_minor(&misc),
+            Err(UserfaultfdParseError::ParseDevMinor(_))
+        ));
+        fs::write(&misc, "229 fuse\n").unwrap();
+        assert_eq!(Env::userfaultfd_minor(&misc).unwrap(), None);
     }
 
     #[test]
