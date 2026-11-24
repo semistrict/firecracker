@@ -327,7 +327,12 @@ unsafe impl Sync for RawGuestRegionMmap {}
 #[derive(Debug)]
 pub struct GuestRegionMmap {
     /// Held for its `Drop` impl which unmaps the guest memory region.
+    #[cfg(not(feature = "cladefs"))]
     _region: RawGuestRegionMmap,
+    /// Held for its `Drop` impl which unmaps the guest memory region; `None` for memory-cell
+    /// regions carved from `cladefs_memory`'s single reservation, which owns the mapping.
+    #[cfg(feature = "cladefs")]
+    _region: Option<RawGuestRegionMmap>,
     proxy: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>,
 }
 
@@ -386,10 +391,23 @@ impl GuestRegionMmap {
         assert!(region.mmap_size >= mmap_region.size());
 
         Ok(GuestRegionMmap {
+            #[cfg(not(feature = "cladefs"))]
             _region: region,
+            #[cfg(feature = "cladefs")]
+            _region: Some(region),
             proxy: vm_memory::GuestRegionMmap::new(mmap_region, guest_base)
                 .ok_or(MemoryError::VmMemoryError)?,
         })
+    }
+
+    /// cladefs: wraps a `vm_memory::GuestRegionMmap` carved from `cladefs_memory`'s single
+    /// reservation, which owns and unmaps the mapping on drop.
+    #[cfg(feature = "cladefs")]
+    pub(crate) fn from_unowned(proxy: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>) -> Self {
+        GuestRegionMmap {
+            _region: None,
+            proxy,
+        }
     }
 }
 
@@ -741,6 +759,24 @@ impl GuestRegionMmapExt {
             return Err(GuestMemoryError::InvalidGuestAddress(
                 self.start_addr().unchecked_add(caddr.raw_value()),
             ));
+        }
+
+        // cladefs: memory restored from a memory cell is reclaimed through its window, which ends
+        // its private pages there, their memory emptied: the madvise below frees nothing of it,
+        // the private pages' memory object keeping them (board 8497).
+        #[cfg(feature = "cladefs")]
+        {
+            let phys_address = self.get_host_address(caddr)?;
+            if let Some(reclaimed) = crate::cladefs_memory::reclaim(phys_address, len) {
+                return reclaimed.map_err(|err| {
+                    error!(
+                        "discard_range: reclaiming memory cell memory failed: {:#}",
+                        err
+                    );
+                    let errno = err.errno().map_or(libc::EIO, cladefs::Errno::raw);
+                    GuestMemoryError::IOError(std::io::Error::from_raw_os_error(errno))
+                });
+            }
         }
 
         match (self.inner.file_offset(), self.inner.flags()) {
