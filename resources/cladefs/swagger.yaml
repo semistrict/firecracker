@@ -1,0 +1,206 @@
+# The API the cladefs feature adds to src/firecracker/swagger/firecracker.yaml, in its terms: its
+# paths and definitions here go beside that file's, SnapshotLoadParams gains the properties
+# below, and MemoryBackend's backend_type the value Cell. A Firecracker built without the
+# feature has none of it: PUT /cladefs/{id} is refused as an unknown path, cladefs_overrides and
+# memory_cell as unknown fields of PUT /snapshot/load, and Cell as an unknown backend_type.
+swagger: "2.0"
+info:
+  title: Firecracker API, cladefs's additions
+  version: 1.16.1
+paths:
+  /cladefs/{id}:
+    put:
+      summary: Creates or updates an extent-store device. Pre-boot only.
+      description:
+        Creates cladefs's extent-store device with ID specified by id parameter, on an extent
+        store that cladefs's extent daemon serves, or replaces the one with that ID. Needs a
+        Firecracker built with its cladefs feature, and the virtio-PCI transport (--enable-pci):
+        a VM with the device on the MMIO transport does not start.
+      operationId: putGuestCladefsByID
+      parameters:
+        - name: id
+          in: path
+          description: The id of the guest extent-store device
+          required: true
+          type: string
+        - name: body
+          in: body
+          description: Guest extent-store device properties
+          required: true
+          schema:
+            $ref: "#/definitions/Cladefs"
+      responses:
+        204:
+          description: Extent-store device is created/updated
+        400:
+          description: Extent-store device cannot be created/updated due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
+definitions:
+  Cladefs:
+    type: object
+    required:
+      - id
+      - tag
+      - path_on_host
+      - capacity
+      - cladefsd_socket
+    properties:
+      id:
+        type: string
+        description:
+          Identificator for this device.
+      tag:
+        type: string
+        description:
+          The filesystem's name, at most 36 bytes, which the guest mounts it by.
+      path_on_host:
+        type: string
+        description:
+          The extent store's directory, created if it doesn't exist.
+      capacity:
+        type: integer
+        description:
+          The most bytes a store created holds.
+      dax_window_size:
+        type: integer
+        description:
+          The size in bytes of the DAX window, a multiple of 2 MiB, that the guest maps files'
+          data from. None without one.
+      cladefsd_socket:
+        type: string
+        description:
+          The socket of cladefs's extent daemon, which serves the store.
+      cache_type:
+        type: string
+        enum:
+          - Writeback
+          - Unsafe
+        default: Writeback
+        description:
+          What the device does with the guest's asks for durability, as a drive's cache_type does
+          with its flushes. Writeback waits for each, as the extent daemon makes the store's
+          commits durable, uploaded. Unsafe answers them once ordered, the daemon making them
+          durable soon after without the guest waiting; what a host's crash takes since the last
+          upload is lost, as of a disk image whose flushes the host drops.
+
+  CladefsOverride:
+    type: object
+    description:
+      cladefs's extent-store device restored from a snapshot opens the store at
+      path_on_host, forked from the snapshot's version of its cell if it doesn't
+      exist, rather than the store the snapshotted VM had.
+    required:
+      - id
+      - path_on_host
+    properties:
+      id:
+        type: string
+        description:
+          The ID of the extent-store device to modify
+      path_on_host:
+        type: string
+        description:
+          The store's directory
+      cladefsd_socket:
+        type: string
+        description:
+          The extent daemon's socket, if not the snapshotted VM's
+
+  MemoryCell:
+    type: object
+    description:
+      With a Cell memory backend, the memory cell a VM restored from a snapshot takes its
+      memory from (cladefs TASK-456.3) - its store, the backend's path, forked from the
+      snapshot's version of its memory cell if it doesn't exist. Its pages are the extent daemon's, shared
+      with every VM restored from the same snapshot on the host; a page the guest stores to is
+      a private copy of its own.
+    required:
+      - tenant
+      - cell
+      - version
+      - cladefsd_socket
+    properties:
+      tenant:
+        type: integer
+        description:
+          The tenant of the memory cell whose version the snapshot holds
+      cell:
+        type: integer
+        description:
+          The memory cell, by its ID
+      version:
+        type: integer
+        description:
+          The version of the memory cell the snapshot holds, which every host restores from
+      cladefsd_socket:
+        type: string
+        description:
+          The extent daemon's socket
+
+  # Properties of firecracker.yaml's SnapshotCreateParams, mutually exclusive with mem_file_path.
+  SnapshotCreateParams:
+    properties:
+      memory_cell:
+        $ref: "#/definitions/CreateMemoryCell"
+
+  CreateMemoryCell:
+    type: object
+    description:
+      Write guest memory straight into a memory cell during PUT /snapshot/create (cladefs
+      TASK-456.4), avoiding writing a local memory file. For a VM restored from a memory cell
+      (MemBackendType::Cell), omit both fields so Firecracker writes only the window's private
+      pages into its forked memory cell, commits, reclaims them, and makes a version. For a
+      cold-booted VM, supply both path_on_host and cladefsd_socket. Returns 200 OK with a
+      MemoryCellSnapshot body naming the created version.
+    properties:
+      path_on_host:
+        type: string
+        description:
+          The new memory cell's directory (required for non-cell VMs; omit for cell-restored VMs)
+      cladefsd_socket:
+        type: string
+        description:
+          The extent daemon's socket (required for non-cell VMs; omit for cell-restored VMs)
+
+  MemoryCellSnapshot:
+    type: object
+    required:
+      - tenant
+      - cell
+      - version
+    properties:
+      tenant:
+        type: integer
+      cell:
+        type: integer
+      version:
+        type: integer
+
+  # Properties of firecracker.yaml's SnapshotLoadParams, beside network_overrides.
+  SnapshotLoadParams:
+    properties:
+      cladefs_overrides:
+        type: array
+        description:
+          cladefs's extent-store devices whose stores to override on snapshot restore
+        items:
+          $ref: "#/definitions/CladefsOverride"
+      memory_cell:
+        $ref: "#/definitions/MemoryCell"
+
+  # A value of firecracker.yaml's MemoryBackend backend_type, beside File and Uffd.
+  MemoryBackend:
+    properties:
+      backend_type:
+        type: string
+        enum:
+          - Cell
+        description:
+          Cell - guest memory is a memory cell of the snapshot's cell, its store at
+          backend_path, served by the extent daemon (see memory_cell)

@@ -33,6 +33,59 @@ pub enum MemBackendType {
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// cladefs: guest memory is a memory cell of the snapshot's cell, its store the backend's
+    /// path, served by the extent daemon (TASK-456.3): its pages shared with every VM restored
+    /// from the same snapshot on the host, a page the guest stores to a private copy of its own.
+    /// `memory_cell` says where the snapshot's memory is and which daemon serves it.
+    #[cfg(feature = "cladefs")]
+    Cell,
+}
+
+/// cladefs: writes a VM's guest memory straight into a memory cell during `/snapshot/create`
+/// (TASK-456.4), instead of writing a local memory file.
+///
+/// For a VM restored from a memory cell (`MemBackendType::Cell`), omit both fields: Firecracker
+/// writes only the window's private pages into the VM's already-open forked memory cell, commits,
+/// reclaims them back to the newly committed extents, and makes a version.
+///
+/// For a VM not backed by a memory cell (e.g., cold-booted anonymous RAM), supply both
+/// `path_on_host` and `cladefsd_socket`: Firecracker creates a new memory cell there, writes only
+/// resident non-zero pages, commits, and makes a version.
+#[cfg(feature = "cladefs")]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateMemoryCellConfig {
+    /// The new memory cell's directory on host (required when not restored from a memory cell;
+    /// must be omitted when restored from a memory cell).
+    #[serde(default)]
+    pub path_on_host: Option<PathBuf>,
+    /// The extent daemon's socket (required when not restored from a memory cell; must be omitted
+    /// when restored from a memory cell).
+    #[serde(default)]
+    pub cladefsd_socket: Option<PathBuf>,
+    /// When true, creates a standalone host-local ephemeral memory cell on cold-boot suspend
+    /// (zero bucket uploads, no version created). On a VM already restored from an ephemeral
+    /// memory cell, may be omitted (`false`) or set to `true` to re-suspend in place; setting
+    /// `true` on a bucket-backed restored memory cell is refused.
+    #[serde(default)]
+    pub ephemeral: bool,
+}
+
+/// cladefs: the memory cell created or checkpointed by `/snapshot/create` with `memory_cell`
+/// (TASK-456.4), returned as the HTTP 200 JSON body so callers can pass it to `/snapshot/load`.
+#[cfg(feature = "cladefs")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCellSnapshot {
+    /// The memory cell's tenant.
+    pub tenant: u64,
+    /// The memory cell, by its ID.
+    pub cell: u64,
+    /// The version of the memory cell created by this snapshot (0 for host-local ephemeral
+    /// memory cells).
+    pub version: u64,
+    /// True when the memory cell is a host-local ephemeral cell (zero bucket uploads).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -46,11 +99,21 @@ pub struct CreateSnapshotParams {
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
+    #[cfg(not(feature = "cladefs"))]
     pub mem_file_path: PathBuf,
+    /// Path to the file that will contain the guest memory. Mutually exclusive with `memory_cell`.
+    #[cfg(feature = "cladefs")]
+    #[serde(default)]
+    pub mem_file_path: Option<PathBuf>,
     /// Whether to fsync the snapshot state and guest memory files.
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]
     pub sync_snapshot_files: bool,
+    /// cladefs: write guest memory straight into a memory cell instead of `mem_file_path`
+    /// (TASK-456.4). Mutually exclusive with `mem_file_path`.
+    #[cfg(feature = "cladefs")]
+    #[serde(default)]
+    pub memory_cell: Option<CreateMemoryCellConfig>,
 }
 
 /// Default value for [CreateSnapshotParams::sync_snapshot_files].
@@ -66,6 +129,47 @@ pub struct NetworkOverride {
     pub iface_id: String,
     /// The new name of the interface to be assigned
     pub host_dev_name: String,
+}
+
+/// cladefs: has an extent-store device restored from a snapshot open the store at `path_on_host`,
+/// forked from the snapshot's version of its cell if it doesn't exist, rather than the store the
+/// snapshotted VM had: a store of its own for each VM restored from one snapshot (TASK-39.1), on
+/// any host, served by the extent daemon at `cladefsd_socket`.
+#[cfg(feature = "cladefs")]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CladefsOverride {
+    /// The ID of the extent-store device to modify.
+    pub id: String,
+    /// The store's directory.
+    pub path_on_host: String,
+    /// The extent daemon's socket, if not the snapshotted VM's.
+    #[serde(default)]
+    pub cladefsd_socket: Option<String>,
+}
+
+/// cladefs: the memory cell a VM restored with `Cell` memory takes its memory from: either a
+/// bucket-backed cell forked from `(tenant, cell, version)` if it doesn't exist, or (when
+/// `ephemeral` is true) an existing host-local ephemeral memory cell reopened in place (`version`
+/// must be 0; `tenant`/`cell` optional to verify identity).
+#[cfg(feature = "cladefs")]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryCellConfig {
+    /// The snapshot's memory cell's tenant (optional when `ephemeral` is true and `cell` is 0).
+    #[serde(default)]
+    pub tenant: u64,
+    /// The memory cell, by its ID (optional when `ephemeral` is true).
+    #[serde(default)]
+    pub cell: u64,
+    /// The version of the memory cell the snapshot holds (must be 0 when `ephemeral` is true).
+    #[serde(default)]
+    pub version: u64,
+    /// The extent daemon's socket.
+    pub cladefsd_socket: PathBuf,
+    /// When true, reopen an existing host-local ephemeral memory cell in place without bucket I/O.
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 /// Allows for changing the host UDS of the vsock backend during snapshot restore
@@ -119,6 +223,12 @@ pub struct LoadSnapshotParams {
     pub network_overrides: Vec<NetworkOverride>,
     /// When set, the vsock backend UDS path will be overridden
     pub vsock_override: Option<VsockOverride>,
+    /// cladefs: the extent-store devices whose stores to override on load.
+    #[cfg(feature = "cladefs")]
+    pub cladefs_overrides: Vec<CladefsOverride>,
+    /// cladefs: with a `Cell` memory backend, the memory cell it takes its memory from.
+    #[cfg(feature = "cladefs")]
+    pub memory_cell: Option<MemoryCellConfig>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore,
     /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
     /// (default), kvmclock resumes from where it was at snapshot time.
@@ -157,6 +267,14 @@ pub struct LoadSnapshotConfig {
     /// Whether or not to override the vsock backend UDS path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
+    /// cladefs: the extent-store devices whose stores to override on load.
+    #[cfg(feature = "cladefs")]
+    #[serde(default)]
+    pub cladefs_overrides: Vec<CladefsOverride>,
+    /// cladefs: with a `Cell` memory backend, the memory cell it takes its memory from.
+    #[cfg(feature = "cladefs")]
+    #[serde(default)]
+    pub memory_cell: Option<MemoryCellConfig>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
     #[serde(default)]
     pub clock_realtime: bool,

@@ -37,8 +37,12 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
+#[cfg(feature = "cladefs")]
+use crate::vmm_config::snapshot::MemoryCellSnapshot;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
+#[cfg(feature = "cladefs")]
+use crate::vstate::memory::GuestMemoryExtension;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
@@ -160,13 +164,50 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// cladefs: cannot write guest memory into a memory cell: {0}
+    #[cfg(feature = "cladefs")]
+    MemoryCell(#[from] crate::cladefs_memory::CellMemoryError),
+    /// cladefs: snapshot requires either `mem_file_path` or `memory_cell`, not both or neither.
+    #[cfg(feature = "cladefs")]
+    InvalidMemoryTarget,
 }
 
 /// Snapshot version
 pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 /// Creates a Microvm snapshot.
+#[cfg(not(feature = "cladefs"))]
 pub fn create_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
+    write_snapshot(vmm, vm_info, params)
+}
+
+/// Creates a Microvm snapshot, returning the created memory cell's version if `memory_cell` was
+/// used in place of `mem_file_path` (TASK-456.4).
+#[cfg(feature = "cladefs")]
+pub fn create_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<Option<MemoryCellSnapshot>, CreateSnapshotError> {
+    // cladefs: the extent-store devices' stores first: a version of each one's cell, which the
+    // snapshot failing after drops, as no snapshot file names it then (TASK-575).
+    let taken = vmm
+        .take_extent_snapshots()
+        .map_err(CreateSnapshotError::MicrovmState)?;
+    let written = write_snapshot(vmm, vm_info, params);
+    if written.is_err() {
+        vmm.drop_extent_snapshots(&taken);
+    }
+    written
+}
+
+/// Writes a Microvm snapshot: its state, then its memory.
+#[cfg(not(feature = "cladefs"))]
+fn write_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
@@ -199,6 +240,63 @@ pub fn create_snapshot(
         .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
     Ok(())
+}
+
+/// Writes a Microvm snapshot: its state, then its memory (either to `mem_file_path` or straight
+/// into a memory cell, TASK-456.4).
+#[cfg(feature = "cladefs")]
+fn write_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<Option<MemoryCellSnapshot>, CreateSnapshotError> {
+    if params.mem_file_path.is_some() == params.memory_cell.is_some() {
+        return Err(CreateSnapshotError::InvalidMemoryTarget);
+    }
+
+    let microvm_state = vmm
+        .save_state(vm_info)
+        .map_err(CreateSnapshotError::MicrovmState)?;
+
+    snapshot_state_to_file(
+        &microvm_state,
+        &params.snapshot_path,
+        params.sync_snapshot_files,
+    )?;
+
+    let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+            "snapshot requires KVM".into(),
+        ))
+    })?;
+
+    let memory_snapshot = if let Some(ref cell_cfg) = params.memory_cell {
+        let snapshot = crate::cladefs_memory::snapshot_memory(kvm_vm.guest_memory(), cell_cfg)?;
+        if params.snapshot_type == crate::vmm_config::snapshot::SnapshotType::Full {
+            kvm_vm.reset_dirty_bitmap();
+            kvm_vm.guest_memory().reset_dirty();
+        }
+        Some(snapshot)
+    } else {
+        let mem_file_path = params
+            .mem_file_path
+            .as_ref()
+            .ok_or(CreateSnapshotError::InvalidMemoryTarget)?;
+        kvm_vm.snapshot_memory_to_file(
+            mem_file_path,
+            params.snapshot_type,
+            params.sync_snapshot_files,
+        )?;
+        None
+    };
+
+    // We need to mark queues as dirty again for all activated devices. The reason we
+    // do it here is that we don't mark pages as dirty during runtime
+    // for queue objects.
+    vmm.device_manager
+        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+
+    Ok(memory_snapshot)
 }
 
 fn snapshot_state_to_file(
@@ -371,6 +469,9 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     File(#[from] GuestMemoryFromFileError),
     /// Error creating guest memory from uffd: {0}
     Uffd(#[from] GuestMemoryFromUffdError),
+    /// cladefs: error restoring guest memory from a memory cell: {0}
+    #[cfg(feature = "cladefs")]
+    Cell(#[from] crate::cladefs_memory::CellMemoryError),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -422,6 +523,34 @@ pub fn restore_from_snapshot(
             .backend
             .uds_path
             .clone_from(&vsock_override.uds_path);
+    }
+
+    // cladefs: the stores the extent-store devices open, each forked from the snapshot's version of
+    // its cell if it doesn't exist.
+    #[cfg(feature = "cladefs")]
+    for entry in &params.cladefs_overrides {
+        let extent_devices = match &mut microvm_state.device_states.virtio_state {
+            VirtioDevicesState::Pci(pci_state) => Some(&mut pci_state.extent_devices),
+            VirtioDevicesState::Mmio(_) => None,
+        };
+        extent_devices
+            .and_then(|devices| {
+                devices
+                    .iter_mut()
+                    .map(|device| &mut device.device_state)
+                    .find(|state| state.device.config.id == entry.id)
+            })
+            .map(|state| {
+                state
+                    .device
+                    .config
+                    .path_on_host
+                    .clone_from(&entry.path_on_host);
+                if let Some(socket) = &entry.cladefsd_socket {
+                    state.device.config.cladefsd_socket.clone_from(socket);
+                }
+            })
+            .ok_or_else(|| SnapshotStateFromFileError::UnknownCladefsDevice(entry.id.clone()))?;
     }
 
     let track_dirty_pages = params.track_dirty_pages;
@@ -478,6 +607,22 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        // cladefs: from a memory cell of the snapshot's cell (TASK-456.3).
+        #[cfg(feature = "cladefs")]
+        MemBackendType::Cell => (
+            crate::cladefs_memory::guest_memory(
+                mem_backend_path,
+                params.memory_cell.as_ref(),
+                mem_state.regions(),
+                track_dirty_pages,
+                !matches!(
+                    vm_resources.machine_config.huge_pages,
+                    crate::vmm_config::machine_config::HugePageConfig::None
+                ),
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Cell)?,
+            None,
+        ),
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -503,6 +648,9 @@ pub enum SnapshotStateFromFileError {
     UnknownNetworkDevice,
     /// Unknown Vsock Device.
     UnknownVsockDevice,
+    /// cladefs: unknown extent-store device {0}.
+    #[cfg(feature = "cladefs")]
+    UnknownCladefsDevice(String),
 }
 
 fn snapshot_state_from_file(
