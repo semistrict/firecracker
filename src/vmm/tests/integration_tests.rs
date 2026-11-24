@@ -249,8 +249,15 @@ fn verify_create_snapshot(
     let snapshot_params = CreateSnapshotParams {
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
+        #[cfg(not(feature = "cladefs"))]
         mem_file_path: memory_file.as_path().to_path_buf(),
+        #[cfg(feature = "cladefs")]
+        mem_file_path: Some(memory_file.as_path().to_path_buf()),
         sync_snapshot_files: true,
+        #[cfg(feature = "cladefs")]
+        memory_cell: None,
+        #[cfg(feature = "cladefs")]
+        for_migration: false,
     };
 
     controller
@@ -317,6 +324,10 @@ fn verify_load_snapshot(
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages,
         }))
@@ -389,6 +400,10 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
         }))
@@ -462,6 +477,10 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         resume_vm: false,
         network_overrides: vec![],
         vsock_override: None,
+        #[cfg(feature = "cladefs")]
+        cladefs_overrides: vec![],
+        #[cfg(feature = "cladefs")]
+        memory_cell: None,
         clock_realtime: false,
         huge_pages: SnapshotLoadHugePageConfig::Snapshot,
     });
