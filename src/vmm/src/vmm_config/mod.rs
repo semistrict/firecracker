@@ -13,6 +13,9 @@ use crate::vmm_config::pmem::PmemConfig;
 pub mod balloon;
 /// Wrapper for configuring the microVM boot source.
 pub mod boot_source;
+/// Wrapper for configuring cladefs's extent-store devices attached to the microVM.
+#[cfg(feature = "cladefs")]
+pub mod cladefs;
 /// Wrapper for configuring the block devices.
 pub mod drive;
 /// Wrapper for enclave-specific configuration.

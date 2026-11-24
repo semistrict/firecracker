@@ -276,8 +276,13 @@ mod tests {
             Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
                 snapshot_type: SnapshotType::Diff,
                 snapshot_path: PathBuf::new(),
+                #[cfg(not(feature = "cladefs"))]
                 mem_file_path: PathBuf::new(),
+                #[cfg(feature = "cladefs")]
+                mem_file_path: Some(PathBuf::new()),
                 sync_snapshot_files: true,
+                #[cfg(feature = "cladefs")]
+                memory_cell: None,
             })),
             start_time_us,
         );
@@ -290,8 +295,13 @@ mod tests {
             Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
                 snapshot_type: SnapshotType::Diff,
                 snapshot_path: PathBuf::new(),
+                #[cfg(not(feature = "cladefs"))]
                 mem_file_path: PathBuf::new(),
+                #[cfg(feature = "cladefs")]
+                mem_file_path: Some(PathBuf::new()),
                 sync_snapshot_files: true,
+                #[cfg(feature = "cladefs")]
+                memory_cell: None,
             })),
             start_time_us,
         );

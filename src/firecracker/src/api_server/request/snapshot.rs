@@ -54,6 +54,20 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
+    #[cfg(feature = "cladefs")]
+    match (&snapshot_config.mem_file_path, &snapshot_config.memory_cell) {
+        (Some(_), Some(_)) => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                "too many fields: either `mem_file_path` or `memory_cell` exclusively is required",
+            )));
+        }
+        (None, None) => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                "missing field: either `mem_file_path` or `memory_cell` is required",
+            )));
+        }
+        _ => {}
+    }
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
@@ -111,6 +125,10 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         vsock_override: snapshot_config.vsock_override,
+        #[cfg(feature = "cladefs")]
+        cladefs_overrides: snapshot_config.cladefs_overrides,
+        #[cfg(feature = "cladefs")]
+        memory_cell: snapshot_config.memory_cell,
         clock_realtime: snapshot_config.clock_realtime,
         huge_pages: snapshot_config.huge_pages,
     };
@@ -149,8 +167,13 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
+            #[cfg(not(feature = "cladefs"))]
             mem_file_path: PathBuf::from("bar"),
+            #[cfg(feature = "cladefs")]
+            mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: true,
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -166,8 +189,13 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
+            #[cfg(not(feature = "cladefs"))]
             mem_file_path: PathBuf::from("bar"),
+            #[cfg(feature = "cladefs")]
+            mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: false,
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -181,13 +209,74 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
+            #[cfg(not(feature = "cladefs"))]
             mem_file_path: PathBuf::from("bar"),
+            #[cfg(feature = "cladefs")]
+            mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: true,
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
             VmmAction::CreateSnapshot(expected_config)
         );
+
+        #[cfg(feature = "cladefs")]
+        {
+            use vmm::vmm_config::snapshot::CreateMemoryCellConfig;
+            let body = r#"{
+                "snapshot_path": "foo",
+                "memory_cell": {}
+            }"#;
+            let expected_config = CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: PathBuf::from("foo"),
+                mem_file_path: None,
+                sync_snapshot_files: true,
+                memory_cell: Some(CreateMemoryCellConfig::default()),
+            };
+            assert_eq!(
+                vmm_action_from_request(
+                    parse_put_snapshot(&Body::new(body), Some("create")).unwrap()
+                ),
+                VmmAction::CreateSnapshot(expected_config)
+            );
+
+            let body = r#"{
+                "snapshot_path": "foo",
+                "memory_cell": {
+                    "path_on_host": "/cells/mem",
+                    "cladefsd_socket": "/run/cladefsd.sock"
+                }
+            }"#;
+            let expected_config = CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: PathBuf::from("foo"),
+                mem_file_path: None,
+                sync_snapshot_files: true,
+                memory_cell: Some(CreateMemoryCellConfig {
+                    path_on_host: Some(PathBuf::from("/cells/mem")),
+                    cladefsd_socket: Some(PathBuf::from("/run/cladefsd.sock")),
+                }),
+            };
+            assert_eq!(
+                vmm_action_from_request(
+                    parse_put_snapshot(&Body::new(body), Some("create")).unwrap()
+                ),
+                VmmAction::CreateSnapshot(expected_config)
+            );
+
+            // Both or neither of mem_file_path and memory_cell are refused.
+            let both = r#"{
+                "snapshot_path": "foo",
+                "mem_file_path": "bar",
+                "memory_cell": {}
+            }"#;
+            parse_put_snapshot(&Body::new(both), Some("create")).unwrap_err();
+            let neither = r#"{ "snapshot_path": "foo" }"#;
+            parse_put_snapshot(&Body::new(neither), Some("create")).unwrap_err();
+        }
 
         let invalid_body = r#"{
             "invalid_field": "foo",
@@ -213,6 +302,10 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
         };
@@ -246,6 +339,10 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
@@ -280,6 +377,10 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
@@ -322,6 +423,10 @@ mod tests {
                 host_dev_name: String::from("vmtap2"),
             }],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
@@ -352,6 +457,10 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             clock_realtime: false,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
