@@ -33,6 +33,12 @@ pub enum MemBackendType {
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// cladefs: guest memory is a memory cell of the snapshot's cell, its store the backend's
+    /// path, served by the extent daemon (TASK-456.3): its pages shared with every VM restored
+    /// from the same snapshot on the host, a page the guest stores to a private copy of its own.
+    /// `memory_cell` says where the snapshot's memory is and which daemon serves it.
+    #[cfg(feature = "cladefs")]
+    Cell,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -66,6 +72,41 @@ pub struct NetworkOverride {
     pub iface_id: String,
     /// The new name of the interface to be assigned
     pub host_dev_name: String,
+}
+
+/// cladefs: has an extent-store device restored from a snapshot open the store at `path_on_host`,
+/// forked from the snapshot's version of its cell if it doesn't exist, rather than the store the
+/// snapshotted VM had: a store of its own for each VM restored from one snapshot (TASK-39.1), on
+/// any host, served by the extent daemon at `cladefsd_socket`.
+#[cfg(feature = "cladefs")]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CladefsOverride {
+    /// The ID of the extent-store device to modify.
+    pub id: String,
+    /// The store's directory.
+    pub path_on_host: String,
+    /// The extent daemon's socket, if not the snapshotted VM's.
+    #[serde(default)]
+    pub cladefsd_socket: Option<String>,
+}
+
+/// cladefs: the memory cell a VM restored with `Cell` memory takes its memory from: its store,
+/// the backend's path, forked from the version `version` of the memory cell `cell` of `tenant`'s
+/// if it doesn't exist, on any host, as a disk's; served by the extent daemon at
+/// `cladefsd_socket` (TASK-456.3).
+#[cfg(feature = "cladefs")]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryCellConfig {
+    /// The snapshot's memory cell's tenant.
+    pub tenant: u64,
+    /// The memory cell, by its ID.
+    pub cell: u64,
+    /// The version of the memory cell the snapshot holds.
+    pub version: u64,
+    /// The extent daemon's socket.
+    pub cladefsd_socket: PathBuf,
 }
 
 /// Allows for changing the host UDS of the vsock backend during snapshot restore
@@ -119,6 +160,12 @@ pub struct LoadSnapshotParams {
     pub network_overrides: Vec<NetworkOverride>,
     /// When set, the vsock backend UDS path will be overridden
     pub vsock_override: Option<VsockOverride>,
+    /// cladefs: the extent-store devices whose stores to override on load.
+    #[cfg(feature = "cladefs")]
+    pub cladefs_overrides: Vec<CladefsOverride>,
+    /// cladefs: with a `Cell` memory backend, the memory cell it takes its memory from.
+    #[cfg(feature = "cladefs")]
+    pub memory_cell: Option<MemoryCellConfig>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore,
     /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
     /// (default), kvmclock resumes from where it was at snapshot time.
@@ -157,6 +204,14 @@ pub struct LoadSnapshotConfig {
     /// Whether or not to override the vsock backend UDS path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
+    /// cladefs: the extent-store devices whose stores to override on load.
+    #[cfg(feature = "cladefs")]
+    #[serde(default)]
+    pub cladefs_overrides: Vec<CladefsOverride>,
+    /// cladefs: with a `Cell` memory backend, the memory cell it takes its memory from.
+    #[cfg(feature = "cladefs")]
+    #[serde(default)]
+    pub memory_cell: Option<MemoryCellConfig>,
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
     #[serde(default)]
     pub clock_realtime: bool,
