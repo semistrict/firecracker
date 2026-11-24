@@ -61,7 +61,10 @@ pub fn gdb_thread(
 
     std::thread::Builder::new()
         .name("gdb".into())
-        .spawn(move || event_loop(connection, vmm, gdb_event_receiver, entry_addr))
+        .spawn(move || {
+            crate::signal_handler::install_signal_stack();
+            event_loop(connection, vmm, gdb_event_receiver, entry_addr)
+        })
         .map_err(|_| GdbTargetError::GdbThreadError)?;
 
     Ok(())

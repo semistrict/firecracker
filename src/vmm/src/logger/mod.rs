@@ -7,6 +7,7 @@
 mod logging;
 mod metrics;
 pub mod rate_limited;
+pub(crate) mod signal_safe;
 
 pub use log::{Level, log_enabled, trace};
 

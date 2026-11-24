@@ -3,6 +3,7 @@
 
 //! Auxiliary module for configuring the metrics system.
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -32,17 +33,23 @@ pub enum MetricsConfigError {
 
 /// Configures the metrics as described in `metrics_cfg`.
 pub fn init_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError> {
-    let writer = FcLineWriter::new(
-        open_file_nonblock(&metrics_cfg.metrics_path)
-            .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?,
-    );
+    let file = open_file_nonblock(&metrics_cfg.metrics_path)
+        .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?;
+    // The metrics' file, which stays open as long as the process, for the fatal signals'
+    // handlers to write their metric to, as they can't take the metrics' lock.
+    let fd = file.as_raw_fd();
     METRICS
-        .init(writer)
+        .init(FcLineWriter::new(file))
         .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?;
 
     if metrics_cfg.emit_id {
         METRICS.id.enable();
     }
+
+    crate::logger::signal_safe::set_metrics_meta(
+        metrics_cfg.emit_id,
+        metrics_cfg.properties.as_ref(),
+    );
 
     if let Some(properties) = metrics_cfg.properties {
         METRICS
@@ -50,6 +57,8 @@ pub fn init_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError
             .set(properties)
             .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?;
     }
+
+    crate::logger::signal_safe::set_metrics_fd(fd);
 
     Ok(())
 }

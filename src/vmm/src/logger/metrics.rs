@@ -139,21 +139,20 @@ impl<T: Serialize + Debug, M: Write + Send + Debug> Metrics<T, M> {
     /// is not meant to be used in a multithreaded scenario. The reason
     /// `metrics_buf` is enclosed in a `Mutex` is that `lazy_static` enforces
     /// thread-safety on all its members.
-    /// The only exception is for signal handlers that result in process exit, which may be run on
-    /// any thread. To prevent the race condition present in the serialisation step of
-    /// SharedIncMetrics, deadly signals use SharedStoreMetrics instead (which have a thread-safe
-    /// serialise implementation).
-    /// The only known caveat is that other metrics may not be properly written before exiting from
-    /// a signal handler. We make this compromise since the process will be killed anyway and the
-    /// important metric in this case is the signal one.
-    /// The alternative is to hold a Mutex over the entire function call, but this increases the
-    /// known deadlock potential.
+    /// Signal handlers don't call it: it takes the metrics' lock and allocates, which a
+    /// handler interrupting a thread that holds the lock, or the allocator's, would wait for ever
+    /// for. They write a line of their signal's metric alone (`logger::signal_safe`), to the same
+    /// file: so each record is serialized whole first, then handed to the writer at once, a line
+    /// ending in its newline, which a `LineWriter` writes through in one `write(2)`. Serialized into
+    /// the writer, a record longer than its buffer was flushed in parts, and a fatal signal between
+    /// them appended its line to the unfinished one, which no reader could parse.
     pub fn write(&self) -> Result<bool, MetricsError> {
         if let Some(lock) = self.metrics_buf.get() {
-            let mut writer = lock.lock().expect("poisoned lock");
-            serde_json::to_writer(writer.by_ref(), &self.app_metrics)
+            let mut record = serde_json::to_vec(&self.app_metrics)
                 .map_err(|err| MetricsError::Serde(err.to_string()))?;
-            writer.write_all(b"\n").map_err(MetricsError::Write)?;
+            record.push(b'\n');
+            let mut writer = lock.lock().expect("poisoned lock");
+            writer.write_all(&record).map_err(MetricsError::Write)?;
             Ok(true)
         } else {
             // If the metrics are not initialized, no error is thrown but we do let the user know
@@ -1099,6 +1098,39 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+
+    /// A writer that keeps each write it is given, apart.
+    #[derive(Debug, Default)]
+    struct Writes(Vec<Vec<u8>>);
+
+    impl Write for Writes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Each record reaches the writer whole, in one write, a line: a fatal signal's handler writes
+    // its own line to the same file, which a record flushed in parts would leave it appended to,
+    // past an unfinished one.
+    #[test]
+    fn test_records_written_whole() {
+        let m = &Metrics::<_, Writes>::new(FirecrackerMetrics::new());
+        m.init(Writes::default()).unwrap();
+        m.write().unwrap();
+        m.write().unwrap();
+        let writes = &m.metrics_buf.get().unwrap().lock().unwrap().0;
+        assert_eq!(writes.len(), 2, "{} writes", writes.len());
+        for record in writes {
+            assert_eq!(record.last(), Some(&b'\n'));
+            assert_eq!(record.iter().filter(|&&byte| byte == b'\n').count(), 1);
+            serde_json::from_slice::<serde_json::Value>(record).unwrap();
+        }
+    }
 
     #[test]
     fn test_init() {
