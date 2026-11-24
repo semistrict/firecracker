@@ -93,6 +93,13 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
     /// - self.avail_features() & self.acked_features() = self.get_acked_features()
     fn set_acked_features(&mut self, acked_features: u64);
 
+    /// Feature bits acked by the device itself (for its backend protocol, not negotiated by the
+    /// guest driver) that must stay set when the guest rewrites a features page or resets the
+    /// device.
+    fn device_acked_features(&self) -> u64 {
+        0
+    }
+
     /// Check if virtio device has negotiated given feature.
     fn has_feature(&self, feature: u64) -> bool {
         (self.acked_features() & (1 << feature)) != 0
@@ -151,14 +158,23 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
         }
     }
 
-    /// Acknowledges that this set of features should be enabled.
+    /// Acknowledges that this set of features should be enabled: the page's features, in place of
+    /// those the driver wrote to it before, while preserving [`Self::device_acked_features`]. A
+    /// driver may write a page again before `FEATURES_OK`, as Linux does once a driver's
+    /// `validate` has cleared some, and ORing the writes kept the features it had cleared acked.
     fn ack_features_by_page(&mut self, page: u32, value: u32) {
-        let mut v = match page {
-            0 => u64::from(value),
-            1 => u64::from(value) << 32,
+        let (mut v, kept) = match page {
+            0 => (
+                u64::from(value),
+                self.acked_features() & !u64::from(u32::MAX),
+            ),
+            1 => (
+                u64::from(value) << 32,
+                self.acked_features() & u64::from(u32::MAX),
+            ),
             _ => {
                 warn!("Cannot acknowledge unknown features page: {}", page);
-                0u64
+                (0u64, self.acked_features())
             }
         };
 
@@ -170,7 +186,8 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
             // Don't count these features as acked.
             v &= !unrequested_features;
         }
-        self.set_acked_features(self.acked_features() | v);
+        let own = self.device_acked_features() & avail_features;
+        self.set_acked_features(kept | v | own);
     }
 
     /// Returns the full device-specific configuration as a byte slice.
@@ -214,7 +231,7 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
             return false;
         }
         self.deactivate();
-        self.set_acked_features(0);
+        self.set_acked_features(self.device_acked_features() & self.avail_features());
         for queue in self.queues_mut() {
             *queue = Queue::new(queue.max_size);
         }
@@ -299,6 +316,7 @@ pub(crate) mod tests {
     struct MockVirtioDevice {
         avail_features: u64,
         acked_features: u64,
+        device_acked_features: u64,
         config: Vec<u8>,
     }
 
@@ -324,6 +342,10 @@ pub(crate) mod tests {
 
         fn set_acked_features(&mut self, acked_features: u64) {
             self.acked_features = acked_features
+        }
+
+        fn device_acked_features(&self) -> u64 {
+            self.device_acked_features
         }
 
         fn queues(&self) -> &[Queue] {
@@ -376,6 +398,7 @@ pub(crate) mod tests {
         let mut device = MockVirtioDevice {
             avail_features: 0,
             acked_features: 0,
+            device_acked_features: 0,
             config: vec![],
         };
 
@@ -398,6 +421,7 @@ pub(crate) mod tests {
         let mut device = MockVirtioDevice {
             avail_features: features,
             acked_features: 0,
+            device_acked_features: 0,
             config: vec![],
         };
 
@@ -417,11 +441,61 @@ pub(crate) mod tests {
         assert_eq!(device.acked_features, features);
     }
 
+    /// A page written again replaces what it said, as Linux writes it once more after a driver's
+    /// `validate` clears features; the other page keeps its own.
+    #[test]
+    fn test_features_written_again() {
+        let mut device = MockVirtioDevice {
+            avail_features: u64::MAX,
+            acked_features: 0,
+            device_acked_features: 0,
+            config: vec![],
+        };
+        device.ack_features_by_page(0, 0b1100);
+        device.ack_features_by_page(1, 0b1);
+        device.ack_features_by_page(0, 0b0100);
+        assert_eq!(device.acked_features, (1 << 32) | 0b0100);
+        device.ack_features_by_page(1, 0);
+        assert_eq!(device.acked_features, 0b0100);
+    }
+
+    /// Device-acked features (e.g. `VhostUserVirtioFeatures::PROTOCOL_FEATURES` on page 0) stay
+    /// acked across guest page writes and rewrites, while guest-cleared features are still cleared
+    /// and unavailable bits remain masked off.
+    #[test]
+    fn test_features_written_again_preserves_device_acked_features() {
+        let own_p0 = 1u64 << 30;
+        let own_p1 = 1u64 << 40;
+        let unavailable_own = 1u64 << 31;
+        let mut device = MockVirtioDevice {
+            avail_features: own_p0 | own_p1 | (1 << 32) | 0b1100,
+            acked_features: own_p0 | own_p1,
+            device_acked_features: own_p0 | own_p1 | unavailable_own,
+            config: vec![],
+        };
+
+        device.ack_features_by_page(0, 0b1100);
+        assert_eq!(device.acked_features, own_p0 | own_p1 | 0b1100);
+
+        device.ack_features_by_page(1, 0b1);
+        assert_eq!(device.acked_features, own_p0 | own_p1 | (1 << 32) | 0b1100);
+
+        // Rewrite page 0 clearing bit 3: guest bit clears, device-acked bit 30 stays set.
+        device.ack_features_by_page(0, 0b0100);
+        assert_eq!(device.acked_features, own_p0 | own_p1 | (1 << 32) | 0b0100);
+
+        // Rewrite both pages to 0: only available device-acked bits remain.
+        device.ack_features_by_page(0, 0);
+        device.ack_features_by_page(1, 0);
+        assert_eq!(device.acked_features, own_p0 | own_p1);
+    }
+
     #[test]
     fn test_read_config_default() {
         let device = MockVirtioDevice {
             avail_features: 0,
             acked_features: 0,
+            device_acked_features: 0,
             config: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22],
         };
 
@@ -454,6 +528,7 @@ pub(crate) mod tests {
         let empty_device = MockVirtioDevice {
             avail_features: 0,
             acked_features: 0,
+            device_acked_features: 0,
             config: vec![],
         };
         let mut buf = [0xFF; 4];

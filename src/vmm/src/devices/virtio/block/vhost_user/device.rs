@@ -316,6 +316,10 @@ where
         self.acked_features = acked_features;
     }
 
+    fn device_acked_features(&self) -> u64 {
+        self.avail_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+    }
+
     fn queues(&self) -> &[Queue] {
         &self.queues
     }
@@ -542,7 +546,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
             socket: tmp_socket_path.clone(),
         };
-        let vhost_block = VhostUserBlockImpl::<MockMaster>::new(vhost_block_config).unwrap();
+        let mut vhost_block = VhostUserBlockImpl::<MockMaster>::new(vhost_block_config).unwrap();
 
         // If backend has no features, nothing should be negotiated and
         // no flags should be set.
@@ -571,6 +575,10 @@ mod tests {
         assert!(!vhost_block.root_device);
         assert!(!vhost_block.read_only);
         assert_eq!(vhost_block.config_space, Vec::<u8>::new());
+
+        // Rewriting page 0 when the backend offered no features must not set PROTOCOL_FEATURES.
+        vhost_block.ack_features_by_page(0, 0);
+        assert_eq!(vhost_block.acked_features(), 0);
     }
 
     #[test]
@@ -860,5 +868,170 @@ mod tests {
         assert!(unsafe { *vhost_block.vu_handle.vu.memory_is_set.get() });
         assert!(unsafe { *vhost_block.vu_handle.vu.vring_enabled.get() });
         assert!(vhost_block.is_activated());
+    }
+
+    #[test]
+    fn test_ack_features_by_page_preserves_protocol_features() {
+        struct MockMaster {
+            backend_features: u64,
+            set_features_arg: std::cell::Cell<Option<u64>>,
+        }
+
+        impl VhostUserHandleBackend for MockMaster {
+            fn from_stream(_sock: UnixStream, _max_queue_num: u64) -> Self {
+                Self {
+                    backend_features: AVAILABLE_FEATURES | (1 << VIRTIO_BLK_F_FLUSH),
+                    set_features_arg: std::cell::Cell::new(None),
+                }
+            }
+
+            fn set_owner(&self) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_hdr_flags(&self, _flags: VhostUserHeaderFlag) {}
+
+            fn get_features(&self) -> Result<u64, vhost::Error> {
+                Ok(self.backend_features)
+            }
+
+            fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures, vhost::Error> {
+                Ok(VhostUserProtocolFeatures::CONFIG)
+            }
+
+            fn set_protocol_features(
+                &mut self,
+                _features: VhostUserProtocolFeatures,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn get_config(
+                &mut self,
+                _offset: u32,
+                _size: u32,
+                _flags: VhostUserConfigFlags,
+                _buf: &[u8],
+            ) -> Result<(VhostUserConfig, VhostUserConfigPayload), vhost::Error> {
+                Ok((VhostUserConfig::default(), vec![]))
+            }
+
+            fn set_features(&self, features: u64) -> Result<(), vhost::Error> {
+                self.set_features_arg.set(Some(features));
+                Ok(())
+            }
+
+            fn set_mem_table(
+                &self,
+                _regions: &[VhostUserMemoryRegionInfo],
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_num(&self, _queue_index: usize, _num: u16) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_addr(
+                &self,
+                _queue_index: usize,
+                _config_data: &VringConfigData,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_base(&self, _queue_index: usize, _base: u16) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_call(
+                &self,
+                _queue_index: usize,
+                _fd: &EventFd,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_kick(
+                &self,
+                _queue_index: usize,
+                _fd: &EventFd,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_enable(
+                &mut self,
+                _queue_index: usize,
+                _enable: bool,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+        }
+
+        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
+            fn process(&mut self, _: Events, _: &mut EventOps) {}
+            fn init(&mut self, _: &mut EventOps) {}
+        }
+
+        let proto = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let ro = 1u32 << VIRTIO_BLK_F_RO;
+        let flush = 1u32 << VIRTIO_BLK_F_FLUSH;
+        let version_1_p1 = 1u32 << (VIRTIO_F_VERSION_1 - 32);
+
+        let (_tmp_dir, tmp_socket_path) = create_tmp_socket();
+        let config = VhostUserBlockConfig {
+            drive_id: "test_drive".to_string(),
+            partuuid: None,
+            is_root_device: false,
+            cache_type: CacheType::Writeback,
+            socket: tmp_socket_path,
+        };
+        let mut vhost_block = VhostUserBlockImpl::<MockMaster>::new(config).unwrap();
+        assert_eq!(vhost_block.acked_features(), proto);
+
+        // Guest negotiates page 0 (never setting PROTOCOL_FEATURES) and page 1.
+        vhost_block.ack_features_by_page(0, ro | flush);
+        vhost_block.ack_features_by_page(1, version_1_p1);
+        assert_eq!(
+            vhost_block.acked_features(),
+            proto | u64::from(ro | flush) | (1u64 << VIRTIO_F_VERSION_1)
+        );
+
+        // Guest rewrites page 0 clearing VIRTIO_BLK_F_FLUSH: guest bit clears, PROTOCOL_FEATURES stays.
+        vhost_block.ack_features_by_page(0, ro);
+        assert_eq!(
+            vhost_block.acked_features(),
+            proto | u64::from(ro) | (1u64 << VIRTIO_F_VERSION_1)
+        );
+
+        // Clearing all guest page-0 bits still preserves PROTOCOL_FEATURES and page 1.
+        vhost_block.ack_features_by_page(0, 0);
+        assert_eq!(
+            vhost_block.acked_features(),
+            proto | (1u64 << VIRTIO_F_VERSION_1)
+        );
+
+        // Re-negotiate RO before activate so activate passes both guest and device-acked bits.
+        vhost_block.ack_features_by_page(0, ro);
+        assert_eq!(
+            vhost_block.acked_features(),
+            proto | u64::from(ro) | (1u64 << VIRTIO_F_VERSION_1)
+        );
+
+        // Activate passes PROTOCOL_FEATURES along with the negotiated guest features to the backend.
+        let region_size = 0x10000;
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(region_size as u64).unwrap();
+        let guest_memory = create_mem(file, &[(GuestAddress(0x0), region_size)]);
+        let q = VirtQueue::new(GuestAddress(0), &guest_memory, 16);
+        vhost_block.queues[0] = q.create_queue();
+        vhost_block
+            .activate(guest_memory, default_interrupt())
+            .unwrap();
+        assert_eq!(
+            vhost_block.vu_handle.vu.set_features_arg.get(),
+            Some(proto | u64::from(ro) | (1u64 << VIRTIO_F_VERSION_1))
+        );
     }
 }

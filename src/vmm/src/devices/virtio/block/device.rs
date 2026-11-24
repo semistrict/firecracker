@@ -161,6 +161,13 @@ impl VirtioDevice for Block {
         }
     }
 
+    fn device_acked_features(&self) -> u64 {
+        match self {
+            Self::Virtio(b) => b.device_acked_features(),
+            Self::VhostUser(b) => b.device_acked_features(),
+        }
+    }
+
     fn queues(&self) -> &[Queue] {
         match self {
             Self::Virtio(b) => &b.queues,

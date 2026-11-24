@@ -389,7 +389,8 @@ impl NeTransport {
 
         // Set acked features from the mirror.
         let avail = locked_device.avail_features();
-        locked_device.set_acked_features(driver_features & avail);
+        let own = locked_device.device_acked_features();
+        locked_device.set_acked_features((driver_features | own) & avail);
 
         // Configure each queue from the mirror. In the enclave model the guest's
         // negotiated queue config arrives via the info-page mirror rather than
