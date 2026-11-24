@@ -50,7 +50,6 @@ mod tests {
             dax_window_size: Some(64 << 20),
             dax_private_max_bytes: None,
             cladefsd_socket: "/cladefsd.sock".into(),
-            read_only: false,
             cache_type: vmm::vmm_config::cladefs::CacheType::Writeback,
         };
         assert_eq!(

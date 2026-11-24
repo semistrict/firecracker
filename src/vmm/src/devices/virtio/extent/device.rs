@@ -401,8 +401,7 @@ impl VirtioDevice for Extent {
         self.device_state = DeviceState::Inactive;
     }
 
-    // cladefs: the worker stops, and the device is as before the driver activated it: a
-    // follower's, its store opened anew as it is activated again.
+    // cladefs: the worker stops, and the device is as before the driver activated it.
     fn _reset(&mut self) -> bool {
         // cladefs: as activation, on a thread under the VMM's seccomp filter, rather than the vCPU's
         // whose MMIO write resets the device (TASK-50.1).
@@ -447,7 +446,7 @@ mod tests {
         assert_eq!(
             refused,
             "Extent device: the driver took features 0x120000001 of the 0x120000011 offered, \
-             where a driver of protocol version 1 takes every one: it is of another"
+             where a driver of protocol version 2 takes every one: it is of another"
         );
     }
 }
