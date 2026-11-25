@@ -5,7 +5,7 @@ use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -402,24 +402,27 @@ impl CgroupV2 {
     }
 
     // Returns controllers that can be enabled from the cgroup path specified
-    // by the mount_point parameter
-    fn detect_available_controllers<P>(mount_point: P) -> HashSet<String>
+    // by the mount_point parameter. A hierarchy with no cgroup.controllers
+    // file has none; one whose file cannot be opened or read is an error,
+    // rather than taken for a hierarchy with no controllers.
+    fn detect_available_controllers<P>(mount_point: P) -> Result<HashSet<String>, JailerError>
     where
         P: AsRef<Path> + Debug,
     {
         let mut controllers = HashSet::new();
         let controller_list_file = mount_point.as_ref().join("cgroup.controllers");
-        let f = match File::open(controller_list_file) {
+        let f = match File::open(&controller_list_file) {
             Ok(f) => f,
-            Err(_) => return controllers,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(controllers),
+            Err(err) => return Err(JailerError::FileOpen(controller_list_file, err)),
         };
 
-        for l in BufReader::new(f).lines().map_while(Result::ok) {
-            for controller in l.split(' ') {
-                controllers.insert(controller.to_string());
-            }
+        for line in BufReader::new(f).lines() {
+            let line =
+                line.map_err(|err| JailerError::ReadLine(controller_list_file.clone(), err))?;
+            controllers.extend(line.split_whitespace().map(str::to_string));
         }
-        controllers
+        Ok(controllers)
     }
 
     // Create a new cgroupsv2 controller
@@ -433,7 +436,7 @@ impl CgroupV2 {
                 properties: Vec::new(),
                 location: path,
             },
-            available_controllers: Self::detect_available_controllers(unified_path),
+            available_controllers: Self::detect_available_controllers(unified_path)?,
         })
     }
 }
@@ -601,6 +604,7 @@ pub mod test_util {
 mod tests {
     use std::fmt::Debug;
     use std::io::{BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use vmm_sys_util::tempdir::TempDir;
@@ -728,6 +732,73 @@ mod tests {
                 )
                 .unwrap_err();
         }
+    }
+
+    // The error CgroupV2::new returns for the cgroup v2 hierarchy at `unified`, which must be
+    // `kind`'s, of `path`, with `errno`.
+    fn cgroup_v2_error(unified: &Path, kind: &str, path: &Path, errno: i32) {
+        let err = CgroupV2::new("101", Path::new("fc_test_cg"), unified).unwrap_err();
+        let (got_kind, got_path, got_err) = match &err {
+            JailerError::FileOpen(path, err) => ("FileOpen", path, err),
+            JailerError::ReadLine(path, err) => ("ReadLine", path, err),
+            other => panic!("expected JailerError::{kind}, got {other:?}"),
+        };
+        assert_eq!((got_kind, got_path.as_path()), (kind, path), "{err:?}");
+        assert_eq!(got_err.raw_os_error(), Some(errno), "{err:?}");
+    }
+
+    #[test]
+    fn test_cgroup_v2_controllers_absent() {
+        // No cgroup.controllers: a hierarchy with no controllers, none of which can be asked for.
+        let dir = TempDir::new().unwrap();
+        let mut cgroup = CgroupV2::new("101", Path::new("fc_test_cg"), dir.as_path()).unwrap();
+        let err = cgroup
+            .add_property("cpuset.mems".to_string(), "0".to_string())
+            .unwrap_err();
+        assert!(
+            matches!(&err, JailerError::CgroupControllerUnavailable(c) if c == "cpuset"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_cgroup_v2_controllers_unopenable() {
+        // The hierarchy's path a file: opening cgroup.controllers under it fails with ENOTDIR.
+        let file = TempFile::new().unwrap();
+        let controllers = file.as_path().join("cgroup.controllers");
+        cgroup_v2_error(file.as_path(), "FileOpen", &controllers, libc::ENOTDIR);
+    }
+
+    #[test]
+    fn test_cgroup_v2_controllers_unreadable() {
+        // A directory at cgroup.controllers opens, but reading it fails with EISDIR.
+        let dir = TempDir::new().unwrap();
+        let controllers = dir.as_path().join("cgroup.controllers");
+        fs::create_dir(&controllers).unwrap();
+        cgroup_v2_error(dir.as_path(), "ReadLine", &controllers, libc::EISDIR);
+    }
+
+    #[test]
+    fn test_cgroup_v2_controllers_forbidden() {
+        // A cgroup.controllers the jailer may not read (EACCES) fails CgroupV2::new, rather than
+        // passing for no controllers and failing the property later as
+        // CgroupControllerUnavailable.
+        let mut mock_cgroups = MockCgroupFs::new().unwrap();
+        mock_cgroups.add_v2_mounts().unwrap();
+        let unified = mock_cgroups.sys_cgroups_path.join("unified");
+        let controllers = unified.join("cgroup.controllers");
+        fs::set_permissions(&controllers, fs::Permissions::from_mode(0o000)).unwrap();
+        // On a thread of its own, as nobody's filesystem user if it may be one (root), which
+        // drops root's reading of a file whatever its mode; another user's is the file's owner,
+        // whom its mode forbids too.
+        std::thread::spawn(move || {
+            // SAFETY: setfsuid changes the calling thread's filesystem user alone, which this
+            // thread keeps until it ends; it reads or writes no memory of the caller's.
+            unsafe { libc::setfsuid(65534) };
+            cgroup_v2_error(&unified, "FileOpen", &controllers, libc::EACCES);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
