@@ -448,6 +448,15 @@ where
 
     /// Notify the connection about an event (or set of events) that it was interested in.
     fn notify(&mut self, evset: EventSet) {
+        if self.state == ConnState::Killed {
+            return;
+        }
+
+        if evset.contains(EventSet::ERROR) {
+            self.kill();
+            return;
+        }
+
         if evset.contains(EventSet::IN) {
             // Data can be read from the host stream. Setting a Rw pending indication, so that
             // the muxer will know to call `recv_pkt()` later.
@@ -493,6 +502,25 @@ where
                 // If we've freed up some more buffer space, we may need to let the peer know it
                 // can safely send more data our way.
                 self.pending_rx.insert(PendingRx::CreditUpdate);
+            }
+        }
+
+        // Epoll reports HANG_UP even when neither IN nor OUT was requested (or delivered).
+        // Handle it so the level-triggered nested epoll FD cannot busy-spin on a hung-up stream.
+        if evset.contains(EventSet::HANG_UP)
+            && self.state != ConnState::Killed
+            && !evset.contains(EventSet::IN)
+            && !evset.contains(EventSet::OUT)
+        {
+            if !self.tx_buf.is_empty() {
+                self.kill();
+            } else if matches!(
+                self.state,
+                ConnState::Established | ConnState::PeerClosed(false, _)
+            ) {
+                self.pending_rx.insert(PendingRx::Rw);
+            } else {
+                self.kill();
             }
         }
     }
@@ -582,7 +610,9 @@ where
     /// connection is asked to yield a packet, via `recv_pkt()`).
     pub fn kill(&mut self) {
         self.state = ConnState::Killed;
-        self.pending_rx.insert(PendingRx::Rst);
+        // Drop any other pending RX indications (Rw, Response, Request, CreditUpdate) so the
+        // connection yields only an RST and has no stale pending RX after that RST is sent.
+        self.pending_rx = PendingRxSet::from(PendingRx::Rst);
         // We're sending an RST, so anything still buffered for the host is forfeit.
         self.tx_buf.clear();
     }
@@ -1434,5 +1464,62 @@ mod tests {
         assert!(ctx.conn.has_pending_rx());
         ctx.recv();
         assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RST);
+    }
+
+    #[test]
+    fn test_kill_clears_other_pending_rx() {
+        let mut ctx = CsmTestContext::new_established();
+        ctx.notify_epollin();
+        ctx.conn.insert_credit_update();
+        assert!(ctx.conn.pending_rx.contains(PendingRx::Rw));
+        assert!(ctx.conn.pending_rx.contains(PendingRx::CreditUpdate));
+
+        ctx.conn.kill();
+        assert_eq!(ctx.conn.state, ConnState::Killed);
+        assert!(ctx.conn.pending_rx.contains(PendingRx::Rst));
+        assert!(!ctx.conn.pending_rx.contains(PendingRx::Rw));
+        assert!(!ctx.conn.pending_rx.contains(PendingRx::CreditUpdate));
+
+        ctx.recv();
+        assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RST);
+        assert!(!ctx.conn.has_pending_rx());
+    }
+
+    #[test]
+    fn test_notify_killed_and_error_hup() {
+        // Killed connections must ignore further epoll notifications.
+        let mut ctx = CsmTestContext::new_established();
+        ctx.conn.kill();
+        ctx.conn
+            .notify(EventSet::IN | EventSet::OUT | EventSet::HANG_UP);
+        assert!(!ctx.conn.pending_rx.contains(PendingRx::Rw));
+        assert_eq!(ctx.conn.get_polled_evset(), EventSet::empty());
+
+        // EPOLLERR kills the connection so it stops being polled.
+        let mut ctx = CsmTestContext::new_established();
+        ctx.conn.notify(EventSet::ERROR);
+        assert_eq!(ctx.conn.state, ConnState::Killed);
+        assert_eq!(ctx.conn.get_polled_evset(), EventSet::empty());
+        ctx.recv();
+        assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RST);
+
+        // EPOLLHUP without IN/OUT on an established connection with buffered TX kills it.
+        let mut ctx = CsmTestContext::new_established();
+        let mut stream = TestStream::new();
+        stream.write_state = StreamState::WouldBlock;
+        ctx.set_stream(stream);
+        ctx.init_data_tx_pkt(&[1, 2, 3, 4]);
+        ctx.send();
+        assert!(!ctx.conn.tx_buf.is_empty());
+        ctx.conn.notify(EventSet::HANG_UP);
+        assert_eq!(ctx.conn.state, ConnState::Killed);
+        assert_eq!(ctx.conn.get_polled_evset(), EventSet::empty());
+
+        // EPOLLHUP without IN/OUT on an established connection with empty TX schedules Rw (EOF)
+        // and disarms IN so the nested epoll FD cannot busy-spin.
+        let mut ctx = CsmTestContext::new_established();
+        ctx.conn.notify(EventSet::HANG_UP);
+        assert!(ctx.conn.pending_rx.contains(PendingRx::Rw));
+        assert_eq!(ctx.conn.get_polled_evset(), EventSet::empty());
     }
 }

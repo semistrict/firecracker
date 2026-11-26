@@ -109,6 +109,7 @@ where
         // backend buffered while it was up. Assumes TRANSPORT_RESET is the only evq event
         // we publish; new event types would need to disambiguate before clearing.
         self.pending_event_ack = false;
+        self.reset_sent_while_paused = false;
         if self.backend.has_pending_rx() {
             match self.process_rx() {
                 Ok(true) => used_queues.push(RXQ_INDEX.try_into().unwrap()),

@@ -30,9 +30,9 @@
 ///  other pollable FDs are then registered under this nested epoll FD.
 ///  To route all these events to their handlers, the muxer uses another `HashMap` object,
 ///  mapping `RawFd`s to `EpollListener`s.
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -65,6 +65,75 @@ pub enum MuxerRx {
     RstPkt { local_port: u32, peer_port: u32 },
 }
 
+/// A freshly accepted host UDS connection accumulating its `CONNECT <port>\n` command line
+/// across non-blocking reads.
+#[derive(Debug)]
+struct LocalStream {
+    stream: UnixStream,
+    buf: [u8; 32],
+    len: usize,
+}
+
+impl LocalStream {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            buf: [0u8; 32],
+            len: 0,
+        }
+    }
+
+    /// Reads available non-blocking bytes up to `\n`, without reading past `\n`.
+    /// Returns `Ok(Some(port))` once a complete command line has been parsed, `Ok(None)` if
+    /// `WouldBlock` was encountered before `\n`, or an error on EOF/overflow/malformed input.
+    fn try_read_port(&mut self) -> Result<Option<u32>, VsockUnixBackendError> {
+        while self.len < self.buf.len() {
+            match self.stream.read(&mut self.buf[self.len..=self.len]) {
+                Ok(0) => return Err(VsockUnixBackendError::InvalidPortRequest),
+                Ok(1) => {
+                    let byte = self.buf[self.len];
+                    self.len += 1;
+                    if byte == b'\n' {
+                        return Self::parse_port(&self.buf[..self.len]).map(Some);
+                    }
+                }
+                Ok(_) => unreachable!(),
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(None),
+                Err(err) => return Err(VsockUnixBackendError::UnixRead(err)),
+            }
+        }
+        Err(VsockUnixBackendError::InvalidPortRequest)
+    }
+
+    fn parse_port(buf: &[u8]) -> Result<u32, VsockUnixBackendError> {
+        let mut word_iter = std::str::from_utf8(buf)
+            .map_err(|_| VsockUnixBackendError::InvalidPortRequest)?
+            .split_whitespace();
+
+        word_iter
+            .next()
+            .ok_or(VsockUnixBackendError::InvalidPortRequest)
+            .and_then(|word| {
+                if word.eq_ignore_ascii_case("connect") {
+                    Ok(())
+                } else {
+                    Err(VsockUnixBackendError::InvalidPortRequest)
+                }
+            })
+            .and_then(|_| {
+                word_iter
+                    .next()
+                    .ok_or(VsockUnixBackendError::InvalidPortRequest)
+            })
+            .and_then(|word| {
+                word.parse::<u32>()
+                    .map_err(|_| VsockUnixBackendError::InvalidPortRequest)
+            })
+            .map_err(|_| VsockUnixBackendError::InvalidPortRequest)
+    }
+}
+
 /// An epoll listener, registered under the muxer's nested epoll FD.
 #[derive(Debug)]
 enum EpollListener {
@@ -76,7 +145,7 @@ enum EpollListener {
     HostSock,
     /// A listener interested in reading host `connect <port>` commands from a freshly
     /// connected host socket.
-    LocalStream(UnixStream),
+    LocalStream(LocalStream),
 }
 
 /// The vsock connection multiplexer.
@@ -93,6 +162,10 @@ pub struct VsockMuxer {
     /// - by `VsockMuxer::send_pkt()` (e.g. RST in response to a connection request packet); and
     /// - in response to EPOLLIN events (e.g. data available to be read from an AF_UNIX socket).
     rxq: MuxerRxQ,
+    /// Standalone RST packets produced by `reset_connections()` so every active connection
+    /// (up to `MAX_CONNECTIONS`) yields an RST even when their count exceeds `MUXER_RXQ_SIZE`
+    /// while all host FDs are closed immediately.
+    reset_rsts: VecDeque<(u32, u32)>,
     /// A queue used for terminating connections that are taking too long to shut down.
     killq: MuxerKillQ,
     /// The Unix socket, through which host-initiated connections are accepted.
@@ -123,6 +196,22 @@ impl VsockChannel for VsockMuxer {
     /// - `Ok(())`: `pkt` has been successfully filled in; or
     /// - `Err(VsockError::NoData)`: there was no available data with which to fill in the packet.
     fn recv_pkt(&mut self, pkt: &mut VsockPacketRx) -> Result<(), VsockError> {
+        if let Some((local_port, peer_port)) = self.reset_rsts.pop_front() {
+            pkt.hdr
+                .set_op(uapi::VSOCK_OP_RST)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(self.cid)
+                .set_src_port(local_port)
+                .set_dst_port(peer_port)
+                .set_len(0)
+                .set_type(uapi::VSOCK_TYPE_STREAM)
+                .set_flags(0)
+                .set_buf_alloc(0)
+                .set_fwd_cnt(0);
+            debug!("vsock muxer: RX reset RST pkt: {:?}", pkt.hdr);
+            return Ok(());
+        }
+
         // We'll look for instructions on how to build the RX packet in the RX queue. If the
         // queue is empty, that doesn't necessarily mean we don't have any pending RX, since
         // the queue might be out-of-sync. If that's the case, we'll attempt to sync it first,
@@ -255,7 +344,7 @@ impl VsockChannel for VsockMuxer {
     /// Check if the muxer has any pending RX data, with which to fill a guest-provided RX
     /// buffer.
     fn has_pending_rx(&self) -> bool {
-        !self.rxq.is_empty() || !self.rxq.is_synced()
+        !self.reset_rsts.is_empty() || !self.rxq.is_empty() || !self.rxq.is_synced()
     }
 }
 
@@ -321,16 +410,48 @@ impl VsockBackend for VsockMuxer {
         }
 
         self.rxq = MuxerRxQ::new();
+        self.reset_rsts.clear();
         self.killq = MuxerKillQ::new();
         self.local_port_set.clear();
         self.local_port_last = (1u32 << 30) - 1;
     }
 
     fn reset_connections(&mut self) {
-        let keys: Vec<ConnMapKey> = self.conn_map.keys().copied().collect();
-        for key in keys {
-            self.kill_connection(key);
+        // Drop any half-open host connections still waiting for `CONNECT <port>\n`.
+        let local_fds: Vec<RawFd> = self
+            .listener_map
+            .iter()
+            .filter_map(|(&fd, listener)| {
+                matches!(listener, EpollListener::LocalStream(_)).then_some(fd)
+            })
+            .collect();
+        for fd in local_fds {
+            self.remove_listener(fd);
         }
+
+        // Preserve any orphan RST packets already queued before rebuilding rxq.
+        while let Some(rx) = self.rxq.pop() {
+            if let MuxerRx::RstPkt {
+                local_port,
+                peer_port,
+            } = rx
+            {
+                self.reset_rsts.push_back((local_port, peer_port));
+            }
+        }
+
+        // Close every active host connection immediately (even if the guest RX queue is full)
+        // and queue an RST packet for each in `reset_rsts` (not capped at `MUXER_RXQ_SIZE`),
+        // so the guest resets any in-flight connection state even with >256 connections.
+        let keys: Vec<ConnMapKey> = self.conn_map.keys().copied().collect();
+        for key in &keys {
+            METRICS.conns_killed.inc();
+            self.remove_connection(*key);
+            self.reset_rsts.push_back((key.local_port, key.peer_port));
+        }
+
+        self.killq = MuxerKillQ::new();
+        self.rxq = MuxerRxQ::new();
     }
 }
 
@@ -349,6 +470,7 @@ impl VsockMuxer {
             host_sock_path,
             epoll: Epoll::new().map_err(VsockUnixBackendError::EpollFdCreate)?,
             rxq: MuxerRxQ::new(),
+            reset_rsts: VecDeque::new(),
             conn_map: HashMap::with_capacity(defs::MAX_CONNECTIONS),
             listener_map: HashMap::with_capacity(defs::MAX_CONNECTIONS + 1),
             killq: MuxerKillQ::new(),
@@ -387,7 +509,7 @@ impl VsockMuxer {
 
             // A new host-initiated connection is ready to be accepted.
             Some(EpollListener::HostSock) => {
-                if self.conn_map.len() == defs::MAX_CONNECTIONS {
+                if self.conn_map.len() + self.pending_local_streams() >= defs::MAX_CONNECTIONS {
                     // If we're already maxed-out on connections, we'll just accept and
                     // immediately discard this potentially new one.
                     warn!("vsock: connection limit reached; refusing new host connection");
@@ -408,7 +530,10 @@ impl VsockMuxer {
                         // the guest side, we need to know the destination port. We'll read
                         // that port from a "connect" command received on this socket, so the
                         // next step is to ask to be notified the moment we can read from it.
-                        self.add_listener(stream.as_raw_fd(), EpollListener::LocalStream(stream))
+                        self.add_listener(
+                            stream.as_raw_fd(),
+                            EpollListener::LocalStream(LocalStream::new(stream)),
+                        )
                     })
                     .unwrap_or_else(|err| {
                         warn!("vsock: unable to accept local connection: {:?}", err);
@@ -417,28 +542,39 @@ impl VsockMuxer {
 
             // Data is ready to be read from a host-initiated connection. That would be the
             // "connect" command that we're expecting.
-            Some(EpollListener::LocalStream(_)) => {
-                if let Some(EpollListener::LocalStream(mut stream)) = self.remove_listener(fd) {
-                    Self::read_local_stream_port(&mut stream)
-                        .map(|peer_port| (self.allocate_local_port(), peer_port))
-                        .and_then(|(local_port, peer_port)| {
-                            self.add_connection(
+            Some(EpollListener::LocalStream(local)) => {
+                if event_set.contains(EventSet::ERROR) {
+                    self.remove_listener(fd);
+                    return;
+                }
+                match local.try_read_port() {
+                    // Command line not yet terminated by '\n'; keep listening for the rest.
+                    Ok(None) => (),
+                    Ok(Some(peer_port)) => {
+                        if let Some(EpollListener::LocalStream(local)) = self.remove_listener(fd) {
+                            let local_port = self.allocate_local_port();
+                            if let Err(err) = self.add_connection(
                                 ConnMapKey {
                                     local_port,
                                     peer_port,
                                 },
                                 MuxerConnection::new_local_init(
-                                    stream,
+                                    local.stream,
                                     uapi::VSOCK_HOST_CID,
                                     self.cid,
                                     local_port,
                                     peer_port,
                                 ),
-                            )
-                        })
-                        .unwrap_or_else(|err| {
-                            info!("vsock: error adding local-init connection: {:?}", err);
-                        })
+                            ) {
+                                self.free_local_port(local_port);
+                                info!("vsock: error adding local-init connection: {:?}", err);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.remove_listener(fd);
+                        info!("vsock: error adding local-init connection: {:?}", err);
+                    }
                 }
             }
 
@@ -452,54 +588,12 @@ impl VsockMuxer {
         }
     }
 
-    /// Parse a host "connect" command, and extract the destination vsock port.
-    fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32, VsockUnixBackendError> {
-        let mut buf = [0u8; 32];
-
-        // This is the minimum number of bytes that we should be able to read, when parsing a
-        // valid connection request. I.e. `b"connect 0\n".len()`.
-        const MIN_READ_LEN: usize = 10;
-
-        // Bring in the minimum number of bytes that we should be able to read.
-        stream
-            .read_exact(&mut buf[..MIN_READ_LEN])
-            .map_err(VsockUnixBackendError::UnixRead)?;
-
-        // Now, finish reading the destination port number, by bringing in one byte at a time,
-        // until we reach an EOL terminator (or our buffer space runs out).  Yeah, not
-        // particularly proud of this approach, but it will have to do for now.
-        let mut blen = MIN_READ_LEN;
-        while buf[blen - 1] != b'\n' && blen < buf.len() {
-            stream
-                .read_exact(&mut buf[blen..=blen])
-                .map_err(VsockUnixBackendError::UnixRead)?;
-            blen += 1;
-        }
-
-        let mut word_iter = std::str::from_utf8(&buf[..blen])
-            .map_err(|_| VsockUnixBackendError::InvalidPortRequest)?
-            .split_whitespace();
-
-        word_iter
-            .next()
-            .ok_or(VsockUnixBackendError::InvalidPortRequest)
-            .and_then(|word| {
-                if word.to_lowercase() == "connect" {
-                    Ok(())
-                } else {
-                    Err(VsockUnixBackendError::InvalidPortRequest)
-                }
-            })
-            .and_then(|_| {
-                word_iter
-                    .next()
-                    .ok_or(VsockUnixBackendError::InvalidPortRequest)
-            })
-            .and_then(|word| {
-                word.parse::<u32>()
-                    .map_err(|_| VsockUnixBackendError::InvalidPortRequest)
-            })
-            .map_err(|_| VsockUnixBackendError::InvalidPortRequest)
+    /// Count host-initiated connections currently waiting for their `CONNECT <port>\n` line.
+    fn pending_local_streams(&self) -> usize {
+        self.listener_map
+            .values()
+            .filter(|listener| matches!(listener, EpollListener::LocalStream(_)))
+            .count()
     }
 
     /// Add a new connection to the active connection pool.
@@ -555,12 +649,19 @@ impl VsockMuxer {
     /// it an RST packet.
     fn kill_connection(&mut self, key: ConnMapKey) {
         let mut had_rx = false;
+        let mut fd = None;
         METRICS.conns_killed.inc();
 
         self.conn_map.entry(key).and_modify(|conn| {
             had_rx = conn.has_pending_rx();
+            fd = Some(conn.as_raw_fd());
             conn.kill();
         });
+        // A killed connection wants no more epoll events; unregister immediately so a readable
+        // host stream cannot keep firing while waiting for an RX descriptor for the RST.
+        if let Some(fd) = fd {
+            self.remove_listener(fd);
+        }
         // This connection will now have an RST packet to yield, so we need to add it to the RX
         // queue.  However, there's no point in doing that if it was already in the queue.
         if !had_rx {
@@ -1720,5 +1821,128 @@ mod tests {
 
         // Check that the connection was removed.
         assert_eq!(METRICS.conns_removed.count(), conns_removed + 1);
+    }
+
+    #[test]
+    fn test_reset_connections_closes_fds_and_local_streams_immediately() {
+        let mut ctx = MuxerTestContext::new("reset_closes_immediately");
+        let local_port = 1026;
+        let peer_port = 1025;
+        let mut listener = ctx.create_local_listener(local_port);
+
+        // Guest-initiated established connection.
+        ctx.init_tx_pkt(local_port, peer_port, uapi::VSOCK_OP_REQUEST);
+        ctx.send();
+        let mut guest_stream = listener.accept();
+        ctx.recv();
+        assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RESPONSE);
+
+        // Host-initiated established connection.
+        let (mut host_stream, host_local_port) = ctx.local_connect(2025);
+
+        // Queue unread host data on the guest-initiated stream before snapshot reset.
+        guest_stream.write_all(b"streaming data").unwrap();
+        ctx.notify_muxer();
+
+        // Pending half-open LocalStream (connected, partial command, no newline yet).
+        let mut half_open = UnixStream::connect(&ctx.muxer.host_sock_path).unwrap();
+        ctx.notify_muxer();
+        half_open.write_all(b"CONNECT ").unwrap();
+        ctx.notify_muxer();
+        assert_eq!(ctx.count_epoll_listeners().0, 1);
+
+        // Reset connections without draining RX (simulating a full guest RX queue).
+        ctx.muxer.reset_connections();
+
+        // All connections and pending LocalStreams must be torn down immediately.
+        assert!(ctx.muxer.conn_map.is_empty());
+        assert!(ctx.muxer.local_port_set.is_empty());
+        assert_eq!(ctx.count_epoll_listeners(), (0, 0));
+
+        // Host peers see EOF or ECONNRESET (when unread bytes remained in the socket buffer)
+        // immediately, before any recv_pkt() runs.
+        let mut buf = [0u8; 16];
+        let is_closed = |res: std::io::Result<usize>| {
+            matches!(res, Ok(0))
+                || matches!(res, Err(ref e) if e.kind() == ErrorKind::ConnectionReset)
+        };
+        assert!(is_closed(guest_stream.read(&mut buf)));
+        assert!(is_closed(host_stream.read(&mut buf)));
+        assert!(is_closed(half_open.read(&mut buf)));
+
+        // Both active connections still yield their RST packets cleanly.
+        let mut rsts = Vec::new();
+        while ctx.muxer.has_pending_rx() {
+            ctx.recv();
+            assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RST);
+            rsts.push((ctx.rx_pkt.hdr.src_port(), ctx.rx_pkt.hdr.dst_port()));
+        }
+        rsts.sort_unstable();
+        let mut expected = vec![(local_port, peer_port), (host_local_port, 2025)];
+        expected.sort_unstable();
+        assert_eq!(rsts, expected);
+    }
+
+    #[test]
+    fn test_local_connect_fragmented_writes() {
+        let mut ctx = MuxerTestContext::new("local_connect_fragmented");
+        let peer_port = 2222;
+        let mut stream = UnixStream::connect(&ctx.muxer.host_sock_path).unwrap();
+        ctx.notify_muxer();
+        assert_eq!(ctx.count_epoll_listeners(), (1, 0));
+
+        // Deliver `CONNECT 2222\n` across three separate non-blocking writes.
+        stream.write_all(b"CONNECT ").unwrap();
+        ctx.notify_muxer();
+        assert_eq!(ctx.count_epoll_listeners(), (1, 0));
+        assert!(!ctx.muxer.has_pending_rx());
+
+        stream.write_all(b"2222").unwrap();
+        ctx.notify_muxer();
+        assert_eq!(ctx.count_epoll_listeners(), (1, 0));
+        assert!(!ctx.muxer.has_pending_rx());
+
+        stream.write_all(b"\n").unwrap();
+        ctx.notify_muxer();
+        assert_eq!(ctx.count_epoll_listeners().0, 0);
+        assert!(ctx.muxer.has_pending_rx());
+
+        ctx.recv();
+        assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_REQUEST);
+        assert_eq!(ctx.rx_pkt.hdr.dst_port(), peer_port);
+    }
+
+    #[test]
+    fn test_reset_connections_exceeding_rxq_size() {
+        // Must not drop RSTs when more than MUXER_RXQ_SIZE (256) connections are active.
+        const COUNT: u32 = defs::MUXER_RXQ_SIZE + 14;
+        let mut ctx = MuxerTestContext::new("reset_exceeds_rxq");
+        let local_port = 1026;
+        let mut listener = ctx.create_local_listener(local_port);
+        let mut streams = Vec::with_capacity(COUNT as usize);
+
+        for i in 0..COUNT {
+            let peer_port = 2000 + i;
+            ctx.init_tx_pkt(local_port, peer_port, uapi::VSOCK_OP_REQUEST);
+            ctx.send();
+            streams.push(listener.accept());
+            ctx.recv();
+            assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RESPONSE);
+        }
+        assert_eq!(ctx.muxer.conn_map.len(), COUNT as usize);
+
+        ctx.muxer.reset_connections();
+        assert!(ctx.muxer.conn_map.is_empty());
+
+        let mut rsts = Vec::with_capacity(COUNT as usize);
+        while ctx.muxer.has_pending_rx() {
+            ctx.recv();
+            assert_eq!(ctx.rx_pkt.hdr.op(), uapi::VSOCK_OP_RST);
+            assert_eq!(ctx.rx_pkt.hdr.src_port(), local_port);
+            rsts.push(ctx.rx_pkt.hdr.dst_port());
+        }
+        rsts.sort_unstable();
+        let expected: Vec<u32> = (2000..2000 + COUNT).collect();
+        assert_eq!(rsts, expected);
     }
 }
