@@ -81,6 +81,12 @@ pub struct Vsock<B> {
 
     /// Gates RX delivery while a TRANSPORT_RESET is awaiting guest ack.
     pub(crate) pending_event_ack: bool,
+
+    /// Whether `prepare_save()` already published a `TRANSPORT_RESET` while the VM remained
+    /// paused (cleared on `kick()`, `handle_evq_event()`, `activate()`, and `_reset()`).
+    /// Prevents repeated `PUT /snapshot/create` calls while paused from burning through the
+    /// guest's 8-entry event virtqueue.
+    pub(crate) reset_sent_while_paused: bool,
 }
 
 impl<B> Vsock<B>
@@ -112,6 +118,7 @@ where
             rx_packet: VsockPacketRx::new()?,
             tx_packet: VsockPacketTx::default(),
             pending_event_ack: false,
+            reset_sent_while_paused: false,
         })
     }
 
@@ -403,6 +410,7 @@ where
             return Err(ActivateError::EventFd);
         }
 
+        self.reset_sent_while_paused = false;
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
 
         Ok(())
@@ -421,11 +429,13 @@ where
         self.rx_packet.clear();
         self.tx_packet.clear();
         self.pending_event_ack = false;
+        self.reset_sent_while_paused = false;
         true
     }
 
     fn kick(&mut self) {
         if self.is_activated() {
+            self.reset_sent_while_paused = false;
             // Vsock has a complicated protocol that isn't resilient to any packet loss,
             // so for Vsock we don't support connection persistence through snapshot. Any
             // in-flight packets or events are simply lost and Vsock is restored 'empty'.
@@ -505,9 +515,22 @@ where
                 Ok(false) => {}
                 Err(err) => error!("Failed to queue the RSTs of the connections: {:?}", err),
             }
-            self.send_transport_reset_event().unwrap_or_else(|err| {
-                error!("Failed to send reset transport event: {:?}", err);
-            });
+            if self.backend.has_pending_rx() {
+                warn!(
+                    "vsock: RX queue full during snapshot; pending RSTs could not be queued \
+                     ahead of TRANSPORT_RESET"
+                );
+            }
+            if self.reset_sent_while_paused {
+                self.signal_used_queue(EVQ_INDEX).unwrap_or_else(|err| {
+                    error!("Failed to signal pending reset transport event: {:?}", err);
+                });
+            } else {
+                match self.send_transport_reset_event() {
+                    Ok(()) => self.reset_sent_while_paused = true,
+                    Err(err) => error!("Failed to send reset transport event: {:?}", err),
+                }
+            }
         }
     }
 }
@@ -833,5 +856,45 @@ mod tests {
             "non-IN evset must not clear the gate"
         );
         assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+    }
+
+    #[test]
+    fn test_prepare_save_repeated_while_paused_does_not_exhaust_evq() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx.mock_activate(test_ctx.mem.clone(), test_ctx.interrupt.clone());
+
+        // Publish 2 evq descriptors (fewer than the 10 snapshots we'll take while paused).
+        for i in 0..2u16 {
+            ctx.guest_evvq.dtable[i as usize].set(
+                EVQ_PAYLOAD_GUEST_ADDR + u64::from(i) * 4,
+                4,
+                VIRTQ_DESC_F_WRITE,
+                0,
+            );
+            ctx.guest_evvq.avail.ring[i as usize].set(i);
+        }
+        ctx.guest_evvq.avail.idx.set(2);
+        ctx.device.queues[EVQ_INDEX] = ctx.guest_evvq.create_queue();
+
+        // Repeated snapshots while paused must reuse the already-queued TRANSPORT_RESET.
+        for _ in 0..10 {
+            ctx.device.prepare_save();
+        }
+        assert!(ctx.device.pending_event_ack);
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            1,
+            "repeated prepare_save while paused must only consume one evq descriptor"
+        );
+
+        // Once the VM resumes (kick), a subsequent pause+snapshot must emit a fresh reset.
+        ctx.device.kick();
+        ctx.device.prepare_save();
+        assert_eq!(
+            ctx.guest_evvq.used.idx.get(),
+            2,
+            "prepare_save after kick must emit a fresh TRANSPORT_RESET"
+        );
     }
 }
