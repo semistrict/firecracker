@@ -38,7 +38,9 @@ use crate::vstate::memory::{
     AtomicBitmap, GuestAddress, GuestMemoryMmap, GuestRegionMmap, MmapRegionBuilder,
 };
 
-/// Errors restoring or snapshotting guest memory with a memory cell.
+/// Errors restoring or snapshotting guest memory with a memory cell. A `cladefs::Error` is printed
+/// with its causes (`{:#}`), as the extent device's errors print it: its own `Display` is its
+/// outermost context alone, which leaves out the errno the daemon refused with.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum CellMemoryError {
     /// A `Cell` memory backend needs `memory_cell`, naming the copy and the daemon.
@@ -51,9 +53,9 @@ pub enum CellMemoryError {
     Region(vm_memory::mmap::MmapRegionError),
     /// A guest memory region at {0:#x} of {1} bytes past what vm-memory allows.
     RegionPlace(u64, usize),
-    /// Opening the memory cell at {0}: {1}
+    /// Opening the memory cell at {0}: {1:#}
     Open(String, cladefs::Error),
-    /// Making the memory cell the guest's memory: {0}
+    /// Making the memory cell the guest's memory: {0:#}
     Window(cladefs::Error),
     /// A VM restored from a memory cell snapshots into its own forked cell: omit `path_on_host` and `cladefsd_socket`.
     RestoredMemoryCellHasConfig,
@@ -61,7 +63,7 @@ pub enum CellMemoryError {
     NoCreateMemoryCellPath,
     /// Querying resident guest pages with mincore: {0}
     Mincore(std::io::Error),
-    /// Snapshotting guest memory into its memory cell: {0}
+    /// Snapshotting guest memory into its memory cell: {0:#}
     Snapshot(cladefs::Error),
     /// Invalid ephemeral memory cell configuration: `version` must be 0, and `tenant` requires `cell`.
     InvalidEphemeralConfig,
@@ -71,7 +73,7 @@ pub enum CellMemoryError {
     DiffFile(String, std::io::Error),
     /// Memory diff file {0} is {1} bytes, expected {2}.
     DiffFileSize(String, u64, u64),
-    /// Applying memory diff files to the memory cell: {0}
+    /// Applying memory diff files to the memory cell: {0:#}
     ApplyDiffs(cladefs::Error),
 }
 
@@ -369,4 +371,21 @@ pub fn snapshot_memory(
         version: version.version,
         ephemeral: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The errno the extent daemon refused an opening with is in the fault Firecracker reports
+    /// (cladefs board 13876): a `cladefs::Error`'s own `Display` is its outermost context alone.
+    #[test]
+    fn faults_name_the_daemons_errno() {
+        let refused =
+            cladefs::Error::new(cladefs::Errno::EACCES).context("opening the extent store at 0/0");
+        assert_eq!(
+            CellMemoryError::Open("0/0".into(), refused).to_string(),
+            "Opening the memory cell at 0/0: opening the extent store at 0/0: EACCES (errno 13)"
+        );
+    }
 }
