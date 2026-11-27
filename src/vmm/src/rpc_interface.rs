@@ -37,6 +37,8 @@ use crate::vmm_config::enclave::{EnclaveConfig, EnclaveConfigError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
+#[cfg(feature = "cladefs")]
+use crate::vmm_config::memory_cell::MemoryCellBootConfig;
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
 };
@@ -98,6 +100,10 @@ pub enum VmmAction {
     /// called before the microVM has booted.
     #[cfg(feature = "cladefs")]
     InsertCladefsDevice(CladefsDeviceConfig),
+    /// cladefs: set the memory cell a freshly booted VM's memory is the window of (board 14415).
+    /// This action can only be called before the microVM has booted.
+    #[cfg(feature = "cladefs")]
+    SetMemoryCell(MemoryCellBootConfig),
     /// Update an extent-store device's cell state (`Released` or `Open`) while the microVM is
     /// paused. This action can only be called after the microVM has booted.
     #[cfg(feature = "cladefs")]
@@ -506,6 +512,12 @@ impl<'a> PrebootApiController<'a> {
             InsertPmemDevice(config) => self.insert_pmem_device(config),
             #[cfg(feature = "cladefs")]
             InsertCladefsDevice(config) => self.insert_cladefs_device(config),
+            #[cfg(feature = "cladefs")]
+            SetMemoryCell(config) => {
+                self.boot_path = true;
+                self.vm_resources.memory_cell = Some(config);
+                Ok(VmmData::Empty)
+            }
             InsertNetworkDevice(config) => self.insert_net_device(config),
             LoadSnapshot(config) => self
                 .load_snapshot(&config)
@@ -957,7 +969,9 @@ impl RuntimeApiController {
             | StartMicroVm
             | UpdateMachineConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
             #[cfg(feature = "cladefs")]
-            InsertCladefsDevice(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
+            InsertCladefsDevice(_) | SetMemoryCell(_) => {
+                Err(VmmActionError::OperationNotSupportedPostBoot)
+            }
         }
     }
 

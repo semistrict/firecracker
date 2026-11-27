@@ -26,6 +26,9 @@ pub mod entropy;
 pub mod instance_info;
 /// Wrapper for configuring the memory and CPU of the microVM.
 pub mod machine_config;
+/// cladefs: the memory cell a freshly booted VM's memory is the window of.
+#[cfg(feature = "cladefs")]
+pub mod memory_cell;
 /// Wrapper for configuring memory hotplug.
 pub mod memory_hotplug;
 /// Wrapper for configuring the metrics.

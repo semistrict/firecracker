@@ -100,6 +100,9 @@ pub enum StartMicrovmError {
     /// Cannot start the thread that starts extent-store devices' threads: {0}
     #[cfg(feature = "cladefs")]
     ExtentThreads(io::Error),
+    /// Cannot make guest memory a memory cell's window: {0}
+    #[cfg(feature = "cladefs")]
+    CellMemory(#[from] crate::cladefs_memory::CellMemoryError),
     /// Error creating legacy device: {0}
     #[cfg(target_arch = "x86_64")]
     CreateLegacyDevice(device_manager::legacy::LegacyDeviceError),
@@ -196,10 +199,6 @@ pub fn build_microvm_for_boot(
         .as_ref()
         .ok_or(StartMicrovmError::MissingKernelConfig)?;
 
-    let guest_memory = vm_resources
-        .allocate_guest_memory()
-        .map_err(StartMicrovmError::GuestMemory)?;
-
     // Clone the command-line so that a failed boot doesn't pollute the original.
     // If the user didn't provide boot_args, use the KVM-specific default.
     #[allow(unused_mut)]
@@ -218,25 +217,19 @@ pub fn build_microvm_for_boot(
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm)?;
     let mut vcpus = vm.create_vcpus(vcpu_count)?;
-    vm.register_dram_memory_regions(guest_memory)?;
-
     // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,
     // before they clone the GuestMemoryMmap object
-    let virtio_mem_addr = if let Some(memory_hotplug) = &vm_resources.memory_hotplug {
-        let addr = allocate_virtio_mem_address(&vm, memory_hotplug.total_size_mib)?;
-        let hotplug_memory_region = vm_resources
-            .allocate_memory_region(
-                addr,
-                u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib)),
-            )
-            .map_err(StartMicrovmError::GuestMemory)?;
-        vm.register_hotpluggable_memory_region(
-            hotplug_memory_region,
-            u64_to_usize(u32_mib_to_bytes(memory_hotplug.slot_size_mib)),
-        )?;
-        Some(addr)
-    } else {
-        None
+    let (guest_memory, hotpluggable) = allocate_guest_memory(&vm, vm_resources)?;
+    vm.register_dram_memory_regions(guest_memory)?;
+    let virtio_mem_addr = match (hotpluggable, &vm_resources.memory_hotplug) {
+        (Some((addr, hotplug_memory_region)), Some(memory_hotplug)) => {
+            vm.register_hotpluggable_memory_region(
+                hotplug_memory_region,
+                u64_to_usize(u32_mib_to_bytes(memory_hotplug.slot_size_mib)),
+            )?;
+            Some(addr)
+        }
+        _ => None,
     };
 
     let kvm_vm = Arc::new(vm);
@@ -660,6 +653,66 @@ fn attach_entropy_device(
         event_manager,
         false,
     )
+}
+
+/// The memory of the VM `vm_resources` boot into `vm`: its DRAM's regions, and its hotpluggable
+/// memory's region, with its address, if it has any.
+#[cfg(not(feature = "cladefs"))]
+fn allocate_guest_memory(
+    vm: &KvmVm,
+    vm_resources: &VmResources,
+) -> Result<
+    (
+        Vec<GuestRegionMmap>,
+        Option<(GuestAddress, GuestRegionMmap)>,
+    ),
+    StartMicrovmError,
+> {
+    let guest_memory = vm_resources
+        .allocate_guest_memory()
+        .map_err(StartMicrovmError::GuestMemory)?;
+    let Some(memory_hotplug) = &vm_resources.memory_hotplug else {
+        return Ok((guest_memory, None));
+    };
+    let addr = allocate_virtio_mem_address(vm, memory_hotplug.total_size_mib)?;
+    let hotplug_memory_region = vm_resources
+        .allocate_memory_region(
+            addr,
+            u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib)),
+        )
+        .map_err(StartMicrovmError::GuestMemory)?;
+    Ok((guest_memory, Some((addr, hotplug_memory_region))))
+}
+
+/// cladefs: the memory of the VM `vm_resources` boot into `vm`, as upstream's: but all of it, its
+/// hotpluggable memory's region last, one memory cell's window (board 14415), as a restored VM's
+/// is, the regions in the order a snapshot's memory lays them out.
+#[cfg(feature = "cladefs")]
+fn allocate_guest_memory(
+    vm: &KvmVm,
+    vm_resources: &VmResources,
+) -> Result<
+    (
+        Vec<GuestRegionMmap>,
+        Option<(GuestAddress, GuestRegionMmap)>,
+    ),
+    StartMicrovmError,
+> {
+    let hotpluggable = (vm_resources.memory_hotplug.as_ref())
+        .map(|memory_hotplug| {
+            let addr = allocate_virtio_mem_address(vm, memory_hotplug.total_size_mib)?;
+            let size = u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib));
+            Ok::<_, StartMicrovmError>((addr, size))
+        })
+        .transpose()?;
+    let mut guest_memory = vm_resources.allocate_cell_memory(hotpluggable)?;
+    let hotpluggable = hotpluggable.map(|(addr, _)| {
+        let region = guest_memory
+            .pop()
+            .expect("the hotpluggable memory's region, last");
+        (addr, region)
+    });
+    Ok((guest_memory, hotpluggable))
 }
 
 fn allocate_virtio_mem_address(

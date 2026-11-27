@@ -21,7 +21,7 @@ extern crate cladefs;
 #[cfg(feature = "cladefs")]
 extern crate virtio_extent;
 
-/// cladefs: a VM's memory restored from a memory cell of its snapshot's cell (TASK-456.3).
+/// cladefs: a VM's memory, a memory cell's window, booted or restored (TASK-456.3, board 14415).
 #[cfg(feature = "cladefs")]
 pub mod cladefs_memory;
 
@@ -474,6 +474,8 @@ impl Vmm {
             pmem_devices: pmem,
             #[cfg(feature = "cladefs")]
             cladefs_devices: extent,
+            #[cfg(feature = "cladefs")]
+            memory_cell: crate::cladefs_memory::boot_config(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,

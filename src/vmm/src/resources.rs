@@ -28,6 +28,8 @@ use crate::vmm_config::enclave::EnclaveConfig;
 use crate::vmm_config::entropy::*;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
+#[cfg(feature = "cladefs")]
+use crate::vmm_config::memory_cell::MemoryCellBootConfig;
 use crate::vmm_config::memory_hotplug::{MemoryHotplugConfig, MemoryHotplugConfigError};
 use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
@@ -106,6 +108,10 @@ pub struct VmmConfig {
     #[cfg(feature = "cladefs")]
     #[serde(default, rename = "cladefs", skip_serializing_if = "Vec::is_empty")]
     pub cladefs_devices: Vec<CladefsDeviceConfig>,
+    /// cladefs: the memory cell a freshly booted VM's memory is the window of (board 14415).
+    #[cfg(feature = "cladefs")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_cell: Option<MemoryCellBootConfig>,
     #[serde(skip)]
     pub serial_config: Option<SerialConfig>,
     pub memory_hotplug: Option<MemoryHotplugConfig>,
@@ -137,6 +143,9 @@ pub struct VmResources {
     /// The extent-store device configs.
     #[cfg(feature = "cladefs")]
     pub cladefs: CladefsBuilder,
+    /// cladefs: the memory cell a freshly booted VM's memory is the window of (board 14415).
+    #[cfg(feature = "cladefs")]
+    pub memory_cell: Option<MemoryCellBootConfig>,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
     /// The optional Mmds data store.
@@ -250,6 +259,11 @@ impl VmResources {
         #[cfg(feature = "cladefs")]
         for extent_config in vmm_config.cladefs_devices.into_iter() {
             resources.cladefs.insert(extent_config)?;
+        }
+
+        #[cfg(feature = "cladefs")]
+        {
+            resources.memory_cell = vmm_config.memory_cell;
         }
 
         if let Some(serial_cfg) = vmm_config.serial_config {
@@ -546,6 +560,31 @@ impl VmResources {
         }
     }
 
+    /// cladefs: the memory of a VM these [`VmResources`] boot, its DRAM's regions and then
+    /// `hotpluggable`'s, if any: one memory cell's window, a new cell where `memory-cell` says, by
+    /// the code a restored VM's memory is made (board 14415). Refused without `memory-cell`, and
+    /// with a vhost-user device, which can't reach such memory.
+    #[cfg(feature = "cladefs")]
+    pub fn allocate_cell_memory(
+        &self,
+        hotpluggable: Option<(GuestAddress, usize)>,
+    ) -> Result<Vec<GuestRegionMmap>, crate::cladefs_memory::CellMemoryError> {
+        use crate::cladefs_memory::{CellMemoryError, Source, guest_memory};
+        use crate::vmm_config::machine_config::HugePageConfig;
+        let config = (self.memory_cell.as_ref()).ok_or(CellMemoryError::NoBootMemoryCell)?;
+        if (self.block.devices.iter()).any(|b| b.lock().expect("Poisoned lock").is_vhost_user()) {
+            return Err(CellMemoryError::VhostUser);
+        }
+        let regions =
+            crate::arch::arch_memory_regions(mib_to_bytes(self.machine_config.mem_size_mib));
+        guest_memory(
+            Source::Boot(config),
+            regions.into_iter().chain(hotpluggable),
+            self.machine_config.track_dirty_pages,
+            self.machine_config.huge_pages != HugePageConfig::None,
+        )
+    }
+
     /// Allocates guest memory in a configuration most appropriate for these [`VmResources`].
     pub fn allocate_guest_memory(&self) -> Result<Vec<GuestRegionMmap>, MemoryError> {
         let regions =
@@ -583,6 +622,8 @@ impl From<&VmResources> for VmmConfig {
             pmem_devices: resources.pmem.configs.clone(),
             #[cfg(feature = "cladefs")]
             cladefs_devices: resources.cladefs.configs.clone(),
+            #[cfg(feature = "cladefs")]
+            memory_cell: resources.memory_cell.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
@@ -703,6 +744,8 @@ mod tests {
             pmem: Default::default(),
             #[cfg(feature = "cladefs")]
             cladefs: Default::default(),
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
             pci_enabled: false,
             serial_out_path: None,
             serial_rate_limiter_cfg: None,

@@ -272,7 +272,7 @@ fn write_snapshot(
     })?;
 
     let memory_snapshot = if let Some(ref cell_cfg) = params.memory_cell {
-        let snapshot = crate::cladefs_memory::snapshot_memory(kvm_vm.guest_memory(), cell_cfg)?;
+        let snapshot = crate::cladefs_memory::snapshot_memory(cell_cfg)?;
         if params.snapshot_type == crate::vmm_config::snapshot::SnapshotType::Full {
             kvm_vm.reset_dirty_bitmap();
             kvm_vm.guest_memory().reset_dirty();
@@ -608,12 +608,18 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
-        // cladefs: from a memory cell of the snapshot's cell (TASK-456.3).
+        // cladefs: a memory cell's window, by the code a fresh boot's is (TASK-456.3, board 14415).
         #[cfg(feature = "cladefs")]
         MemBackendType::Cell => (
             crate::cladefs_memory::guest_memory(
-                mem_backend_path,
-                params.memory_cell.as_ref(),
+                crate::cladefs_memory::Source::Restore {
+                    store: mem_backend_path,
+                    config: params
+                        .memory_cell
+                        .as_ref()
+                        .ok_or(crate::cladefs_memory::CellMemoryError::NoMemoryCell)
+                        .map_err(RestoreFromSnapshotGuestMemoryError::Cell)?,
+                },
                 mem_state.regions(),
                 track_dirty_pages,
                 !matches!(

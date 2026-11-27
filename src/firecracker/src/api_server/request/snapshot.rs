@@ -271,6 +271,8 @@ mod tests {
                 VmmAction::CreateSnapshot(expected_config)
             );
 
+            // A memory cell named at a snapshot, as a cold boot's once was, is refused: every VM's
+            // memory is its memory cell's window already (board 14415).
             let body = r#"{
                 "snapshot_path": "foo",
                 "memory_cell": {
@@ -278,33 +280,11 @@ mod tests {
                     "cladefsd_socket": "/run/cladefsd.sock"
                 }
             }"#;
-            let expected_config = CreateSnapshotParams {
-                snapshot_type: SnapshotType::Full,
-                snapshot_path: PathBuf::from("foo"),
-                mem_file_path: None,
-                sync_snapshot_files: true,
-                memory_cell: Some(CreateMemoryCellConfig {
-                    path_on_host: Some(PathBuf::from("/cells/mem")),
-                    cladefsd_socket: Some(PathBuf::from("/run/cladefsd.sock")),
-                    ephemeral: false,
-                }),
-                for_migration: false,
-            };
-            assert_eq!(
-                vmm_action_from_request(
-                    parse_put_snapshot(&Body::new(body), Some("create")).unwrap()
-                ),
-                VmmAction::CreateSnapshot(expected_config)
-            );
+            parse_put_snapshot(&Body::new(body), Some("create")).unwrap_err();
 
-            // Ephemeral memory cell create and load configurations parse cleanly.
             let eph_create = r#"{
                 "snapshot_path": "foo",
-                "memory_cell": {
-                    "path_on_host": "/cells/mem",
-                    "cladefsd_socket": "/run/cladefsd.sock",
-                    "ephemeral": true
-                }
+                "memory_cell": { "ephemeral": true }
             }"#;
             assert_eq!(
                 vmm_action_from_request(
@@ -315,11 +295,7 @@ mod tests {
                     snapshot_path: PathBuf::from("foo"),
                     mem_file_path: None,
                     sync_snapshot_files: true,
-                    memory_cell: Some(CreateMemoryCellConfig {
-                        path_on_host: Some(PathBuf::from("/cells/mem")),
-                        cladefsd_socket: Some(PathBuf::from("/run/cladefsd.sock")),
-                        ephemeral: true,
-                    }),
+                    memory_cell: Some(CreateMemoryCellConfig { ephemeral: true }),
                     for_migration: false,
                 })
             );

@@ -57,26 +57,30 @@ at `extern crate cladefs` in `src/vmm/src/lib.rs`.
   they are. The device's threads also use upstream's `sigaltstack` and `mprotect` rules, for
   their alternate signal stacks' guard pages.
 - `swagger.yaml`: the API the feature adds to `src/firecracker/swagger/firecracker.yaml`:
-  `PUT /cladefs/{id}`, `PATCH /cladefs/{id}`, `for_migration` and `memory_cell` in
-  `PUT /snapshot/create`, and `cladefs_overrides` and `memory_cell` (with optional `diff_files`)
-  in `PUT /snapshot/load`. Without the feature, the first two are unknown paths and the fields
-  are unknown, as upstream has them; so is `cladefs` in a VM's configuration file.
+  `PUT /cladefs/{id}`, `PATCH /cladefs/{id}`, `PUT /memory-cell`, `for_migration` and
+  `memory_cell` in `PUT /snapshot/create`, and `cladefs_overrides` and `memory_cell` (with
+  optional `diff_files`) in `PUT /snapshot/load`. Without the feature, the first three are unknown
+  paths and the fields are unknown, as upstream has them; so are `cladefs` and `memory-cell` in a
+  VM's configuration file.
 - The extent device attaches over virtio-PCI alone (`--enable-pci`): its DAX window is a BAR
   of its own, which a shared memory capability describes. Upstream's MMIO transport is as
   upstream has it, with no way to describe the window, and a VM with the device on it does not
   start (`StartMicrovmError::ExtentDevicesNeedPci`).
 - `FcExitCode::CladefsdLost` (158), when an extent device's daemon goes, and
   `FcExitCode::AccessRefused` (159), when a guest's access to its DAX window stays refused.
-- Guest memory restored from a memory cell (`mem_backend` `Cell`) is the cell's window, its
-  pages the extent daemon's, a page the guest stores to a private copy in a memory object of
-  the window's. What the guest gives back of it, a balloon's inflation or a free page report
+- Every VM's guest memory is a memory cell's window (`src/vmm/src/cladefs_memory.rs`), by one
+  path: a freshly booted VM's a new, empty cell's, where `memory-cell` (`PUT /memory-cell`) says,
+  a boot without it refused (board 14415); a restored VM's (`mem_backend` `Cell`) a fork of the
+  snapshot's memory's version, or an ephemeral cell reopened. Its pages are the extent daemon's,
+  a page the guest stores to a private copy in a memory object of the window's. It is of 4 KiB
+  pages: `huge_pages` other than `None` is refused. A VM with a vhost-user device does not boot. What the guest gives back of it, a balloon's inflation or a free page report
   (`discard_range`), is reclaimed through the window (`cladefs::memory_cell::MemoryCell::reclaim`):
   its private pages there end, their memory emptied, and the window names the cell's pages there
   again, which the guest reads next. Upstream's `madvise(MADV_DONTNEED)` freed nothing of that
   memory, the private pages' memory object keeping them.
-- `PUT /snapshot/create` accepts `memory_cell` in place of `mem_file_path` (TASK-456.4): for a
-  cell-restored VM (`memory_cell: {}`), Firecracker writes only the window's private pages into
-  its forked memory cell, commits, reclaims them back to the newly committed extents, and makes a
-  version; for a cold-booted VM (`memory_cell: { path_on_host, cladefsd_socket }`), it scans
-  resident pages via `mincore` and writes only non-zero resident pages. Returns HTTP 200 with
-  `{"tenant", "cell", "version"}`.
+- `PUT /snapshot/create` accepts `memory_cell` in place of `mem_file_path` (TASK-456.4):
+  `memory_cell: {}` writes only the window's private pages into the VM's memory cell, a booted
+  VM's as a restored one's, commits, reclaims them back to the newly committed extents, and makes
+  a version, or checkpoints an ephemeral cell in place. Returns HTTP 200 with
+  `{"tenant", "cell", "version"}`. A VM restored from a `File` or `Uffd` backend has no memory
+  cell, and snapshots to `mem_file_path`.

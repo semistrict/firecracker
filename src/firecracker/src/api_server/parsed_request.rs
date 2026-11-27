@@ -15,7 +15,7 @@ use super::request::actions::parse_put_actions;
 use super::request::balloon::{parse_get_balloon, parse_patch_balloon, parse_put_balloon};
 use super::request::boot_source::parse_put_boot_source;
 #[cfg(feature = "cladefs")]
-use super::request::cladefs::{parse_patch_cladefs, parse_put_cladefs};
+use super::request::cladefs::{parse_patch_cladefs, parse_put_cladefs, parse_put_memory_cell};
 use super::request::cpu_configuration::parse_put_cpu_config;
 use super::request::drive::{parse_patch_drive, parse_put_drive};
 use super::request::enclave::{parse_get_enclave, parse_put_enclave};
@@ -107,6 +107,8 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "pmem", Some(body)) => parse_put_pmem(body, path_tokens.next()),
             #[cfg(feature = "cladefs")]
             (Method::Put, "cladefs", Some(body)) => parse_put_cladefs(body, path_tokens.next()),
+            #[cfg(feature = "cladefs")]
+            (Method::Put, "memory-cell", Some(body)) => parse_put_memory_cell(body),
             (Method::Put, "logger", Some(body)) => parse_put_logger(body),
             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
             (Method::Put, "machine-config", Some(body)) => parse_put_machine_config(body),

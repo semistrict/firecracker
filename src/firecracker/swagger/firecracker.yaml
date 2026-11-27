@@ -447,6 +447,34 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /memory-cell:
+    put:
+      summary: Names the memory cell a booted VM's memory is the window of. Pre-boot only. (cladefs)
+      description:
+        Every VM's guest memory is a memory cell's window, a freshly booted VM's as a restored
+        VM's. A boot makes a new, empty memory cell where this says, served by cladefs's extent
+        daemon (cladefsd); its snapshots (memory_cell {}) write its private pages into it. A boot
+        without it is refused.
+      operationId: putMemoryCell
+      parameters:
+        - name: body
+          in: body
+          description: Where the new memory cell is made
+          required: true
+          schema:
+            $ref: "#/definitions/MemoryCell"
+      responses:
+        204:
+          description: Memory cell named
+        400:
+          description: Memory cell cannot be named due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
   /pmem/{id}:
     put:
       summary: Creates or updates a pmem device. Pre-boot only.
@@ -1487,6 +1515,30 @@ definitions:
           - Unsafe
           - Writeback
         default: Writeback
+
+  MemoryCell:
+    type: object
+    description:
+      The new memory cell a freshly booted VM's memory is the window of (cladefs). Unknown fields
+      are refused.
+    required:
+      - path_on_host
+      - cladefsd_socket
+    properties:
+      path_on_host:
+        type: string
+        description:
+          "0/0" (or "TENANT/0"), a new cell the daemon places, whose snapshots make versions; or,
+          ephemeral, a directory of the host's. A cell holding a memory already is refused.
+      cladefsd_socket:
+        type: string
+        description: The socket of the extent daemon, which serves the cell.
+      ephemeral:
+        type: boolean
+        default: false
+        description:
+          A standalone host-local ephemeral cell, which writes nothing to the bucket, its
+          snapshots checkpointing it in place, making no version.
 
   PartialCladefs:
     type: object

@@ -6,6 +6,7 @@ use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::cladefs::{
     CladefsDeviceCellState, CladefsDeviceConfig, CladefsDeviceUpdateConfig,
 };
+use vmm::vmm_config::memory_cell::MemoryCellBootConfig;
 
 use super::super::parsed_request::{ParsedRequest, RequestError, checked_id};
 use super::{Body, StatusCode};
@@ -57,6 +58,12 @@ pub(crate) fn parse_patch_cladefs(
     )))
 }
 
+/// `PUT /memory-cell`: the memory cell a freshly booted VM's memory is the window of (board 14415).
+pub(crate) fn parse_put_memory_cell(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let config = serde_json::from_slice::<MemoryCellBootConfig>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::SetMemoryCell(config)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +95,28 @@ mod tests {
         assert_eq!(
             vmm_action_from_request(parse_put_cladefs(&Body::new(BODY), Some("extents")).unwrap()),
             VmmAction::InsertCladefsDevice(expected)
+        );
+    }
+
+    #[test]
+    fn test_parse_put_memory_cell_request() {
+        parse_put_memory_cell(&Body::new(r#"{"path_on_host":"0/0"}"#)).unwrap_err();
+        parse_put_memory_cell(&Body::new(
+            r#"{"path_on_host":"0/0","cladefsd_socket":"/s","version":1}"#,
+        ))
+        .unwrap_err();
+        assert_eq!(
+            vmm_action_from_request(
+                parse_put_memory_cell(&Body::new(
+                    r#"{"path_on_host":"0/0","cladefsd_socket":"/cladefsd.sock"}"#
+                ))
+                .unwrap()
+            ),
+            VmmAction::SetMemoryCell(MemoryCellBootConfig {
+                path_on_host: "0/0".into(),
+                cladefsd_socket: "/cladefsd.sock".into(),
+                ephemeral: false,
+            })
         );
     }
 

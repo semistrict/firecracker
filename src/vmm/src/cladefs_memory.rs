@@ -1,8 +1,9 @@
 // Copyright 2026 The cladefs Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! cladefs: a VM's memory restored from a memory cell of its snapshot's cell (TASK-456.3),
-//! rather than from a file or through a userfaultfd handler of another process.
+//! cladefs: a VM's memory, a memory cell's window, whether the VM was freshly booted (board
+//! 14415) or restored from a snapshot (TASK-456.3): one path for both, rather than memory from a
+//! file, or through a userfaultfd handler of another process, or anonymous memory.
 //!
 //! Guest memory is one reservation of the whole of it, its regions carved from it in order, as a
 //! snapshot's memory file lays them out: so that one window of the extent daemon's covers it,
@@ -10,12 +11,21 @@
 //! (`cladefs::memory_cell`), maps the daemon's pages of the image's extents as the guest first
 //! touches them, shared with every VM restored from the same snapshot on the host, and gives the
 //! guest a private copy of a page it stores to: so no page is in memory more than once but those
-//! VMs wrote. The VM's memory cell is a fork of the snapshot's memory's copy, its own, which its
-//! next snapshot writes its private pages into.
+//! VMs wrote. Where it comes from ([`Source`]):
 //!
-//! The window is made before anything touches guest memory, as restoring its devices does. The
-//! cell and the reservation live as long as the process, a VM's: kept here, the cell going
-//! first, which lets go of the window's memory, then the reservation.
+//! - A freshly booted VM's memory cell is a new one, empty, which `memory-cell` names
+//!   (`MemoryCellBootConfig`): its image all holes, each page the guest writes made private. A
+//!   boot without one is refused (hotbed question 596).
+//! - A restored VM's is a fork of the snapshot's memory's version, its own; or, ephemeral, the
+//!   host-local cell it was suspended into, reopened.
+//!
+//! Either way the VM's snapshots write its private pages into its memory cell, the same way
+//! ([`snapshot_memory`]). The window maps 4 KiB pages: memory of huge pages is refused (hotbed
+//! question 595).
+//!
+//! The window is made before anything touches guest memory. The cell and the reservation live as
+//! long as the process, a VM's: kept here, the cell going first, which lets go of the window's
+//! memory, then the reservation.
 //!
 //! What the guest gives back of that memory, a balloon's inflation or a free page report, is
 //! reclaimed through the window ([`reclaim`], board 8497): its private pages there end, their
@@ -28,25 +38,25 @@ use std::sync::Mutex;
 
 use cladefs::CellVersion;
 use cladefs::memory_cell::MemoryCell;
-use vm_memory::GuestMemoryBackend;
 use vm_memory::mmap::NewBitmap;
 
-use crate::arch::host_page_size;
-
+use crate::vmm_config::memory_cell::MemoryCellBootConfig;
 use crate::vmm_config::snapshot::{CreateMemoryCellConfig, MemoryCellConfig, MemoryCellSnapshot};
-use crate::vstate::memory::{
-    AtomicBitmap, GuestAddress, GuestMemoryMmap, GuestRegionMmap, MmapRegionBuilder,
-};
+use crate::vstate::memory::{AtomicBitmap, GuestAddress, GuestRegionMmap, MmapRegionBuilder};
 
-/// Errors restoring or snapshotting guest memory with a memory cell. A `cladefs::Error` is printed
+/// Errors making or snapshotting guest memory with a memory cell. A `cladefs::Error` is printed
 /// with its causes (`{:#}`), as the extent device's errors print it: its own `Display` is its
 /// outermost context alone, which leaves out the errno the daemon refused with.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum CellMemoryError {
     /// A `Cell` memory backend needs `memory_cell`, naming the copy and the daemon.
     NoMemoryCell,
-    /// Guest memory restored from a memory cell can't be of huge pages.
+    /// Booting a VM needs `memory-cell` (`PUT /memory-cell`): its memory is a memory cell's window (hotbed question 596).
+    NoBootMemoryCell,
+    /// Guest memory that is a memory cell's window can't be of huge pages: set `huge_pages` to `None` (hotbed question 595).
     HugePages,
+    /// A vhost-user device can't reach guest memory that is a memory cell's window.
+    VhostUser,
     /// Reserving {0} bytes for guest memory: {1}
     Reserve(usize, std::io::Error),
     /// Making a guest memory region: {0}
@@ -57,17 +67,13 @@ pub enum CellMemoryError {
     Open(String, cladefs::Error),
     /// Making the memory cell the guest's memory: {0:#}
     Window(cladefs::Error),
-    /// A VM restored from a memory cell snapshots into its own forked cell: omit `path_on_host` and `cladefsd_socket`.
-    RestoredMemoryCellHasConfig,
-    /// Snapshotting a VM not restored from a memory cell requires both `path_on_host` and `cladefsd_socket`.
-    NoCreateMemoryCellPath,
-    /// Querying resident guest pages with mincore: {0}
-    Mincore(std::io::Error),
+    /// The VM's memory is no memory cell's (restored from a `File` or `Uffd` backend): snapshot it to `mem_file_path` (hotbed question 597).
+    NotCellMemory,
     /// Snapshotting guest memory into its memory cell: {0:#}
     Snapshot(cladefs::Error),
     /// Invalid ephemeral memory cell configuration: `version` must be 0, and `tenant` requires `cell`.
     InvalidEphemeralConfig,
-    /// Snapshot `memory_cell.ephemeral: true` cannot be used on a VM restored from a bucket-backed memory cell.
+    /// Snapshot `memory_cell.ephemeral: true` cannot be used on a VM whose memory cell is bucket-backed.
     EphemeralMismatch,
     /// Reading memory diff file {0}: {1}
     DiffFile(String, std::io::Error),
@@ -77,18 +83,35 @@ pub enum CellMemoryError {
     ApplyDiffs(cladefs::Error),
 }
 
-/// The memory a VM was restored with, kept for the process's life: the cell first, as it goes
-/// first, letting go of the window's memory, then the reservation it is in.
-struct Restored {
+/// What a VM's memory cell is: a fresh boot's, new, or a restore's.
+#[derive(Debug, Clone, Copy)]
+pub enum Source<'a> {
+    /// A freshly booted VM's: a new memory cell, empty, where `memory-cell` says.
+    Boot(&'a MemoryCellBootConfig),
+    /// A restored VM's: the memory cell at `store` (the memory backend's path), as `config`
+    /// says, a fork of the snapshot's memory's version or an ephemeral cell reopened.
+    Restore {
+        /// The memory cell's directory, or `TENANT/CELL`.
+        store: &'a Path,
+        /// Where the snapshot's memory is, and which daemon serves it.
+        config: &'a MemoryCellConfig,
+    },
+}
+
+/// The VM's memory, kept for the process's life: the cell first, as it goes first, letting go of
+/// the window's memory, then the reservation it is in; and the configuration it was booted with,
+/// if it was.
+struct CellMemory {
     memory_cell: MemoryCell,
     reservation: Reservation,
+    boot: Option<MemoryCellBootConfig>,
 }
 
 // SAFETY: the reservation's memory is the guest's, which the window serves from any thread.
-unsafe impl Send for Restored {}
+unsafe impl Send for CellMemory {}
 
-/// The VM's memory restored from a memory cell, if it was.
-static RESTORED: Mutex<Option<Restored>> = Mutex::new(None);
+/// The VM's memory, once made: none for a VM restored from a `File` or `Uffd` backend.
+static MEMORY: Mutex<Option<CellMemory>> = Mutex::new(None);
 
 /// A reservation of memory, unmapped when dropped.
 struct Reservation {
@@ -129,16 +152,14 @@ impl Drop for Reservation {
     }
 }
 
-/// Guest memory of `regions`, restored from the memory cell at `store`, as `config` says, its
-/// window made over it.
+/// Guest memory of `regions`, a fresh boot's or a restore's as `source` says, the window of its
+/// memory cell made over it.
 pub fn guest_memory(
-    store: &Path,
-    config: Option<&MemoryCellConfig>,
+    source: Source<'_>,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
     huge_pages: bool,
 ) -> Result<Vec<GuestRegionMmap>, CellMemoryError> {
-    let config = config.ok_or(CellMemoryError::NoMemoryCell)?;
     if huge_pages {
         return Err(CellMemoryError::HugePages);
     }
@@ -148,7 +169,7 @@ pub fn guest_memory(
     let mut guest = Vec::with_capacity(regions.len());
     let mut offset = 0;
     for (start, len) in regions {
-        // SAFETY: within the reservation, which outlives the region (`Restored`).
+        // SAFETY: within the reservation, which outlives the region (`CellMemory`).
         let at = unsafe { reservation.base.as_ptr().add(offset) };
         let bitmap = track_dirty_pages.then(|| AtomicBitmap::with_len(len));
         // SAFETY: the region's memory is the reservation's, mapped as the region says it is.
@@ -164,19 +185,50 @@ pub fn guest_memory(
         guest.push(GuestRegionMmap::from_unowned(region));
         offset += len;
     }
+    let memory_cell = open(source, size as u64)?;
+    // SAFETY: the reservation is the guest's memory, which nothing else of the process uses, and
+    // which outlives the memory_cell (`CellMemory`).
+    unsafe { memory_cell.window(reservation.base, size as u64, None) }
+        .map_err(CellMemoryError::Window)?;
+    let boot = match source {
+        Source::Boot(config) => Some(config.clone()),
+        Source::Restore { .. } => None,
+    };
+    *MEMORY.lock().unwrap() = Some(CellMemory {
+        memory_cell,
+        reservation,
+        boot,
+    });
+    Ok(guest)
+}
+
+/// Opens the memory cell of a memory of `size` bytes as `source` says, ready for its window: a
+/// restore's diff files applied.
+fn open(source: Source<'_>, size: u64) -> Result<MemoryCell, CellMemoryError> {
+    let (store, config) = match source {
+        Source::Boot(config) => {
+            let path = &config.path_on_host;
+            let made = match config.ephemeral {
+                true => MemoryCell::create_ephemeral(&config.cladefsd_socket, path, size),
+                false => MemoryCell::create(&config.cladefsd_socket, path, size),
+            };
+            return made.map_err(|error| CellMemoryError::Open(path.display().to_string(), error));
+        }
+        Source::Restore { store, config } => (store, config),
+    };
     for path in &config.diff_files {
         let len = std::fs::metadata(path)
             .map_err(|err| CellMemoryError::DiffFile(path.display().to_string(), err))?
             .len();
-        if len != size as u64 {
+        if len != size {
             return Err(CellMemoryError::DiffFileSize(
                 path.display().to_string(),
                 len,
-                size as u64,
+                size,
             ));
         }
     }
-    let memory_cell = if config.ephemeral {
+    let opened = if config.ephemeral {
         if config.version != 0 || (config.cell == 0 && config.tenant != 0) {
             return Err(CellMemoryError::InvalidEphemeralConfig);
         }
@@ -184,44 +236,44 @@ pub fn guest_memory(
             tenant: config.tenant,
             id: config.cell,
         });
-        MemoryCell::open_ephemeral_existing(&config.cladefsd_socket, store, expected, size as u64)
-            .map_err(|error| CellMemoryError::Open(store.display().to_string(), error))?
+        MemoryCell::open_ephemeral_existing(&config.cladefsd_socket, store, expected, size)
     } else {
         let from = CellVersion {
             tenant: config.tenant,
             cell: config.cell,
             version: config.version,
         };
-        MemoryCell::open_forked(&config.cladefsd_socket, store, from, size as u64)
-            .map_err(|error| CellMemoryError::Open(store.display().to_string(), error))?
+        MemoryCell::open_forked(&config.cladefsd_socket, store, from, size)
     };
+    let memory_cell =
+        opened.map_err(|error| CellMemoryError::Open(store.display().to_string(), error))?;
     if !config.diff_files.is_empty() {
         let diffs: Vec<&Path> = config.diff_files.iter().map(PathBuf::as_path).collect();
         memory_cell
             .apply_diff_files(&diffs)
             .map_err(CellMemoryError::ApplyDiffs)?;
     }
-    // SAFETY: the reservation is the guest's memory, which nothing else of the process uses, and
-    // which outlives the memory_cell (`Restored`).
-    unsafe { memory_cell.window(reservation.base, size as u64, None) }
-        .map_err(CellMemoryError::Window)?;
-    *RESTORED.lock().unwrap() = Some(Restored {
-        memory_cell,
-        reservation,
-    });
-    Ok(guest)
+    Ok(memory_cell)
+}
+
+/// The memory cell a freshly booted VM's memory is the window of, as its configuration named it:
+/// none for a restored VM.
+pub fn boot_config() -> Option<MemoryCellBootConfig> {
+    let memory = MEMORY.lock().unwrap();
+    memory.as_ref().and_then(|memory| memory.boot.clone())
 }
 
 /// Reclaims the `len` bytes of guest memory at host address `addr`, which the guest gave back,
-/// if they are memory restored from a memory cell: through its window, which ends the private
-/// pages there, their memory emptied (`MemoryCell::reclaim`); the guest reads the cell's pages
-/// there next. None for other memory, which `discard_range` discards as upstream does.
+/// if they are memory of a memory cell's: through its window, which ends the private pages there,
+/// their memory emptied (`MemoryCell::reclaim`); the guest reads the cell's pages there next.
+/// None for other memory, which `discard_range` discards as upstream does.
 pub(crate) fn reclaim(addr: *const u8, len: usize) -> Option<Result<(), cladefs::Error>> {
-    let restored = RESTORED.lock().unwrap();
-    let Restored {
+    let memory = MEMORY.lock().unwrap();
+    let CellMemory {
         memory_cell,
         reservation,
-    } = restored.as_ref()?;
+        ..
+    } = memory.as_ref()?;
     let offset = (addr as usize).checked_sub(reservation.base.as_ptr() as usize)?;
     if offset >= reservation.len {
         return None;
@@ -230,141 +282,38 @@ pub(crate) fn reclaim(addr: *const u8, len: usize) -> Option<Result<(), cladefs:
     Some(memory_cell.reclaim(offset as u64, len as u64))
 }
 
-/// Snapshots guest memory straight into a memory cell (TASK-456.4):
-/// - For a VM restored from a memory cell, writes only the window's private pages into its forked
-///   memory cell, commits, reclaims them back to the newly committed extents, and makes a version.
-/// - For a cold-booted (or non-cell) VM, opens a new memory cell at `config.path_on_host` via
-///   `config.cladefsd_socket`, scans resident pages via `mincore` without faulting untouched
-///   anonymous pages, writes only non-zero resident pages (zeros discarded as holes), commits, and
-///   makes a version.
+/// Snapshots guest memory straight into its memory cell (TASK-456.4), a freshly booted VM's as a
+/// restored one's: writes the window's private pages into it, commits, reclaims them back to the
+/// newly committed extents, and makes a version; or, of an ephemeral memory cell, checkpoints it
+/// in place. The VM is paused.
 pub fn snapshot_memory(
-    guest_memory: &GuestMemoryMmap,
     config: &CreateMemoryCellConfig,
 ) -> Result<MemoryCellSnapshot, CellMemoryError> {
-    let restored = RESTORED.lock().unwrap();
-    if let Some(restored) = restored.as_ref() {
-        if config.path_on_host.is_some() || config.cladefsd_socket.is_some() {
-            return Err(CellMemoryError::RestoredMemoryCellHasConfig);
-        }
-        if restored.memory_cell.is_ephemeral() {
-            // SAFETY: the VM is paused by Firecracker before creating a snapshot, and
-            // `restored.reservation.base` is the base passed to `MemoryCell::window`.
-            let cell = unsafe {
-                restored
-                    .memory_cell
-                    .snapshot_window_ephemeral(restored.reservation.base)
-            }
-            .map_err(CellMemoryError::Snapshot)?;
-            return Ok(MemoryCellSnapshot {
-                tenant: cell.tenant,
-                cell: cell.id,
-                version: 0,
-                ephemeral: true,
-            });
-        }
-        if config.ephemeral {
-            return Err(CellMemoryError::EphemeralMismatch);
-        }
+    let memory = MEMORY.lock().unwrap();
+    let memory = memory.as_ref().ok_or(CellMemoryError::NotCellMemory)?;
+    if memory.memory_cell.is_ephemeral() {
         // SAFETY: the VM is paused by Firecracker before creating a snapshot, and
-        // `restored.reservation.base` is the base passed to `MemoryCell::window`.
-        let version = unsafe {
-            restored
+        // `memory.reservation.base` is the base passed to `MemoryCell::window`.
+        let cell = unsafe {
+            memory
                 .memory_cell
-                .snapshot_window(restored.reservation.base)
+                .snapshot_window_ephemeral(memory.reservation.base)
         }
         .map_err(CellMemoryError::Snapshot)?;
         return Ok(MemoryCellSnapshot {
-            tenant: version.tenant,
-            cell: version.cell,
-            version: version.version,
-            ephemeral: false,
-        });
-    }
-    drop(restored);
-
-    let (Some(path), Some(socket)) = (&config.path_on_host, &config.cladefsd_socket) else {
-        return Err(CellMemoryError::NoCreateMemoryCellPath);
-    };
-    let total_size: usize = guest_memory
-        .iter()
-        .flat_map(|region| region.slots())
-        .map(|(slot, _)| slot.slice.len())
-        .sum();
-    let cell = if config.ephemeral {
-        MemoryCell::open_ephemeral(socket, path, total_size as u64)
-            .map_err(|error| CellMemoryError::Open(path.display().to_string(), error))?
-    } else {
-        MemoryCell::open(socket, path, total_size as u64)
-            .map_err(|error| CellMemoryError::Open(path.display().to_string(), error))?
-    };
-
-    let host_ps = host_page_size();
-    // 64 MiB chunks keep the mincore status vec tiny (16 KiB on 4 KiB hosts).
-    const CHUNK_BYTES: usize = 64 << 20;
-    let mut mincore_vec = vec![0u8; CHUNK_BYTES / host_ps];
-    let mut offset = 0u64;
-
-    for (mem_slot, plugged) in guest_memory.iter().flat_map(|region| region.slots()) {
-        let slot_len = mem_slot.slice.len();
-        if !plugged {
-            offset += slot_len as u64;
-            continue;
-        }
-        let base_ptr = mem_slot.slice.ptr_guard().as_ptr();
-        let mut pos = 0usize;
-        while pos < slot_len {
-            let chunk_len = (slot_len - pos).min(CHUNK_BYTES);
-            let pages = chunk_len / host_ps;
-            let vec = &mut mincore_vec[..pages];
-            // SAFETY: `base_ptr.add(pos)` is a page-aligned guest memory mapping of at least
-            // `chunk_len` bytes, and `vec` has one byte per host page.
-            let rc = unsafe {
-                libc::mincore(
-                    base_ptr.add(pos).cast_mut().cast(),
-                    chunk_len,
-                    vec.as_mut_ptr(),
-                )
-            };
-            if rc != 0 {
-                return Err(CellMemoryError::Mincore(std::io::Error::last_os_error()));
-            }
-            // Write contiguous runs of resident pages; non-resident pages remain zero holes.
-            let mut idx = 0usize;
-            while idx < pages {
-                if vec[idx] & 1 == 0 {
-                    idx += 1;
-                    continue;
-                }
-                let run_start = idx;
-                while idx < pages && (vec[idx] & 1) != 0 {
-                    idx += 1;
-                }
-                let run_off = pos + run_start * host_ps;
-                let run_len = (idx - run_start) * host_ps;
-                // SAFETY: within the plugged guest memory slot, and the VM is paused.
-                let bytes = unsafe { std::slice::from_raw_parts(base_ptr.add(run_off), run_len) };
-                cell.write_sparse(offset + run_off as u64, bytes)
-                    .map_err(CellMemoryError::Snapshot)?;
-            }
-            pos += chunk_len;
-        }
-        offset += slot_len as u64;
-    }
-
-    cell.commit().map_err(CellMemoryError::Snapshot)?;
-    if config.ephemeral {
-        let tenant = cell.tenant();
-        let id = cell.cell();
-        cell.close().map_err(CellMemoryError::Snapshot)?;
-        return Ok(MemoryCellSnapshot {
-            tenant,
-            cell: id,
+            tenant: cell.tenant,
+            cell: cell.id,
             version: 0,
             ephemeral: true,
         });
     }
-    let version = cell.make_version().map_err(CellMemoryError::Snapshot)?;
-    cell.close().map_err(CellMemoryError::Snapshot)?;
+    if config.ephemeral {
+        return Err(CellMemoryError::EphemeralMismatch);
+    }
+    // SAFETY: the VM is paused by Firecracker before creating a snapshot, and
+    // `memory.reservation.base` is the base passed to `MemoryCell::window`.
+    let version = unsafe { memory.memory_cell.snapshot_window(memory.reservation.base) }
+        .map_err(CellMemoryError::Snapshot)?;
     Ok(MemoryCellSnapshot {
         tenant: version.tenant,
         cell: version.cell,

@@ -41,32 +41,19 @@ pub enum MemBackendType {
     Cell,
 }
 
-/// cladefs: writes a VM's guest memory straight into a memory cell during `/snapshot/create`
-/// (TASK-456.4), instead of writing a local memory file.
-///
-/// For a VM restored from a memory cell (`MemBackendType::Cell`), omit both fields: Firecracker
-/// writes only the window's private pages into the VM's already-open forked memory cell, commits,
-/// reclaims them back to the newly committed extents, and makes a version.
-///
-/// For a VM not backed by a memory cell (e.g., cold-booted anonymous RAM), supply both
-/// `path_on_host` and `cladefsd_socket`: Firecracker creates a new memory cell there, writes only
-/// resident non-zero pages, commits, and makes a version.
+/// cladefs: writes a VM's guest memory straight into its memory cell during `/snapshot/create`
+/// (TASK-456.4), instead of writing a local memory file: a freshly booted VM's (board 14415) as a
+/// restored VM's (`MemBackendType::Cell`), whose memory is the cell's window. Firecracker writes
+/// only the window's private pages into it, commits, reclaims them back to the newly committed
+/// extents, and makes a version; or, of an ephemeral memory cell, checkpoints it in place. A VM
+/// restored from a `File` or `Uffd` backend has no memory cell, and snapshots to `mem_file_path`.
 #[cfg(feature = "cladefs")]
 #[derive(Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateMemoryCellConfig {
-    /// The new memory cell's directory on host (required when not restored from a memory cell;
-    /// must be omitted when restored from a memory cell).
-    #[serde(default)]
-    pub path_on_host: Option<PathBuf>,
-    /// The extent daemon's socket (required when not restored from a memory cell; must be omitted
-    /// when restored from a memory cell).
-    #[serde(default)]
-    pub cladefsd_socket: Option<PathBuf>,
-    /// When true, creates a standalone host-local ephemeral memory cell on cold-boot suspend
-    /// (zero bucket uploads, no version created). On a VM already restored from an ephemeral
-    /// memory cell, may be omitted (`false`) or set to `true` to re-suspend in place; setting
-    /// `true` on a bucket-backed restored memory cell is refused.
+    /// Whether the VM's memory cell is a host-local ephemeral one, as a check: `true` on a
+    /// bucket-backed memory cell is refused. The memory cell's kind is the boot's (`memory-cell`)
+    /// or the restore's choice.
     #[serde(default)]
     pub ephemeral: bool,
 }
