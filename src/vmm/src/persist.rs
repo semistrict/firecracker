@@ -26,10 +26,12 @@ use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
 use crate::device_manager::{DevicePersistError, DevicesState};
+use crate::devices::virtio::pmem::device::{BackendPmem, PmemError};
 // Re-exported so external crates inspecting a `MicrovmState` snapshot can match on the
 // serialised virtio transport variant.
 pub use crate::device_manager::VirtioDevicesState;
 use crate::logger::{info, warn};
+use crate::memory_backend::{self, MemoryBackend};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Snapshot;
@@ -129,6 +131,11 @@ pub struct GuestRegionUffdMapping {
     /// to be removed in 2.0.
     #[deprecated]
     pub page_size_kib: usize,
+    /// For the memory of a pmem device the backend serves (`size_mib`), the device's ID; none for
+    /// guest memory. Its `offset` follows guest memory's, as if the backend held each device's
+    /// contents after it, in the order given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pmem_id: Option<String>,
 }
 
 /// Errors related to saving and restoring Microvm state.
@@ -167,13 +174,25 @@ pub enum CreateSnapshotError {
     /// cladefs: cannot write guest memory into a memory cell: {0}
     #[cfg(feature = "cladefs")]
     MemoryCell(#[from] crate::cladefs_memory::CellMemoryError),
-    /// cladefs: snapshot requires either `mem_file_path` or `memory_cell`, not both or neither.
-    #[cfg(feature = "cladefs")]
-    InvalidMemoryTarget,
+    /// A snapshot's guest memory goes to one place: `mem_file_path`, or the `Mappings` memory backend, which persists it itself (or cladefs's `memory_cell`)
+    MemoryTarget,
+    /// The memory backend failed to persist guest memory: {0}
+    MemoryBackend(#[from] crate::memory_backend::MemoryBackendError),
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
+
+/// What making a snapshot gave besides its files.
+#[derive(Debug, Default)]
+pub struct SnapshotOutcome {
+    /// The `Mappings` memory backend's result, which persisted guest memory itself.
+    pub memory_backend: Option<serde_json::Value>,
+    /// cladefs: the memory cell's version guest memory was written into, with `memory_cell`
+    /// (TASK-456.4).
+    #[cfg(feature = "cladefs")]
+    pub memory_cell: Option<MemoryCellSnapshot>,
+}
 
 /// Creates a Microvm snapshot.
 #[cfg(not(feature = "cladefs"))]
@@ -181,18 +200,17 @@ pub fn create_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
-) -> Result<(), CreateSnapshotError> {
+) -> Result<SnapshotOutcome, CreateSnapshotError> {
     write_snapshot(vmm, vm_info, params)
 }
 
-/// Creates a Microvm snapshot, returning the created memory cell's version if `memory_cell` was
-/// used in place of `mem_file_path` (TASK-456.4).
+/// Creates a Microvm snapshot.
 #[cfg(feature = "cladefs")]
 pub fn create_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
-) -> Result<Option<MemoryCellSnapshot>, CreateSnapshotError> {
+) -> Result<SnapshotOutcome, CreateSnapshotError> {
     // cladefs: the extent-store devices' stores first: a version of each one's cell (or migration
     // mappings without a version when `for_migration` is set), which the snapshot failing after
     // drops, as no snapshot file names it then (TASK-575).
@@ -206,53 +224,30 @@ pub fn create_snapshot(
     written
 }
 
-/// Writes a Microvm snapshot: its state, then its memory.
-#[cfg(not(feature = "cladefs"))]
+/// Writes a Microvm snapshot: its state, then its memory: through the `Mappings` memory backend,
+/// which persists it itself, to `mem_file_path`, or (cladefs) straight into a memory cell.
 fn write_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
-) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
-        .save_state(vm_info)
-        .map_err(CreateSnapshotError::MicrovmState)?;
-
-    snapshot_state_to_file(
-        &microvm_state,
-        &params.snapshot_path,
-        params.sync_snapshot_files,
-    )?;
-
+) -> Result<SnapshotOutcome, CreateSnapshotError> {
     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(
-        &params.mem_file_path,
-        params.snapshot_type,
-        params.sync_snapshot_files,
-    )?;
-
-    // We need to mark queues as dirty again for all activated devices. The reason we
-    // do it here is that we don't mark pages as dirty during runtime
-    // for queue objects.
-    vmm.device_manager
-        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
-
-    Ok(())
-}
-
-/// Writes a Microvm snapshot: its state, then its memory (either to `mem_file_path` or straight
-/// into a memory cell, TASK-456.4).
-#[cfg(feature = "cladefs")]
-fn write_snapshot(
-    vmm: &mut Vmm,
-    vm_info: &VmInfo,
-    params: &CreateSnapshotParams,
-) -> Result<Option<MemoryCellSnapshot>, CreateSnapshotError> {
-    if params.mem_file_path.is_some() == params.memory_cell.is_some() {
-        return Err(CreateSnapshotError::InvalidMemoryTarget);
+    let backend = kvm_vm.memory_backend().cloned();
+    #[cfg(not(feature = "cladefs"))]
+    let memory_cell = false;
+    #[cfg(feature = "cladefs")]
+    let memory_cell = params.memory_cell.is_some();
+    // One place for guest memory: the backend, a file, or a memory cell.
+    if usize::from(backend.is_some())
+        + usize::from(params.mem_file_path.is_some())
+        + usize::from(memory_cell)
+        != 1
+    {
+        return Err(CreateSnapshotError::MemoryTarget);
     }
 
     let microvm_state = vmm
@@ -265,31 +260,27 @@ fn write_snapshot(
         params.sync_snapshot_files,
     )?;
 
-    let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
-        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-            "snapshot requires KVM".into(),
-        ))
-    })?;
-
-    let memory_snapshot = if let Some(ref cell_cfg) = params.memory_cell {
-        let snapshot = crate::cladefs_memory::snapshot_memory(cell_cfg)?;
-        if params.snapshot_type == crate::vmm_config::snapshot::SnapshotType::Full {
-            kvm_vm.reset_dirty_bitmap();
-            kvm_vm.guest_memory().reset_dirty();
-        }
-        Some(snapshot)
-    } else {
-        let mem_file_path = params
-            .mem_file_path
-            .as_ref()
-            .ok_or(CreateSnapshotError::InvalidMemoryTarget)?;
+    let kvm_vm = vmm.vm.as_kvm().expect("checked above");
+    let mut outcome = SnapshotOutcome::default();
+    if let Some(backend) = backend {
+        // Device state saved, the vCPUs paused: the handler persists memory as it now is.
+        outcome.memory_backend = Some(backend.persist()?);
+        kvm_vm.protect_unplugged_slots()?;
+    } else if let Some(mem_file_path) = &params.mem_file_path {
         kvm_vm.snapshot_memory_to_file(
             mem_file_path,
             params.snapshot_type,
             params.sync_snapshot_files,
         )?;
-        None
-    };
+    }
+    #[cfg(feature = "cladefs")]
+    if let Some(ref cell_cfg) = params.memory_cell {
+        outcome.memory_cell = Some(crate::cladefs_memory::snapshot_memory(cell_cfg)?);
+        if params.snapshot_type == crate::vmm_config::snapshot::SnapshotType::Full {
+            kvm_vm.reset_dirty_bitmap();
+            kvm_vm.guest_memory().reset_dirty();
+        }
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -297,7 +288,7 @@ fn write_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
-    Ok(memory_snapshot)
+    Ok(outcome)
 }
 
 fn snapshot_state_to_file(
@@ -470,6 +461,12 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     File(#[from] GuestMemoryFromFileError),
     /// Error creating guest memory from uffd: {0}
     Uffd(#[from] GuestMemoryFromUffdError),
+    /// Error making the memory of a pmem device the memory backend serves: {0}
+    BackendPmem(PmemError),
+    /// A snapshot with pmem devices the memory backend serves (size_mib) loads with a Uffd or Mappings memory backend alone
+    BackendPmemNeedsUffd,
+    /// Error serving guest memory through a Mappings memory backend: {0}
+    Mappings(#[from] MappingsMemoryError),
     /// cladefs: error restoring guest memory from a memory cell: {0}
     #[cfg(feature = "cladefs")]
     Cell(#[from] crate::cladefs_memory::CellMemoryError),
@@ -581,6 +578,20 @@ pub fn restore_from_snapshot(
 
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
+    let backend_pmem = backend_pmem(&microvm_state.device_states)
+        .map_err(RestoreFromSnapshotGuestMemoryError::BackendPmem)?;
+    if !backend_pmem.is_empty()
+        && !matches!(
+            params.mem_backend.backend_type,
+            MemBackendType::Uffd | MemBackendType::Mappings
+        )
+    {
+        return Err(RestoreFromSnapshotGuestMemoryError::BackendPmemNeedsUffd.into());
+    }
+    let pmem: Vec<_> = (backend_pmem.iter())
+        .map(|(id, memory)| (id.as_str(), memory))
+        .collect();
+    let mut memory_backend = None;
 
     let (guest_memory, uffd) = match params.mem_backend.backend_type {
         MemBackendType::File => {
@@ -605,11 +616,25 @@ pub fn restore_from_snapshot(
             let (guest_memory, uffd) = guest_memory_from_uffd(
                 mem_backend_path,
                 mem_state.regions(),
+                &pmem,
                 track_dirty_pages,
                 vm_resources.machine_config.huge_pages,
             )
             .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
             (guest_memory, Some(uffd))
+        }
+        MemBackendType::Mappings => {
+            let (guest_memory, backend) = guest_memory_from_mappings(
+                mem_backend_path,
+                mem_state.regions(),
+                &pmem,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+                seccomp_filters,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Mappings)?;
+            memory_backend = Some(backend);
+            (guest_memory, None)
         }
         // cladefs: a memory cell's window, by the code a fresh boot's is (TASK-456.3, board 14415).
         #[cfg(feature = "cladefs")]
@@ -634,17 +659,43 @@ pub fn restore_from_snapshot(
             None,
         ),
     };
+    drop(pmem);
+    vm_resources.pmem.backend.extend(backend_pmem);
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
         guest_memory,
         uffd,
+        memory_backend,
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
     )
     .map_err(RestoreFromSnapshotError::Build)
+}
+
+/// The memory of the restored pmem devices the memory backend serves (`size_mib`), by ID, placed
+/// where `devices` had them.
+fn backend_pmem(devices: &DevicesState) -> Result<Vec<(String, BackendPmem)>, PmemError> {
+    let pmem_states: Vec<_> = match &devices.virtio_state {
+        VirtioDevicesState::Mmio(state) => (state.pmem_devices.iter())
+            .map(|device| &device.device_state)
+            .collect(),
+        VirtioDevicesState::Pci(state) => (state.pmem_devices.iter())
+            .map(|device| &device.device_state)
+            .collect(),
+    };
+    pmem_states
+        .into_iter()
+        .filter(|state| state.config.backend_served())
+        .map(|state| {
+            Ok((
+                state.config.id.clone(),
+                BackendPmem::restore(state.config_space)?,
+            ))
+        })
+        .collect()
 }
 
 /// Error type for [`snapshot_state_from_file`]
@@ -713,15 +764,18 @@ pub enum GuestMemoryFromUffdError {
 /// Guest memory of `regions`, anonymous, registered with a new userfaultfd for missing pages, and
 /// handed with it to the handler listening at `mem_uds_path`, which fills each page as it is
 /// first touched: a restored VM's memory, from its snapshot's, and a booted VM's
-/// (`PUT /memory-backend`), from nothing.
+/// (`PUT /memory-backend`), from nothing. The memory of the pmem devices it serves, `pmem` by ID,
+/// is registered and handed over with it, after it.
 pub(crate) fn guest_memory_from_uffd(
     mem_uds_path: &Path,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
+    pmem: &[(&str, &BackendPmem)],
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Uffd), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
+    let (guest_memory, mut backend_mappings) =
         create_guest_memory(regions, track_dirty_pages, huge_pages)?;
+    backend_mappings.extend(describe_pmem(&backend_mappings, pmem));
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -742,17 +796,108 @@ pub(crate) fn guest_memory_from_uffd(
         uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
             .map_err(GuestMemoryFromUffdError::Register)?;
     }
+    for (_, memory) in pmem {
+        uffd.register(
+            memory.mmap.mmap_ptr as *mut _,
+            u64_to_usize(memory.mmap.mmap_len),
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
+    }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
 
     Ok((guest_memory, uffd))
 }
 
+/// Errors of guest memory a `Mappings` memory backend serves.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum MappingsMemoryError {
+    /// Failed to reserve guest memory: {0}
+    Reserve(#[from] MemoryError),
+    /// Guest memory of huge pages can't be made of a Mappings memory backend's 4 KiB mappings
+    HugePages,
+    /// No seccomp filter for the VMM thread, which the memory backend's thread runs under
+    NoSeccompFilter,
+    /// Guest memory whose host mapping is another's can't be a Mappings memory backend's
+    Unowned,
+    /// {0}
+    Backend(#[from] crate::memory_backend::MemoryBackendError),
+}
+
+/// Guest memory of `regions`, reserved anonymous, and the memory of the pmem devices it serves,
+/// `pmem` by ID, made of the mappings the `Mappings` handler listening at `mem_uds_path` lists,
+/// which serves their faults: a restored VM's memory and a booted VM's.
+pub(crate) fn guest_memory_from_mappings(
+    mem_uds_path: &Path,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    pmem: &[(&str, &BackendPmem)],
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+    seccomp_filters: &BpfThreadMap,
+) -> Result<(Vec<GuestRegionMmap>, Arc<MemoryBackend>), MappingsMemoryError> {
+    let filter = seccomp_filters
+        .get("vmm")
+        .ok_or(MappingsMemoryError::NoSeccompFilter)?
+        .clone();
+    if huge_pages != HugePageConfig::None {
+        return Err(MappingsMemoryError::HugePages);
+    }
+    let (guest_memory, mappings) = create_guest_memory(regions, track_dirty_pages, huge_pages)?;
+    let pmem_mappings = describe_pmem(&mappings, pmem);
+    let mut holds: Vec<Arc<dyn std::fmt::Debug + Send + Sync>> = Vec::new();
+    for region in &guest_memory {
+        holds.push(Arc::new(
+            region.mapping().ok_or(MappingsMemoryError::Unowned)?,
+        ));
+    }
+    holds.extend(
+        pmem.iter()
+            .map(|(_, memory)| Arc::clone(&memory.mmap) as Arc<dyn std::fmt::Debug + Send + Sync>),
+    );
+    let described = (mappings.into_iter().chain(pmem_mappings).zip(holds))
+        .map(|(mapping, memory)| {
+            let region = memory_backend::Region {
+                host_addr: mapping.base_host_virt_addr,
+                size: mapping.size as u64,
+                guest_memory: mapping.pmem_id.is_none(),
+                memory,
+            };
+            (region, mapping)
+        })
+        .collect();
+    let backend = MemoryBackend::start(mem_uds_path, described, filter)?;
+    Ok((guest_memory, backend))
+}
+
+/// The handshake's descriptions of the memory of the pmem devices a backend serves, `pmem` by ID,
+/// after guest memory's, `guest_memory`.
+fn describe_pmem(
+    guest_memory: &[GuestRegionUffdMapping],
+    pmem: &[(&str, &BackendPmem)],
+) -> Vec<GuestRegionUffdMapping> {
+    let mut offset: u64 = guest_memory.iter().map(|m| m.size as u64).sum();
+    (pmem.iter())
+        .map(|(id, memory)| {
+            #[allow(deprecated)]
+            let mapping = GuestRegionUffdMapping {
+                base_host_virt_addr: memory.mmap.mmap_ptr,
+                size: u64_to_usize(memory.mmap.mmap_len),
+                offset,
+                page_size: HugePageConfig::None.page_size(),
+                page_size_kib: HugePageConfig::None.page_size(),
+                pmem_id: Some((*id).to_string()),
+            };
+            offset += memory.mmap.mmap_len;
+            mapping
+        })
+        .collect()
+}
+
 fn create_guest_memory(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
-) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
+) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), MemoryError> {
     let guest_memory = memory::anonymous(regions, track_dirty_pages, huge_pages)?;
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
@@ -764,6 +909,7 @@ fn create_guest_memory(
             offset,
             page_size: huge_pages.page_size(),
             page_size_kib: huge_pages.page_size(),
+            pmem_id: None,
         });
         offset += mem_region.size() as u64;
     }
@@ -983,6 +1129,7 @@ mod tests {
                 offset: 0,
                 page_size: HugePageConfig::None.page_size(),
                 page_size_kib: HugePageConfig::None.page_size(),
+                pmem_id: None,
             },
             GuestRegionUffdMapping {
                 base_host_virt_addr: 0x100000,
@@ -990,6 +1137,7 @@ mod tests {
                 offset: 0,
                 page_size: HugePageConfig::Hugetlbfs2M.page_size(),
                 page_size_kib: HugePageConfig::Hugetlbfs2M.page_size(),
+                pmem_id: None,
             },
         ];
 

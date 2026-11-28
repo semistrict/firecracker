@@ -3,6 +3,7 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io;
 #[cfg(feature = "gdb")]
@@ -33,7 +34,7 @@ use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
-use crate::devices::virtio::pmem::device::Pmem;
+use crate::devices::virtio::pmem::device::{BackendPmem, Pmem, PmemError};
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
@@ -42,8 +43,10 @@ use crate::initrd::{InitrdConfig, InitrdError};
 use crate::logger::debug;
 #[cfg(target_arch = "aarch64")]
 use crate::logger::warn;
+use crate::memory_backend::MemoryBackend;
 use crate::persist::{
-    GuestMemoryFromUffdError, MicrovmState, MicrovmStateError, guest_memory_from_uffd,
+    GuestMemoryFromUffdError, MappingsMemoryError, MicrovmState, MicrovmStateError,
+    guest_memory_from_mappings, guest_memory_from_uffd,
 };
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
@@ -58,7 +61,7 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
-use crate::vmm_config::snapshot::MemBackendConfig;
+use crate::vmm_config::snapshot::{MemBackendConfig, MemBackendType};
 use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
@@ -118,6 +121,8 @@ pub enum StartMicrovmError {
     GuestMemory(crate::vstate::memory::MemoryError),
     /// Cannot hand guest memory to its memory backend: {0}
     MemoryBackend(GuestMemoryFromUffdError),
+    /// Cannot make guest memory of its memory backend's mappings: {0}
+    MappingsMemory(MappingsMemoryError),
     /// A memory backend serves anonymous guest memory, which a vhost-user device's back-end can't map
     MemoryBackendVhostUser,
     /// Error with initrd initialization: {0}.
@@ -229,10 +234,13 @@ pub fn build_microvm_for_boot(
     let BootMemory {
         dram,
         hotpluggable,
+        mut pmem,
         uffd,
-    } = allocate_guest_memory(&vm, vm_resources)?;
+        memory_backend,
+    } = allocate_guest_memory(&vm, vm_resources, seccomp_filters)?;
     vm.register_dram_memory_regions(dram)?;
     vm.set_uffd(uffd);
+    vm.set_memory_backend(memory_backend);
     let virtio_mem_addr = match (hotpluggable, &vm_resources.memory_hotplug) {
         (Some((addr, hotplug_memory_region)), Some(memory_hotplug)) => {
             vm.register_hotpluggable_memory_region(
@@ -300,6 +308,7 @@ pub fn build_microvm_for_boot(
         &vm,
         &mut boot_cmdline,
         &vm_resources.pmem.configs,
+        &mut pmem,
         event_manager,
     )?;
     #[cfg(feature = "cladefs")]
@@ -488,6 +497,7 @@ pub fn build_microvm_from_snapshot(
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
     uffd: Option<Uffd>,
+    memory_backend: Option<Arc<MemoryBackend>>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
@@ -553,6 +563,7 @@ pub fn build_microvm_from_snapshot(
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
 
     vm.set_uffd(uffd);
+    vm.set_memory_backend(memory_backend);
 
     let kvm_vm = Arc::new(vm);
     let vm = Vm::Kvm(kvm_vm.clone());
@@ -676,8 +687,12 @@ struct BootMemory {
     dram: Vec<GuestRegionMmap>,
     /// Its hotpluggable memory's region, with its address, if it has any.
     hotpluggable: Option<(GuestAddress, GuestRegionMmap)>,
-    /// The userfaultfd its memory backend serves it through, if it has one.
+    /// The memory of its pmem devices the memory backend serves (`size_mib`), by ID.
+    pmem: HashMap<String, BackendPmem>,
+    /// The userfaultfd its `Uffd` memory backend serves it through, if it has one.
     uffd: Option<Uffd>,
+    /// Its `Mappings` memory backend, if it has one.
+    memory_backend: Option<Arc<MemoryBackend>>,
 }
 
 impl BootMemory {
@@ -686,7 +701,7 @@ impl BootMemory {
     fn split(
         mut regions: Vec<GuestRegionMmap>,
         hotpluggable: Option<GuestAddress>,
-        uffd: Option<Uffd>,
+        pmem: HashMap<String, BackendPmem>,
     ) -> Self {
         let hotpluggable = hotpluggable.map(|addr| {
             let region = regions
@@ -697,7 +712,9 @@ impl BootMemory {
         Self {
             dram: regions,
             hotpluggable,
-            uffd,
+            pmem,
+            uffd: None,
+            memory_backend: None,
         }
     }
 }
@@ -706,9 +723,10 @@ impl BootMemory {
 fn allocate_guest_memory(
     vm: &KvmVm,
     vm_resources: &VmResources,
+    seccomp_filters: &BpfThreadMap,
 ) -> Result<BootMemory, StartMicrovmError> {
     match &vm_resources.memory_backend {
-        Some(backend) => allocate_backend_memory(vm, vm_resources, backend),
+        Some(backend) => allocate_backend_memory(vm, vm_resources, backend, seccomp_filters),
         None => allocate_local_memory(vm, vm_resources),
     }
 }
@@ -729,12 +747,14 @@ fn hotpluggable_region(
 }
 
 /// The memory of the VM `vm_resources` boot into `vm`, handed to its memory `backend` as a
-/// restored VM's is (`persist::guest_memory_from_uffd`), in one piece. Refused with a vhost-user
-/// device, whose back-end can't map such memory.
+/// restored VM's is (`persist::guest_memory_from_uffd`), in one piece, with that of the pmem
+/// devices the backend serves. Refused with a vhost-user device, whose back-end can't map such
+/// memory.
 fn allocate_backend_memory(
     vm: &KvmVm,
     vm_resources: &VmResources,
     backend: &MemBackendConfig,
+    seccomp_filters: &BpfThreadMap,
 ) -> Result<BootMemory, StartMicrovmError> {
     if vm_resources.vhost_user_device_used() {
         return Err(StartMicrovmError::MemoryBackendVhostUser);
@@ -743,18 +763,46 @@ fn allocate_backend_memory(
     let regions = crate::arch::arch_memory_regions(crate::utils::mib_to_bytes(
         vm_resources.machine_config.mem_size_mib,
     ));
-    let (guest_memory, uffd) = guest_memory_from_uffd(
-        &backend.backend_path,
-        regions.into_iter().chain(hotpluggable),
-        vm_resources.machine_config.track_dirty_pages,
-        vm_resources.machine_config.huge_pages,
-    )
-    .map_err(StartMicrovmError::MemoryBackend)?;
-    Ok(BootMemory::split(
-        guest_memory,
-        hotpluggable.map(|(addr, _)| addr),
-        Some(uffd),
-    ))
+    let pmem = (vm_resources.pmem.configs.iter())
+        .filter_map(|config| Some((config.id.as_str(), config.size_mib?)))
+        .map(|(id, size_mib)| Ok((id, BackendPmem::allocate(vm, size_mib << 20)?)))
+        .collect::<Result<Vec<_>, PmemError>>()?;
+    let handed: Vec<_> = pmem.iter().map(|(id, memory)| (*id, memory)).collect();
+    let regions = regions.into_iter().chain(hotpluggable);
+    let machine = &vm_resources.machine_config;
+    let (guest_memory, uffd, memory_backend) = match backend.backend_type {
+        MemBackendType::Mappings => {
+            let (guest_memory, memory_backend) = guest_memory_from_mappings(
+                &backend.backend_path,
+                regions,
+                &handed,
+                machine.track_dirty_pages,
+                machine.huge_pages,
+                seccomp_filters,
+            )
+            .map_err(StartMicrovmError::MappingsMemory)?;
+            (guest_memory, None, Some(memory_backend))
+        }
+        _ => {
+            let (guest_memory, uffd) = guest_memory_from_uffd(
+                &backend.backend_path,
+                regions,
+                &handed,
+                machine.track_dirty_pages,
+                machine.huge_pages,
+            )
+            .map_err(StartMicrovmError::MemoryBackend)?;
+            (guest_memory, Some(uffd), None)
+        }
+    };
+    let pmem = (pmem.into_iter())
+        .map(|(id, memory)| (id.to_string(), memory))
+        .collect();
+    Ok(BootMemory {
+        uffd,
+        memory_backend,
+        ..BootMemory::split(guest_memory, hotpluggable.map(|(addr, _)| addr), pmem)
+    })
 }
 
 /// The memory of the VM `vm_resources` boot into `vm`, with no memory backend.
@@ -763,6 +811,7 @@ fn allocate_local_memory(
     vm: &KvmVm,
     vm_resources: &VmResources,
 ) -> Result<BootMemory, StartMicrovmError> {
+    refuse_backend_pmem(vm_resources)?;
     let dram = vm_resources
         .allocate_guest_memory()
         .map_err(StartMicrovmError::GuestMemory)?;
@@ -777,8 +826,18 @@ fn allocate_local_memory(
     Ok(BootMemory {
         dram,
         hotpluggable,
+        pmem: HashMap::new(),
         uffd: None,
+        memory_backend: None,
     })
+}
+
+/// Refuses pmem devices of `size_mib` with no memory backend to serve them.
+fn refuse_backend_pmem(vm_resources: &VmResources) -> Result<(), StartMicrovmError> {
+    match (vm_resources.pmem.configs.iter()).any(PmemConfig::backend_served) {
+        true => Err(PmemError::NoMemoryBackend.into()),
+        false => Ok(()),
+    }
 }
 
 /// cladefs: the memory of the VM `vm_resources` boot into `vm` with no memory backend, as
@@ -788,12 +847,13 @@ fn allocate_local_memory(
     vm: &KvmVm,
     vm_resources: &VmResources,
 ) -> Result<BootMemory, StartMicrovmError> {
+    refuse_backend_pmem(vm_resources)?;
     let hotpluggable = hotpluggable_region(vm, vm_resources)?;
     let guest_memory = vm_resources.allocate_cell_memory(hotpluggable)?;
     Ok(BootMemory::split(
         guest_memory,
         hotpluggable.map(|(addr, _)| addr),
-        None,
+        HashMap::new(),
     ))
 }
 
@@ -907,6 +967,7 @@ fn attach_pmem_devices(
     vm: &Vm,
     cmdline: &mut LoaderKernelCmdline,
     configs: &[PmemConfig],
+    backend: &mut HashMap<String, BackendPmem>,
     event_manager: &mut EventManager,
 ) -> Result<(), StartMicrovmError> {
     let kvm_vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
@@ -919,7 +980,7 @@ fn attach_pmem_devices(
             }
         }
         let id = config.id.clone();
-        let pmem = Pmem::new(kvm_vm.clone(), config.clone())?;
+        let pmem = Pmem::new(kvm_vm.clone(), config.clone(), backend.remove(&id))?;
         let device = Arc::new(Mutex::new(pmem));
 
         device_manager.attach_boot_virtio_device(vm, id, device, cmdline, event_manager, false)?;
@@ -1381,6 +1442,7 @@ pub(crate) mod tests {
             &vmm.vm,
             cmdline,
             &builder.configs,
+            &mut HashMap::new(),
             event_manager,
         )
         .unwrap();

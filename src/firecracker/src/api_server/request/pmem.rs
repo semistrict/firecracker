@@ -98,6 +98,7 @@ mod tests {
         let expected_config = PmemConfig {
             id: "1000".to_string(),
             path_on_host: "dummy".to_string(),
+            size_mib: None,
             root_device: true,
             read_only: true,
             rate_limiter: Some(Default::default()),

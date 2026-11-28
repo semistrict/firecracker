@@ -326,15 +326,22 @@ unsafe impl Sync for RawGuestRegionMmap {}
 /// Note: this implements automatic defer for vm_memory::GuestRegionMmap, so it can be used in its place.
 #[derive(Debug)]
 pub struct GuestRegionMmap {
-    /// Held for its `Drop` impl which unmaps the guest memory region.
+    /// Held for its `Drop` impl which unmaps the guest memory region, once every holder of a
+    /// [`GuestMapping`] of it is done too.
     #[cfg(not(feature = "cladefs"))]
-    _region: RawGuestRegionMmap,
+    _region: Arc<RawGuestRegionMmap>,
     /// Held for its `Drop` impl which unmaps the guest memory region; `None` for memory-cell
     /// regions carved from `cladefs_memory`'s single reservation, which owns the mapping.
     #[cfg(feature = "cladefs")]
-    _region: Option<RawGuestRegionMmap>,
+    _region: Option<Arc<RawGuestRegionMmap>>,
     proxy: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>,
 }
+
+/// A hold on a guest memory region's host mapping, which stays mapped while it is held, its
+/// [`GuestRegionMmap`] gone or not: what a memory backend mapping into the region holds, so that
+/// it never maps into address space freed and used again.
+#[derive(Debug, Clone)]
+pub struct GuestMapping(#[allow(dead_code)] Arc<RawGuestRegionMmap>);
 
 impl Deref for GuestRegionMmap {
     type Target = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;
@@ -392,12 +399,24 @@ impl GuestRegionMmap {
 
         Ok(GuestRegionMmap {
             #[cfg(not(feature = "cladefs"))]
-            _region: region,
+            _region: Arc::new(region),
             #[cfg(feature = "cladefs")]
-            _region: Some(region),
+            _region: Some(Arc::new(region)),
             proxy: vm_memory::GuestRegionMmap::new(mmap_region, guest_base)
                 .ok_or(MemoryError::VmMemoryError)?,
         })
+    }
+
+    /// A hold on the region's host mapping ([`GuestMapping`]); none of a region whose mapping is
+    /// another's (cladefs's memory cell regions).
+    pub(crate) fn mapping(&self) -> Option<GuestMapping> {
+        #[cfg(not(feature = "cladefs"))]
+        return Some(GuestMapping(Arc::clone(&self._region)));
+        #[cfg(feature = "cladefs")]
+        return self
+            ._region
+            .as_ref()
+            .map(|region| GuestMapping(Arc::clone(region)));
     }
 
     /// cladefs: wraps a `vm_memory::GuestRegionMmap` carved from `cladefs_memory`'s single

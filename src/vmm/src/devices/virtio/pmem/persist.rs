@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::device::{ConfigSpace, Pmem, PmemError};
+use super::device::{BackendPmem, ConfigSpace, Pmem, PmemError};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::devices::virtio::pmem::{PMEM_NUM_QUEUES, PMEM_QUEUE_SIZE};
@@ -28,6 +28,8 @@ pub struct PmemState {
 pub struct PmemConstructorArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm: Arc<KvmVm>,
+    /// A device of `size_mib`'s memory, which the memory backend serves.
+    pub backend: Option<BackendPmem>,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -70,6 +72,7 @@ impl<'a> Persist<'a> for Pmem {
         let mut pmem = Pmem::new_with_queues(
             constructor_args.vm,
             state.config.clone(),
+            constructor_args.backend,
             queues,
             state.virtio_state.acked_features,
             Some(state.config_space),
@@ -106,7 +109,7 @@ mod tests {
         };
         let guest_mem = default_mem();
         let vm = Arc::new(setup_vm());
-        let pmem = Pmem::new(vm.clone(), config).unwrap();
+        let pmem = Pmem::new(vm.clone(), config, None).unwrap();
 
         // Save the block device.
         let pmem_state = pmem.save();
@@ -119,6 +122,7 @@ mod tests {
             PmemConstructorArgs {
                 mem: &guest_mem,
                 vm: vm.clone(),
+                backend: None,
             },
             &restored_state,
         )
@@ -152,7 +156,7 @@ mod tests {
         };
         let guest_mem = default_mem();
         let vm = Arc::new(setup_vm());
-        let pmem = Pmem::new(vm.clone(), config).unwrap();
+        let pmem = Pmem::new(vm.clone(), config, None).unwrap();
 
         let mut pmem_state = pmem.save();
         drop(pmem);
@@ -163,6 +167,7 @@ mod tests {
             PmemConstructorArgs {
                 mem: &guest_mem,
                 vm: vm.clone(),
+                backend: None,
             },
             &pmem_state,
         )

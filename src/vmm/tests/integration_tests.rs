@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
+use vmm::memory_backend::{Entry, FromHandler, ToHandler, recv_frame, send_frame};
 use vmm::persist::{
     GuestMemoryFromFileError, GuestRegionUffdMapping, MicrovmState, MicrovmStateError,
     RestoreFromSnapshotError, RestoreFromSnapshotGuestMemoryError, VirtioDevicesState, VmInfo,
@@ -24,6 +25,7 @@ use vmm::persist::{
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
+    VmmData,
 };
 use vmm::seccomp::get_empty_filters;
 use vmm::snapshot::Snapshot;
@@ -35,6 +37,7 @@ use vmm::vmm_config::drive::BlockDeviceConfig;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::machine_config::{HugePageConfig, MachineConfig, MachineConfigUpdate};
 use vmm::vmm_config::net::NetworkInterfaceConfig;
+use vmm::vmm_config::pmem::PmemConfig;
 use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType,
     SnapshotLoadHugePageConfig, SnapshotType,
@@ -257,9 +260,6 @@ fn verify_create_snapshot(
     let snapshot_params = CreateSnapshotParams {
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
-        #[cfg(not(feature = "cladefs"))]
-        mem_file_path: memory_file.as_path().to_path_buf(),
-        #[cfg(feature = "cladefs")]
         mem_file_path: Some(memory_file.as_path().to_path_buf()),
         sync_snapshot_files: true,
         #[cfg(feature = "cladefs")]
@@ -564,9 +564,10 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
 
 /// A page fault handler on a thread of its own, as an external one would be: it takes the regions
 /// and the userfaultfd Firecracker hands over at its socket, and fills each page as it is first
-/// touched, from a snapshot's memory file, or with zeros for a booted VM. It counts the pages it
-/// filled.
+/// touched, from a snapshot's memory file, or with zeros for a booted VM. It keeps the regions,
+/// and counts the pages it filled.
 struct UffdHandler {
+    regions: Arc<Mutex<Vec<GuestRegionUffdMapping>>>,
     filled: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -575,13 +576,15 @@ struct UffdHandler {
 impl UffdHandler {
     fn spawn(socket: &Path, memory: Option<File>) -> Self {
         let listener = UnixListener::bind(socket).unwrap();
+        let regions = Arc::new(Mutex::new(Vec::new()));
         let filled = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (filled, stop) = (filled.clone(), stop.clone());
-            thread::spawn(move || Self::serve(&listener, memory.as_ref(), &filled, &stop))
+            let (regions, filled, stop) = (regions.clone(), filled.clone(), stop.clone());
+            thread::spawn(move || Self::serve(&listener, memory.as_ref(), &regions, &filled, &stop))
         };
         Self {
+            regions,
             filled,
             stop,
             thread: Some(thread),
@@ -591,6 +594,7 @@ impl UffdHandler {
     fn serve(
         listener: &UnixListener,
         memory: Option<&File>,
+        handed: &Mutex<Vec<GuestRegionUffdMapping>>,
         filled: &AtomicUsize,
         stop: &AtomicBool,
     ) {
@@ -598,6 +602,7 @@ impl UffdHandler {
         let mut body = vec![0u8; 4096];
         let (len, uffd) = stream.recv_with_fd(&mut body).unwrap();
         let regions: Vec<GuestRegionUffdMapping> = serde_json::from_slice(&body[..len]).unwrap();
+        handed.lock().unwrap().clone_from(&regions);
         // SAFETY: Firecracker sent its userfaultfd, which no one else here owns.
         let uffd = unsafe { userfaultfd::Uffd::from_raw_fd(uffd.unwrap().into_raw_fd()) };
         let mut page = vec![0u8; regions[0].page_size];
@@ -643,6 +648,13 @@ impl UffdHandler {
     fn filled(&self) -> usize {
         self.filled.load(Ordering::Relaxed)
     }
+
+    /// The regions Firecracker handed over, pmem devices' by ID.
+    fn regions(&self) -> Vec<(Option<String>, usize)> {
+        (self.regions.lock().unwrap().iter())
+            .map(|r| (r.pmem_id.clone(), r.size))
+            .collect()
+    }
 }
 
 impl Drop for UffdHandler {
@@ -652,39 +664,19 @@ impl Drop for UffdHandler {
     }
 }
 
-/// A VM booted with a `Uffd` memory backend has every page of its memory filled by the handler,
-/// the kernel the VMM loads included; its snapshot restores through the same backend.
-#[test]
-fn test_boot_and_restore_with_uffd_memory_backend() {
-    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+/// Pauses the VM and makes a full snapshot of it: its state file and memory file.
+fn snapshot(vmm: &Arc<Mutex<Vmm>>, event_manager: &mut EventManager) -> (TempFile, TempFile) {
     let snapshot_file = TempFile::new().unwrap();
     let memory_file = TempFile::new().unwrap();
-
-    let boot_socket = dir.as_path().join("boot.sock");
-    let handler = UffdHandler::spawn(&boot_socket, None);
-    let mut resources = mock_resources(Some(NOISY_KERNEL_IMAGE), false, false, false);
-    resources
-        .set_memory_backend(MemBackendConfig {
-            backend_type: MemBackendType::Uffd,
-            backend_path: boot_socket,
-        })
-        .unwrap();
-    let (vmm, mut event_manager) = build_vmm(&resources, true);
-    // Loading the kernel filled pages before a vCPU ran.
-    assert!(handler.filled() > 0);
-    thread::sleep(Duration::from_millis(200));
     let mut controller = RuntimeApiController::new(vmm.clone());
     controller
-        .handle_request(VmmAction::Pause, &mut event_manager)
+        .handle_request(VmmAction::Pause, event_manager)
         .unwrap();
     controller
         .handle_request(
             VmmAction::CreateSnapshot(CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: snapshot_file.as_path().to_path_buf(),
-                #[cfg(not(feature = "cladefs"))]
-                mem_file_path: memory_file.as_path().to_path_buf(),
-                #[cfg(feature = "cladefs")]
                 mem_file_path: Some(memory_file.as_path().to_path_buf()),
                 sync_snapshot_files: true,
                 #[cfg(feature = "cladefs")]
@@ -692,17 +684,14 @@ fn test_boot_and_restore_with_uffd_memory_backend() {
                 #[cfg(feature = "cladefs")]
                 for_migration: false,
             }),
-            &mut event_manager,
+            event_manager,
         )
         .unwrap();
-    vmm.lock().unwrap().stop(FcExitCode::Ok);
-    drop(handler);
+    (snapshot_file, memory_file)
+}
 
-    let restore_socket = dir.as_path().join("restore.sock");
-    let handler = UffdHandler::spawn(
-        &restore_socket,
-        Some(File::open(memory_file.as_path()).unwrap()),
-    );
+/// Restores `snapshot_file` with a `Uffd` memory backend at `socket`, resumed.
+fn restore_with_uffd(snapshot_file: &TempFile, socket: &Path) -> Arc<Mutex<Vmm>> {
     let mut event_manager = EventManager::new().unwrap();
     let empty_seccomp_filters = get_empty_filters();
     let mut vm_resources = VmResources::default();
@@ -716,7 +705,7 @@ fn test_boot_and_restore_with_uffd_memory_backend() {
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
             mem_backend: MemBackendConfig {
-                backend_path: restore_socket,
+                backend_path: socket.to_path_buf(),
                 backend_type: MemBackendType::Uffd,
             },
             track_dirty_pages: false,
@@ -733,10 +722,83 @@ fn test_boot_and_restore_with_uffd_memory_backend() {
         .unwrap();
     let vmm = preboot_api_controller.built_vmm.take().unwrap();
     assert_eq!(vmm.lock().unwrap().instance_info.state, VmState::Running);
+    vmm
+}
+
+/// Resources of a VM whose memory the `Uffd` backend at `socket` serves.
+fn uffd_resources(socket: &Path) -> VmResources {
+    let mut resources = mock_resources(Some(NOISY_KERNEL_IMAGE), false, false, false);
+    resources
+        .set_memory_backend(MemBackendConfig {
+            backend_type: MemBackendType::Uffd,
+            backend_path: socket.to_path_buf(),
+        })
+        .unwrap();
+    resources
+}
+
+/// A VM booted with a `Uffd` memory backend has every page of its memory filled by the handler,
+/// the kernel the VMM loads included; its snapshot restores through the same backend.
+#[test]
+fn test_boot_and_restore_with_uffd_memory_backend() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let boot_socket = dir.as_path().join("boot.sock");
+    let handler = UffdHandler::spawn(&boot_socket, None);
+    let (vmm, mut event_manager) = build_vmm(&uffd_resources(&boot_socket), true);
+    // Loading the kernel filled pages before a vCPU ran.
+    assert!(handler.filled() > 0);
+    thread::sleep(Duration::from_millis(200));
+    let (snapshot_file, memory_file) = snapshot(&vmm, &mut event_manager);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    drop(handler);
+
+    let restore_socket = dir.as_path().join("restore.sock");
+    let handler = UffdHandler::spawn(
+        &restore_socket,
+        Some(File::open(memory_file.as_path()).unwrap()),
+    );
+    let vmm = restore_with_uffd(&snapshot_file, &restore_socket);
     thread::sleep(Duration::from_millis(200));
     vmm.lock().unwrap().stop(FcExitCode::Ok);
     // The restored vCPUs' accesses were filled from the snapshot's memory.
     assert!(handler.filled() > 0);
+}
+
+/// A pmem device of `size_mib` has its memory handed to the memory backend with guest memory's, at
+/// boot and at restore, where its snapshot placed it.
+#[test]
+fn test_uffd_memory_backend_serves_pmem() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let boot_socket = dir.as_path().join("boot.sock");
+    let handler = UffdHandler::spawn(&boot_socket, None);
+    let mut resources = uffd_resources(&boot_socket);
+    resources
+        .build_pmem_device(PmemConfig {
+            id: "window".into(),
+            size_mib: Some(4),
+            ..Default::default()
+        })
+        .unwrap();
+    let (vmm, mut event_manager) = build_vmm(&resources, true);
+    let regions = handler.regions();
+    assert_eq!(regions.last(), Some(&(Some("window".to_string()), 4 << 20)));
+    assert_eq!(
+        regions.iter().filter(|(id, _)| id.is_some()).count(),
+        1,
+        "{regions:?}"
+    );
+    let (snapshot_file, memory_file) = snapshot(&vmm, &mut event_manager);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    drop(handler);
+
+    let restore_socket = dir.as_path().join("restore.sock");
+    let handler = UffdHandler::spawn(
+        &restore_socket,
+        Some(File::open(memory_file.as_path()).unwrap()),
+    );
+    let vmm = restore_with_uffd(&snapshot_file, &restore_socket);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    assert_eq!(handler.regions(), regions);
 }
 
 /// A booted VM's memory backend is `Uffd` alone: there is no snapshot memory file to load.
@@ -751,4 +813,440 @@ fn test_boot_memory_backend_must_be_uffd() {
         Err(vmm::vmm_config::snapshot::MemoryBackendConfigError::NotUffd(MemBackendType::File))
     );
     assert_eq!(resources.memory_backend, None);
+}
+
+/// The pages of guest memory a `MappingsHandler` lists lazy at start: the end of the first region,
+/// which the test kernel leaves be.
+const LAZY_PAGES: u64 = 16;
+
+/// A `Mappings` handler on threads of its own, as an external one would be: it maps every region
+/// as a private mapping of a memfd of its own, laid out as the handshake's offsets say, and
+/// installs each page as it is first touched (`UFFDIO_CONTINUE`), writing zeros where the memfd
+/// has none (a missing fault). It persists by copying guest memory into a second memfd, remapping
+/// guest memory's regions onto it, and answering with how many bytes it kept.
+struct MappingsHandler {
+    /// Its state, which the test and its thread share.
+    shared: Arc<Mutex<MappingsShared>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Default)]
+struct MappingsShared {
+    /// The regions Firecracker handed over.
+    regions: Vec<GuestRegionUffdMapping>,
+    /// The memfd guest memory is a private mapping of.
+    memfd: Option<File>,
+    /// The pages it installed.
+    installed: usize,
+    /// The maps Firecracker answered, by ID: whether applied.
+    answers: Vec<(u64, bool)>,
+    /// The socket to Firecracker, for maps the test asks for.
+    stream: Option<std::os::unix::net::UnixStream>,
+    /// Whether it serves a fresh boot, given no memory.
+    booting: bool,
+}
+
+fn new_memfd(len: u64) -> File {
+    // SAFETY: Makes a memfd, whose descriptor it owns at once.
+    let fd = unsafe { libc::memfd_create(c"mappings-handler".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+    // SAFETY: The descriptor is this one's alone.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(len).unwrap();
+    file
+}
+
+impl MappingsHandler {
+    /// Listens at `socket`; restored, its guest memory is `memory`'s.
+    fn spawn(socket: &Path, memory: Option<File>) -> Self {
+        let listener = UnixListener::bind(socket).unwrap();
+        let shared = Arc::new(Mutex::new(MappingsShared {
+            booting: memory.is_none(),
+            memfd: memory,
+            ..Default::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (shared, stop) = (shared.clone(), stop.clone());
+            thread::spawn(move || Self::serve(&listener, &shared, &stop))
+        };
+        Self {
+            shared,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// The regions' entries mapping all of `memfd` as the handshake lays it out, guest memory's
+    /// alone if `guest_only`; with `lazy_tail`, the first region's last [`LAZY_PAGES`] pages lazy
+    /// instead.
+    fn maps(
+        regions: &[GuestRegionUffdMapping],
+        guest_only: bool,
+        lazy_tail: bool,
+    ) -> Vec<FromHandler> {
+        (regions.iter().enumerate())
+            .filter(|(_, r)| !guest_only || r.pmem_id.is_none())
+            .map(|(i, r)| {
+                let lazy = if i == 0 && lazy_tail {
+                    LAZY_PAGES * r.page_size as u64
+                } else {
+                    0
+                };
+                let size = r.size as u64 - lazy;
+                let mut entries = vec![Entry::File {
+                    fd: 0,
+                    file_offset: r.offset,
+                    offset: 0,
+                    len: size,
+                }];
+                if lazy > 0 {
+                    entries.push(Entry::Lazy {
+                        offset: size,
+                        len: lazy,
+                    });
+                }
+                FromHandler::Map {
+                    id: i as u64,
+                    region: i,
+                    entries,
+                }
+            })
+            .collect()
+    }
+
+    fn serve(listener: &UnixListener, shared: &Mutex<MappingsShared>, stop: &AtomicBool) {
+        let (stream, _) = listener.accept().unwrap();
+        let (handshake, mut fds) = recv_frame::<ToHandler>(&stream).unwrap();
+        let ToHandler::Handshake { regions } = handshake else {
+            panic!("{handshake:?}")
+        };
+        // SAFETY: Firecracker sent its userfaultfd, which no one else here owns.
+        let uffd = unsafe { userfaultfd::Uffd::from_raw_fd(fds.remove(0).into_raw_fd()) };
+        let total: u64 = regions.iter().map(|r| r.size as u64).sum();
+        // What guest memory is a private mapping of: the memfd the handler was given, restored.
+        let mut memfd = {
+            let mut shared = shared.lock().unwrap();
+            shared.regions.clone_from(&regions);
+            shared.stream = Some(stream.try_clone().unwrap());
+            shared
+                .memfd
+                .get_or_insert_with(|| new_memfd(total))
+                .try_clone()
+                .unwrap()
+        };
+        // A fresh boot's handler lists the end of guest memory lazy; a restore's, all of it.
+        let booting = shared.lock().unwrap().booting;
+        for map in Self::maps(&regions, false, booting) {
+            send_frame(&stream, &map, &[memfd.as_raw_fd()]).unwrap();
+            assert!(matches!(
+                recv_frame::<ToHandler>(&stream).unwrap().0,
+                ToHandler::Mapped { .. }
+            ));
+        }
+        send_frame(&stream, &FromHandler::Ready, &[]).unwrap();
+
+        let mut copier: Option<thread::JoinHandle<File>> = None;
+        while !stop.load(Ordering::Relaxed) {
+            let mut polls = [
+                libc::pollfd {
+                    fd: uffd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: Polls the descriptors it is given.
+            unsafe { libc::poll(polls.as_mut_ptr(), 2, 10) };
+            if polls[0].revents & libc::POLLIN != 0 {
+                Self::serve_fault(&uffd, &regions, &memfd, shared);
+            }
+            if polls[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                let Ok((message, _)) = recv_frame::<ToHandler>(&stream) else {
+                    break;
+                };
+                match message {
+                    // Read guest memory on a thread of its own, this one serving its faults.
+                    ToHandler::Persist => {
+                        let regions = regions.clone();
+                        copier = Some(thread::spawn(move || {
+                            let kept = new_memfd(total);
+                            for r in regions.iter().filter(|r| r.pmem_id.is_none()) {
+                                // SAFETY: Guest memory Firecracker handed over, which it keeps
+                                // still while it waits for the persist.
+                                let bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        r.base_host_virt_addr as *const u8,
+                                        r.size,
+                                    )
+                                };
+                                kept.write_all_at(bytes, r.offset).unwrap();
+                            }
+                            kept
+                        }));
+                    }
+                    ToHandler::Mapped { id } => shared.lock().unwrap().answers.push((id, true)),
+                    ToHandler::MapRefused { id, .. } => {
+                        shared.lock().unwrap().answers.push((id, false))
+                    }
+                    ToHandler::Handshake { .. } => panic!("a second handshake"),
+                }
+            }
+            if copier.as_ref().is_some_and(|c| c.is_finished()) {
+                let kept = copier.take().unwrap().join().unwrap();
+                for map in Self::maps(&regions, true, false) {
+                    send_frame(&stream, &map, &[kept.as_raw_fd()]).unwrap();
+                }
+                memfd = kept.try_clone().unwrap();
+                shared.lock().unwrap().memfd = Some(kept);
+                let result = serde_json::json!({"kept": total});
+                send_frame(&stream, &FromHandler::Persisted { result }, &[]).unwrap();
+            }
+        }
+    }
+
+    /// Installs the page of the fault `uffd` reports, from `memfd`, as `regions` lay it out:
+    /// writing zeros there first where it has none (a missing fault).
+    fn serve_fault(
+        uffd: &userfaultfd::Uffd,
+        regions: &[GuestRegionUffdMapping],
+        memfd: &File,
+        shared: &Mutex<MappingsShared>,
+    ) {
+        let Some(userfaultfd::Event::Pagefault { kind, addr, .. }) = uffd.read_event().unwrap()
+        else {
+            return;
+        };
+        let page = regions[0].page_size;
+        let addr = addr as u64 & !(page as u64 - 1);
+        let r = (regions.iter())
+            .find(|r| {
+                (r.base_host_virt_addr..r.base_host_virt_addr + r.size as u64).contains(&addr)
+            })
+            .unwrap();
+        if kind == userfaultfd::FaultKind::Missing {
+            let offset = r.offset + addr - r.base_host_virt_addr;
+            memfd.write_all_at(&vec![0u8; page], offset).unwrap();
+        }
+        // A page two vCPUs faulted on is installed once.
+        if uffd.r#continue(addr as *mut _, page, true).is_ok() {
+            shared.lock().unwrap().installed += 1;
+        }
+    }
+
+    fn installed(&self) -> usize {
+        self.shared.lock().unwrap().installed
+    }
+
+    /// Asks Firecracker to map region `region` as zeros, as map `id`: all of it, or its last
+    /// `pages` pages.
+    fn map_zeros(&self, id: u64, region: usize, pages: Option<u64>) {
+        let shared = self.shared.lock().unwrap();
+        let r = &shared.regions[region];
+        let len = pages.map_or(r.size as u64, |pages| pages * r.page_size as u64);
+        let map = FromHandler::Map {
+            id,
+            region,
+            entries: vec![Entry::Zeros {
+                offset: r.size as u64 - len,
+                len,
+            }],
+        };
+        send_frame(shared.stream.as_ref().unwrap(), &map, &[]).unwrap();
+    }
+
+    /// Firecracker's answer to map `id`, once it came: whether applied.
+    fn answer(&self, id: u64) -> bool {
+        loop {
+            if let Some((_, applied)) =
+                (self.shared.lock().unwrap().answers.iter()).find(|(answered, _)| *answered == id)
+            {
+                return *applied;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn memory(&self) -> File {
+        let shared = self.shared.lock().unwrap();
+        shared.memfd.as_ref().unwrap().try_clone().unwrap()
+    }
+}
+
+impl Drop for MappingsHandler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+/// A VM booted with a `Mappings` memory backend runs on the handler's mappings, every page of
+/// them installed by it, the kernel the VMM loads included; its snapshot is the handler's, no
+/// memory file, and restores through the same backend. The handler maps a pmem device's region
+/// while the VM runs, and is refused guest memory's then.
+#[test]
+fn test_boot_snapshot_and_restore_with_mappings_memory_backend() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let boot_socket = dir.as_path().join("boot.sock");
+    let handler = MappingsHandler::spawn(&boot_socket, None);
+    let mut resources = mock_resources(Some(NOISY_KERNEL_IMAGE), false, false, false);
+    resources
+        .set_memory_backend(MemBackendConfig {
+            backend_type: MemBackendType::Mappings,
+            backend_path: boot_socket,
+        })
+        .unwrap();
+    resources
+        .build_pmem_device(PmemConfig {
+            id: "window".into(),
+            size_mib: Some(4),
+            ..Default::default()
+        })
+        .unwrap();
+    let (vmm, mut event_manager) = build_vmm(&resources, true);
+    // Loading the kernel installed pages before a vCPU ran.
+    assert!(handler.installed() > 0);
+    thread::sleep(Duration::from_millis(200));
+
+    // While the VM runs: the pmem device's region may be mapped; guest memory's may be over its
+    // lazy entries alone, once.
+    let regions = handler.shared.lock().unwrap().regions.len();
+    handler.map_zeros(100, regions - 1, None);
+    assert!(handler.answer(100));
+    handler.map_zeros(101, 0, None);
+    assert!(!handler.answer(101));
+    handler.map_zeros(102, 0, Some(LAZY_PAGES));
+    assert!(handler.answer(102));
+    handler.map_zeros(103, 0, Some(LAZY_PAGES));
+    assert!(!handler.answer(103));
+
+    let snapshot_file = TempFile::new().unwrap();
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    let persisted = controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_file_path: None,
+                sync_snapshot_files: true,
+                #[cfg(feature = "cladefs")]
+                memory_cell: None,
+                #[cfg(feature = "cladefs")]
+                for_migration: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+    let total: usize = (handler.shared.lock().unwrap().regions.iter())
+        .map(|r| r.size)
+        .sum();
+    assert_eq!(
+        persisted,
+        VmmData::MemoryBackendPersisted(serde_json::json!({"kept": total}))
+    );
+    // Remapped onto what it kept, the VM runs on.
+    controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    // The VM goes before its handler, which serves its vCPUs' faults until they are gone: the
+    // handler going first would end the process (MemoryBackendLost).
+    drop((controller, event_manager, vmm));
+    let memory = handler.memory();
+    drop(handler);
+
+    let restore_socket = dir.as_path().join("restore.sock");
+    let handler = MappingsHandler::spawn(&restore_socket, Some(memory));
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot_api_controller = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+    preboot_api_controller
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: restore_socket,
+                backend_type: MemBackendType::Mappings,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
+            clock_realtime: false,
+            huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+        }))
+        .unwrap();
+    let vmm = preboot_api_controller.built_vmm.take().unwrap();
+    // Restored, guest memory is what the first handler kept, read through the mappings the second
+    // listed (each page installed by it as this thread touches it).
+    let (regions, memory) = {
+        let shared = handler.shared.lock().unwrap();
+        (
+            shared.regions.clone(),
+            shared.memfd.as_ref().unwrap().try_clone().unwrap(),
+        )
+    };
+    for r in regions.iter().filter(|r| r.pmem_id.is_none()) {
+        let mut kept = vec![0u8; r.size];
+        memory.read_exact_at(&mut kept, r.offset).unwrap();
+        // SAFETY: Guest memory Firecracker handed over, which the paused VM leaves be.
+        let restored =
+            unsafe { std::slice::from_raw_parts(r.base_host_virt_addr as *const u8, r.size) };
+        // But for system memory, where loading writes devices' state anew (the VM generation ID,
+        // the VMClock page): the first region's start, from DRAM's.
+        let differing: Vec<u64> = (restored.chunks(r.page_size).zip(kept.chunks(r.page_size)))
+            .enumerate()
+            .filter(|(_, (restored, kept))| restored != kept)
+            .map(|(page, _)| r.offset + (page * r.page_size) as u64)
+            .collect();
+        #[cfg(target_arch = "x86_64")]
+        let dram_start = 0;
+        #[cfg(target_arch = "aarch64")]
+        let dram_start = vmm::arch::DRAM_MEM_START;
+        let system_start = vmm::arch::SYSTEM_MEM_START - dram_start;
+        let system = system_start..system_start + vmm::arch::SYSTEM_MEM_SIZE;
+        assert!(
+            differing.iter().all(|at| system.contains(at)),
+            "pages differing past system memory {system:x?}: {differing:x?}"
+        );
+    }
+    assert!(kept_kernel(&memory));
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    // The restored vCPUs' accesses were installed from what the first handler kept.
+    assert!(handler.installed() > 0);
+}
+
+/// Whether `memory`, guest memory a handler kept, holds anything but zeros: the kernel the VMM
+/// loaded at boot.
+fn kept_kernel(memory: &File) -> bool {
+    let mut page = vec![0u8; 1 << 20];
+    (0..memory.metadata().unwrap().len())
+        .step_by(page.len())
+        .any(|at| {
+            let read = memory.read_at(&mut page, at).unwrap();
+            page[..read].iter().any(|byte| *byte != 0)
+        })
 }

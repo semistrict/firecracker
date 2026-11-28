@@ -668,6 +668,8 @@ impl<'a> Persist<'a> for PciDevices {
                 PmemConstructorArgs {
                     mem,
                     vm: constructor_args.vm.clone(),
+                    backend: (constructor_args.vm_resources.pmem.backend)
+                        .remove(&pmem_state.device_state.config.id),
                 },
                 &pmem_state.device_state,
             )?));
@@ -1007,6 +1009,7 @@ mod tests {
     {{
       "id": "pmem",
       "path_on_host": "{}",
+      "size_mib": null,
       "root_device": true,
       "read_only": true,
       "rate_limiter": null

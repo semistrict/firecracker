@@ -33,6 +33,9 @@ pub enum MemBackendType {
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// Guest memory is made of the mappings a separate process lists, which it serves through
+    /// UFFD, and persists itself when a snapshot is made (`memory_backend`).
+    Mappings,
     /// cladefs: guest memory is a memory cell of the snapshot's cell, its store the backend's
     /// path, served by the extent daemon (TASK-456.3): its pages shared with every VM restored
     /// from the same snapshot on the host, a page the guest stores to a private copy of its own.
@@ -85,11 +88,8 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory.
-    #[cfg(not(feature = "cladefs"))]
-    pub mem_file_path: PathBuf,
-    /// Path to the file that will contain the guest memory. Mutually exclusive with `memory_cell`.
-    #[cfg(feature = "cladefs")]
+    /// Path to the file that will contain the guest memory: required, unless a `Mappings` memory
+    /// backend persists guest memory itself. Mutually exclusive with cladefs's `memory_cell`.
     #[serde(default)]
     pub mem_file_path: Option<PathBuf>,
     /// Whether to fsync the snapshot state and guest memory files.
@@ -296,16 +296,16 @@ pub struct MemBackendConfig {
 /// Errors of a booted VM's memory backend.
 #[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
 pub enum MemoryBackendConfigError {
-    /// A booted VM's memory backend must be `Uffd`: `{0:?}` names a snapshot's memory alone
+    /// A booted VM's memory backend must be `Uffd` or `Mappings`: `{0:?}` names a snapshot's memory alone
     NotUffd(MemBackendType),
 }
 
 impl MemBackendConfig {
-    /// Checks the backend may serve a booted VM's memory: `Uffd` alone, as there is no snapshot
-    /// memory to load.
+    /// Checks the backend may serve a booted VM's memory: `Uffd` or `Mappings`, as there is no
+    /// snapshot memory to load.
     pub fn validate_for_boot(&self) -> Result<(), MemoryBackendConfigError> {
         match self.backend_type {
-            MemBackendType::Uffd => Ok(()),
+            MemBackendType::Uffd | MemBackendType::Mappings => Ok(()),
             other => Err(MemoryBackendConfigError::NotUffd(other)),
         }
     }

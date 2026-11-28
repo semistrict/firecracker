@@ -228,6 +228,7 @@ impl ParsedRequest {
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
                 #[cfg(feature = "cladefs")]
                 VmmData::MemoryCellSnapshot(snapshot) => Self::success_response_with_data(snapshot),
+                VmmData::MemoryBackendPersisted(result) => Self::success_response_with_data(result),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -654,6 +655,9 @@ pub mod tests {
                 VmmData::MemoryCellSnapshot(snapshot) => {
                     http_response(&serde_json::to_string(snapshot).unwrap(), 200)
                 }
+                VmmData::MemoryBackendPersisted(result) => {
+                    http_response(&serde_json::to_string(result).unwrap(), 200)
+                }
             };
             let response = ParsedRequest::convert_to_response(&data);
             response.write_all(&mut buf).unwrap();
@@ -690,6 +694,9 @@ pub mod tests {
             ..Default::default()
         }));
         verify_ok_response_with(VmmData::Empty);
+        verify_ok_response_with(VmmData::MemoryBackendPersisted(
+            serde_json::json!({"version": 7}),
+        ));
         verify_ok_response_with(VmmData::EnclaveConfiguration(EnclaveConfig::default()));
         verify_ok_response_with(VmmData::FullVmConfig(VmmConfig::default()));
         verify_ok_response_with(VmmData::MachineConfiguration(MachineConfig::default()));

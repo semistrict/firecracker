@@ -561,8 +561,10 @@ impl DeviceManager {
         if config.root_device {
             return Err(PmemConfigError::AddingSecondRootDevice.into());
         }
+        config.validate()?;
 
-        let pmem = Pmem::new(vm.clone(), config).map_err(PmemConfigError::from)?;
+        // A device the memory backend serves can't be added once its memory is handed over.
+        let pmem = Pmem::new(vm.clone(), config, None).map_err(PmemConfigError::from)?;
         Ok(Arc::new(Mutex::new(pmem)))
     }
 
@@ -1268,7 +1270,7 @@ pub(crate) mod tests {
             read_only: false,
             ..Default::default()
         };
-        let pmem = Pmem::new(vmm.vm.as_kvm().unwrap().clone(), cfg).unwrap();
+        let pmem = Pmem::new(vmm.vm.as_kvm().unwrap().clone(), cfg, None).unwrap();
         pci_devices_mut(&mut vmm.device_manager)
             .attach_pci_virtio_device(
                 vmm.vm.as_kvm().unwrap(),

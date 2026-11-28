@@ -101,6 +101,8 @@ pub mod dumbo;
 pub mod gdb;
 /// Logger
 pub mod logger;
+/// The `Mappings` memory backend: a handler listing the mappings that make guest memory.
+pub mod memory_backend;
 /// microVM Metadata Service MMDS
 pub mod mmds;
 /// PCI specific emulation code.
@@ -221,6 +223,9 @@ pub enum FcExitCode {
     BadConfiguration = 152,
     /// Command line arguments parsing error.
     ArgParsing = 153,
+    /// The `Mappings` memory backend went away, or its map failed part-way: no one serves guest
+    /// memory's faults any more, or it is not what the handler asked for.
+    MemoryBackendLost = 160,
     /// cladefs: the extent daemon serving an extent device went, and the VM can't go on: nothing
     /// its store asks is served any more, nor its DAX window's faults (TASK-50.2).
     #[cfg(feature = "cladefs")]

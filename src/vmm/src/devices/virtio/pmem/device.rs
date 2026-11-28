@@ -41,6 +41,10 @@ pub enum PmemError {
     BackingFileZeroSize,
     /// Restored pmem size {0} does not match backing file mapping size {1}
     RestoredSizeMismatch(u64, u64),
+    /// A pmem device of `size_mib` needs the VM's memory backend to serve its memory
+    NoMemoryBackend,
+    /// Error reserving the memory of a pmem device the memory backend serves: {0}
+    BackendMemory(std::io::Error),
     /// Error with EventFd: {0}
     EventFd(std::io::Error),
     /// Unexpected read-only descriptor
@@ -255,6 +259,69 @@ impl PmemMmap {
     }
 }
 
+impl PmemMmap {
+    /// Anonymous memory of `len` bytes, a multiple of [`Pmem::ALIGNMENT`], for a device the
+    /// VM's memory backend serves, which fills its pages as they are first touched.
+    pub fn anonymous(len: u64) -> Result<Self, PmemError> {
+        // SAFETY: We are calling the system call with valid arguments and checking the returned
+        // value
+        let mmap_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                u64_to_usize(len),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if mmap_ptr == libc::MAP_FAILED {
+            return Err(PmemError::BackendMemory(std::io::Error::last_os_error()));
+        }
+        Ok(Self {
+            file_len: len,
+            mmap_ptr: mmap_ptr as u64,
+            mmap_len: len,
+        })
+    }
+}
+
+/// The memory of a pmem device the VM's memory backend serves (`size_mib`), made before the
+/// device: its place in guest physical memory and its host memory, which are handed to the
+/// backend with guest memory's, before anything touches either.
+#[derive(Debug)]
+pub struct BackendPmem {
+    /// Where the device's memory is in guest physical memory.
+    pub config_space: ConfigSpace,
+    /// Its host memory, which the memory backend holds too, so that it stays mapped while the
+    /// backend may map into it, the device gone or not.
+    pub mmap: Arc<PmemMmap>,
+}
+
+impl BackendPmem {
+    /// The memory of a new device of `size` bytes, placed in `vm`'s guest physical memory.
+    pub fn allocate(vm: &KvmVm, size: u64) -> Result<Self, PmemError> {
+        let start = vm
+            .resource_allocator()
+            .past_mmio64_memory
+            .allocate(size, Pmem::ALIGNMENT, AllocPolicy::FirstMatch)
+            .map_err(|_| PmemError::AllocationFailed)?
+            .start();
+        Ok(Self {
+            config_space: ConfigSpace { start, size },
+            mmap: Arc::new(PmemMmap::anonymous(size)?),
+        })
+    }
+
+    /// The memory of a restored device, where its snapshot's `config_space` places it.
+    pub fn restore(config_space: ConfigSpace) -> Result<Self, PmemError> {
+        Ok(Self {
+            config_space,
+            mmap: Arc::new(PmemMmap::anonymous(config_space.size)?),
+        })
+    }
+}
+
 impl Drop for PmemMmap {
     fn drop(&mut self) {
         // SAFETY: `mmap_ptr` is a valid pointer since PmemMmap can only be created via `new()`.
@@ -285,7 +352,7 @@ pub struct Pmem {
     // first before the HVA gets unmapped
     pub kvm_mem_slot: KvmMemSlot,
     pub guest_region: GuestPmemRegion,
-    pub mmap: PmemMmap,
+    pub mmap: Arc<PmemMmap>,
     pub metrics: Arc<PmemMetrics>,
     pub rate_limiter: RateLimiter,
 
@@ -297,21 +364,40 @@ impl Pmem {
     // a multiple of 2MB
     pub const ALIGNMENT: u64 = 2 * 1024 * 1024;
 
-    /// Create a new Pmem device with a backing file at `disk_image_path` path.
-    pub fn new(vm: Arc<KvmVm>, config: PmemConfig) -> Result<Self, PmemError> {
-        Self::new_with_queues(vm, config, vec![Queue::new(PMEM_QUEUE_SIZE)], 0u64, None)
+    /// Create a new Pmem device with a backing file at `disk_image_path` path, or, with `size_mib`,
+    /// of `backend`, the memory the VM's memory backend serves.
+    pub fn new(
+        vm: Arc<KvmVm>,
+        config: PmemConfig,
+        backend: Option<BackendPmem>,
+    ) -> Result<Self, PmemError> {
+        Self::new_with_queues(
+            vm,
+            config,
+            backend,
+            vec![Queue::new(PMEM_QUEUE_SIZE)],
+            0u64,
+            None,
+        )
     }
 
-    /// Create a new Pmem device with a backing file at `disk_image_path` path using a pre-created
-    /// set of queues.
+    /// Create a new Pmem device as [`Pmem::new`] does using a pre-created set of queues.
     pub fn new_with_queues(
         vm: Arc<KvmVm>,
         config: PmemConfig,
+        backend: Option<BackendPmem>,
         queues: Vec<Queue>,
         acked_features: u64,
         config_space: Option<ConfigSpace>,
     ) -> Result<Self, PmemError> {
-        let mmap = PmemMmap::new(&config.path_on_host, config.read_only)?;
+        let (mmap, config_space) = match (config.backend_served(), backend) {
+            (true, Some(backend)) => (backend.mmap, Some(backend.config_space)),
+            (true, None) => return Err(PmemError::NoMemoryBackend),
+            (false, _) => (
+                Arc::new(PmemMmap::new(&config.path_on_host, config.read_only)?),
+                config_space,
+            ),
+        };
 
         let guest_region = match config_space {
             Some(cs) => {
@@ -628,7 +714,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            Pmem::new(vm.clone(), config).unwrap_err(),
+            Pmem::new(vm.clone(), config, None).unwrap_err(),
             PmemError::BackingFile(_),
         ));
 
@@ -642,7 +728,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            Pmem::new(vm.clone(), config).unwrap_err(),
+            Pmem::new(vm.clone(), config, None).unwrap_err(),
             PmemError::BackingFileZeroSize,
         ));
 
@@ -654,7 +740,7 @@ mod tests {
             read_only: false,
             ..Default::default()
         };
-        Pmem::new(vm.clone(), config).unwrap();
+        Pmem::new(vm.clone(), config, None).unwrap();
     }
 
     #[test]
@@ -672,7 +758,7 @@ mod tests {
             read_only: false,
             ..Default::default()
         };
-        let mut pmem = Pmem::new(vm.clone(), config).unwrap();
+        let mut pmem = Pmem::new(vm.clone(), config, None).unwrap();
 
         let mem = default_mem();
         let interrupt = default_interrupt();

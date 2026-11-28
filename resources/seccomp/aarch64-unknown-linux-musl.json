@@ -367,6 +367,26 @@
             },
             {
                 "syscall": "mmap",
+                "comment": "Used by the Mappings memory backend to map a handler's file range over guest memory, inaccessible until registered with the userfaultfd",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 16402,
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "libc::PROT_NONE"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
                 "comment": "Used by pmem device to overlay file mapping on anonymous region",
                 "args": [
                     {
@@ -562,6 +582,19 @@
                         "op": "eq",
                         "val": 4727,
                         "comment": "BLKDISCARD"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Used by the Mappings memory backend to register a handler's mapping with the userfaultfd",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3223366144,
+                        "comment": "UFFDIO_REGISTER"
                     }
                 ]
             },

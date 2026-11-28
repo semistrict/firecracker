@@ -290,6 +290,9 @@ pub enum VmmData {
     /// (TASK-456.4).
     #[cfg(feature = "cladefs")]
     MemoryCellSnapshot(MemoryCellSnapshot),
+    /// What the `Mappings` memory backend answered `/snapshot/create`, having persisted guest
+    /// memory itself.
+    MemoryBackendPersisted(serde_json::Value),
 }
 
 fn mmds_patch_data(
@@ -1059,10 +1062,7 @@ impl RuntimeApiController {
         let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
-        #[cfg(not(feature = "cladefs"))]
-        create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
-        #[cfg(feature = "cladefs")]
-        let memory_snapshot = create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
+        let outcome = create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
 
         match create_params.snapshot_type {
             SnapshotType::Full => {
@@ -1087,10 +1087,13 @@ impl RuntimeApiController {
             }
         }
         #[cfg(feature = "cladefs")]
-        if let Some(snapshot) = memory_snapshot {
+        if let Some(snapshot) = outcome.memory_cell {
             return Ok(VmmData::MemoryCellSnapshot(snapshot));
         }
-        Ok(VmmData::Empty)
+        match outcome.memory_backend {
+            Some(result) => Ok(VmmData::MemoryBackendPersisted(result)),
+            None => Ok(VmmData::Empty),
+        }
     }
 
     /// Updates block device properties:
@@ -1394,9 +1397,6 @@ mod tests {
             CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
-                #[cfg(not(feature = "cladefs"))]
-                mem_file_path: PathBuf::new(),
-                #[cfg(feature = "cladefs")]
                 mem_file_path: Some(PathBuf::new()),
                 sync_snapshot_files: true,
                 #[cfg(feature = "cladefs")]

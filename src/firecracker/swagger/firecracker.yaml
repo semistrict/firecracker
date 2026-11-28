@@ -947,6 +947,11 @@ paths:
           schema:
             $ref: "#/definitions/SnapshotCreateParams"
       responses:
+        200:
+          description: Snapshot created, guest memory persisted by a Mappings memory backend,
+            whose answer is the body
+          schema:
+            type: object
         204:
           description: Snapshot created
         400:
@@ -1592,7 +1597,6 @@ definitions:
     type: object
     required:
       - id
-      - path_on_host
     properties:
       id:
         type: string
@@ -1601,7 +1605,17 @@ definitions:
       path_on_host:
         type: string
         description:
-          Host level path for the virtio-pmem device to use as a backing file.
+          Host level path for the virtio-pmem device to use as a backing file. Either this or
+          size_mib is required.
+      size_mib:
+        type: integer
+        description:
+          The size of a device with no backing file, a multiple of 2, whose memory the VM's memory
+          backend serves as it serves guest memory (PUT /memory-backend, or /snapshot/load's
+          mem_backend of the Uffd type), each page filled by the handler as it is first touched.
+          The handshake lists its region after guest memory's, with its ID as pmem_id. Such a
+          device is neither read-only nor the root device, and its contents are the handler's to
+          keep: a snapshot's memory file holds guest memory alone.
       root_device:
         type: boolean
         description:
@@ -1876,6 +1890,7 @@ definitions:
         enum:
           - File
           - Uffd
+          - Mappings
       backend_path:
         type: string
         description: Based on 'backend_type' it is either
@@ -1883,6 +1898,9 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults
+          3) Path to the UDS where a process is listening that lists the mappings guest memory is
+          made of, serves their page faults, and persists guest memory when a snapshot is made
+          (the protocol is in src/vmm/src/memory_backend.rs)
 
   Metrics:
     type: object
@@ -2042,12 +2060,12 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description: Path to the file that will contain the guest memory. Required, unless the
+          VM's memory backend is of the Mappings type, which persists guest memory itself.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.

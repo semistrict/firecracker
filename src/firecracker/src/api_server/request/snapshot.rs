@@ -53,20 +53,14 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 }
 
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
+    // `mem_file_path` may be missing: a `Mappings` memory backend persists guest memory itself,
+    // which the VMM checks, knowing the backend.
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
     #[cfg(feature = "cladefs")]
-    match (&snapshot_config.mem_file_path, &snapshot_config.memory_cell) {
-        (Some(_), Some(_)) => {
-            return Err(RequestError::SerdeJson(serde_json::Error::custom(
-                "too many fields: either `mem_file_path` or `memory_cell` exclusively is required",
-            )));
-        }
-        (None, None) => {
-            return Err(RequestError::SerdeJson(serde_json::Error::custom(
-                "missing field: either `mem_file_path` or `memory_cell` is required",
-            )));
-        }
-        _ => {}
+    if snapshot_config.mem_file_path.is_some() && snapshot_config.memory_cell.is_some() {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            "too many fields: either `mem_file_path` or `memory_cell` exclusively is required",
+        )));
     }
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
@@ -174,9 +168,6 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
-            #[cfg(not(feature = "cladefs"))]
-            mem_file_path: PathBuf::from("bar"),
-            #[cfg(feature = "cladefs")]
             mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: true,
             #[cfg(feature = "cladefs")]
@@ -198,9 +189,6 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
-            #[cfg(not(feature = "cladefs"))]
-            mem_file_path: PathBuf::from("bar"),
-            #[cfg(feature = "cladefs")]
             mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: false,
             #[cfg(feature = "cladefs")]
@@ -220,9 +208,6 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
-            #[cfg(not(feature = "cladefs"))]
-            mem_file_path: PathBuf::from("bar"),
-            #[cfg(feature = "cladefs")]
             mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: true,
             #[cfg(feature = "cladefs")]
@@ -389,16 +374,32 @@ mod tests {
                 VmmAction::LoadSnapshot(expected_load)
             );
 
-            // Both or neither of mem_file_path and memory_cell are refused.
+            // Both mem_file_path and memory_cell are refused.
             let both = r#"{
                 "snapshot_path": "foo",
                 "mem_file_path": "bar",
                 "memory_cell": {}
             }"#;
             parse_put_snapshot(&Body::new(both), Some("create")).unwrap_err();
-            let neither = r#"{ "snapshot_path": "foo" }"#;
-            parse_put_snapshot(&Body::new(neither), Some("create")).unwrap_err();
         }
+
+        // Neither: a Mappings memory backend persists guest memory, which the VMM checks.
+        let neither = r#"{ "snapshot_path": "foo" }"#;
+        assert_eq!(
+            vmm_action_from_request(
+                parse_put_snapshot(&Body::new(neither), Some("create")).unwrap()
+            ),
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: PathBuf::from("foo"),
+                mem_file_path: None,
+                sync_snapshot_files: true,
+                #[cfg(feature = "cladefs")]
+                memory_cell: None,
+                #[cfg(feature = "cladefs")]
+                for_migration: false,
+            })
+        );
 
         let invalid_body = r#"{
             "invalid_field": "foo",

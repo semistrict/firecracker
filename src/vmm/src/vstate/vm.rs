@@ -29,6 +29,7 @@ use vmm_sys_util::terminal::Terminal;
 use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
 use crate::logger::{debug, info};
+use crate::memory_backend::MemoryBackend;
 use crate::nitro_enclave::enclave_vm::EnclaveVm;
 use crate::pci::PciSBDF;
 use crate::pci::msix::MsixTableEntry;
@@ -93,6 +94,8 @@ pub struct VmCommon {
     pub kvm: Kvm,
     /// Userfaultfd kept open for snapshot restore.
     pub uffd: Option<Uffd>,
+    /// The `Mappings` memory backend serving guest memory, if it has one.
+    pub memory_backend: Option<Arc<MemoryBackend>>,
     /// Handles to vCPU threads.
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
@@ -266,6 +269,7 @@ impl KvmVm {
             mmio_bus: Arc::new(Bus::new()),
             kvm,
             uffd: None,
+            memory_backend: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
             #[cfg(test)]
@@ -312,6 +316,29 @@ impl KvmVm {
     /// Sets the userfaultfd (used during snapshot restore).
     pub fn set_uffd(&mut self, uffd: Option<Uffd>) {
         self.common.uffd = uffd;
+    }
+
+    /// Sets the `Mappings` memory backend serving guest memory.
+    pub fn set_memory_backend(&mut self, backend: Option<Arc<MemoryBackend>>) {
+        self.common.memory_backend = backend;
+    }
+
+    /// The `Mappings` memory backend serving guest memory, if it has one.
+    pub fn memory_backend(&self) -> Option<&Arc<MemoryBackend>> {
+        self.common.memory_backend.as_ref()
+    }
+
+    /// Makes the host memory of every unplugged slot inaccessible again, as registering it did:
+    /// after the memory backend mapped over it, which `MAP_FIXED` makes accessible.
+    pub fn protect_unplugged_slots(&self) -> Result<(), VmError> {
+        for region in self.common.guest_memory.iter() {
+            for (slot, plugged) in region.slots() {
+                if !plugged {
+                    slot.protect(true).map_err(VmError::MemoryError)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Starts the microVM vCPUs.
