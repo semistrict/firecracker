@@ -539,14 +539,14 @@ pub fn restore_from_snapshot(
                     .find(|state| state.device.config.id == entry.id)
             })
             .map(|state| {
-                state
-                    .device
-                    .config
-                    .path_on_host
-                    .clone_from(&entry.path_on_host);
+                if let Some(path) = &entry.path_on_host {
+                    state.device.config.path_on_host.clone_from(path);
+                }
                 if let Some(socket) = &entry.cladefsd_socket {
                     state.device.config.cladefsd_socket.clone_from(socket);
                 }
+                // cladefs board 14663: never in the snapshot, the restore's own.
+                state.device.config.stream.clone_from(&entry.stream);
             })
             .ok_or_else(|| SnapshotStateFromFileError::UnknownCladefsDevice(entry.id.clone()))?;
     }

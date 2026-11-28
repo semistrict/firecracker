@@ -14,6 +14,8 @@ pub use virtio_extent::CacheType;
 pub use virtio_extent::Config as CladefsDeviceConfig;
 /// Errors associated with the operations allowed on an extent-store device.
 pub use virtio_extent::ConfigError as CladefsConfigError;
+/// cladefs: where an extent-store device's guest sends its data requests over vsock (board 14663).
+pub use virtio_extent::StreamConfig as CladefsStreamConfig;
 /// The DAX window's sizes, and guest addresses, are multiples of this: huge pages'.
 pub use virtio_extent::protocol::DAX_WINDOW_ALIGNMENT;
 

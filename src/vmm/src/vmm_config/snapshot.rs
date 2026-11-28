@@ -134,11 +134,17 @@ pub struct NetworkOverride {
 pub struct CladefsOverride {
     /// The ID of the extent-store device to modify.
     pub id: String,
-    /// The store's directory.
-    pub path_on_host: String,
+    /// The store's directory, if not the snapshotted VM's.
+    #[serde(default)]
+    pub path_on_host: Option<String>,
     /// The extent daemon's socket, if not the snapshotted VM's.
     #[serde(default)]
     pub cladefsd_socket: Option<String>,
+    /// Where the restored guest's data requests go over vsock, if its device sent them so: its
+    /// port, and the path this VM's vsock device connects them to (cladefs board 14663). A
+    /// snapshot never holds it, as the path is each VM's own.
+    #[serde(default)]
+    pub stream: Option<crate::vmm_config::cladefs::CladefsStreamConfig>,
 }
 
 /// cladefs: the memory cell a VM restored with `Cell` memory takes its memory from: either a

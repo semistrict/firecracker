@@ -166,6 +166,7 @@ mod tests {
                 dax_private_max_bytes: Some(1 << 20),
                 cladefsd_socket: "/cladefsd.sock".into(),
                 cache_type: CacheType::Unsafe,
+                stream: None,
             },
             window_addr: Some(1 << 40),
             target: cladefs::CellSnapshot::Version(cladefs::CellVersion {
