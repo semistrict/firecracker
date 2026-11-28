@@ -119,7 +119,7 @@ mod tests {
             .to_string();
         assert_eq!(
             refused,
-            "The snapshot's extent device is of protocol version 3, this VMM's 2: its guest's \
+            "The snapshot's extent device is of protocol version 4, this VMM's 3: its guest's \
              driver is of another"
         );
     }

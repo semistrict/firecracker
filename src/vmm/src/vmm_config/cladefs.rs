@@ -71,6 +71,7 @@ mod tests {
             dax_private_max_bytes: None,
             cladefsd_socket: "/cladefsd.sock".into(),
             cache_type: CacheType::Writeback,
+            stream: None,
         }
     }
 
