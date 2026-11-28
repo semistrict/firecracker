@@ -475,6 +475,7 @@ pub fn build_and_boot_enclave(
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
+        memory_backend: None,
         shutdown_exit_code: None,
         vm: Vm::Enclave(enclave_vm),
         device_manager,

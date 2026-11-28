@@ -51,7 +51,10 @@ use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfi
 use crate::vmm_config::serial::SerialConfig;
 #[cfg(feature = "cladefs")]
 use crate::vmm_config::snapshot::MemoryCellSnapshot;
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemoryBackendConfigError,
+    SnapshotType,
+};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
@@ -144,6 +147,9 @@ pub enum VmmAction {
     /// Set the memory hotplug device using `MemoryHotplugConfig` as input. This action can only be
     /// called before the microVM has booted.
     SetMemoryHotplugDevice(MemoryHotplugConfig),
+    /// Set the handler a booted VM's memory is handed to, as a restored VM's is (`Uffd`). This
+    /// action can only be called before the microVM has booted.
+    SetMemoryBackend(MemBackendConfig),
     /// Updates the memory hotplug device using `MemoryHotplugConfigUpdate` as input. This action
     /// can only be called after the microVM has booted.
     UpdateMemoryHotplugSize(MemoryHotplugSizeUpdate),
@@ -205,6 +211,8 @@ pub enum VmmActionError {
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
     /// Memory hotplug update error: {0}
     MemoryHotplugUpdate(VmmError),
+    /// Memory backend config error: {0}
+    MemoryBackendConfig(#[from] MemoryBackendConfigError),
     /// Internal VMM error: {0}
     InternalVmm(#[from] VmmError),
     /// Load snapshot error: {0}
@@ -553,6 +561,7 @@ impl<'a> PrebootApiController<'a> {
                 )),
             SetEntropyDevice(config) => self.set_entropy_device(config),
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
+            SetMemoryBackend(config) => self.set_memory_backend(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
             | FlushMetrics
@@ -688,6 +697,12 @@ impl<'a> PrebootApiController<'a> {
     ) -> Result<VmmData, VmmActionError> {
         self.boot_path = true;
         self.vm_resources.set_memory_hotplug_config(cfg)?;
+        Ok(VmmData::Empty)
+    }
+
+    fn set_memory_backend(&mut self, cfg: MemBackendConfig) -> Result<VmmData, VmmActionError> {
+        self.boot_path = true;
+        self.vm_resources.set_memory_backend(cfg)?;
         Ok(VmmData::Empty)
     }
 
@@ -966,6 +981,7 @@ impl RuntimeApiController {
             | SetMmdsConfiguration(_)
             | SetEntropyDevice(_)
             | SetMemoryHotplugDevice(_)
+            | SetMemoryBackend(_)
             | StartMicroVm
             | UpdateMachineConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
             #[cfg(feature = "cladefs")]
@@ -1507,6 +1523,12 @@ mod tests {
         )));
         check_unsupported(runtime_request(VmmAction::SetMemoryHotplugDevice(
             MemoryHotplugConfig::default(),
+        )));
+        check_unsupported(runtime_request(VmmAction::SetMemoryBackend(
+            MemBackendConfig {
+                backend_type: MemBackendType::Uffd,
+                backend_path: PathBuf::new(),
+            },
         )));
         check_unsupported(runtime_request(VmmAction::SetEnclaveConfig(
             EnclaveConfig::default(),

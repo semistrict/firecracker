@@ -3,7 +3,13 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::tests_outside_test_module)]
 
+use std::fs::File;
 use std::io::{Seek, SeekFrom};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::fs::FileExt;
+use std::os::unix::net::UnixListener;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -11,8 +17,9 @@ use std::time::Duration;
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
 use vmm::persist::{
-    GuestMemoryFromFileError, MicrovmState, MicrovmStateError, RestoreFromSnapshotError,
-    RestoreFromSnapshotGuestMemoryError, VirtioDevicesState, VmInfo, snapshot_state_sanity_check,
+    GuestMemoryFromFileError, GuestRegionUffdMapping, MicrovmState, MicrovmStateError,
+    RestoreFromSnapshotError, RestoreFromSnapshotGuestMemoryError, VirtioDevicesState, VmInfo,
+    snapshot_state_sanity_check,
 };
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
@@ -21,7 +28,7 @@ use vmm::rpc_interface::{
 use vmm::seccomp::get_empty_filters;
 use vmm::snapshot::Snapshot;
 use vmm::test_utils::mock_resources::{MockVmResources, NOISY_KERNEL_IMAGE};
-use vmm::test_utils::{create_vmm, default_vmm, default_vmm_no_boot};
+use vmm::test_utils::{build_vmm, create_vmm, default_vmm, default_vmm_no_boot, mock_resources};
 use vmm::vmm_config::balloon::BalloonDeviceConfig;
 use vmm::vmm_config::boot_source::BootSourceConfig;
 use vmm::vmm_config::drive::BlockDeviceConfig;
@@ -34,6 +41,7 @@ use vmm::vmm_config::snapshot::{
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
+use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 use vmm_sys_util::tempfile::TempFile;
 
 #[allow(unused_mut, unused_variables)]
@@ -552,4 +560,195 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
     let req =
         VmmAction::UpdateMachineConfiguration(MachineConfigUpdate::from(MachineConfig::default()));
     verify_load_snap_disallowed_after_boot_resources(req, "SetVmConfiguration");
+}
+
+/// A page fault handler on a thread of its own, as an external one would be: it takes the regions
+/// and the userfaultfd Firecracker hands over at its socket, and fills each page as it is first
+/// touched, from a snapshot's memory file, or with zeros for a booted VM. It counts the pages it
+/// filled.
+struct UffdHandler {
+    filled: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl UffdHandler {
+    fn spawn(socket: &Path, memory: Option<File>) -> Self {
+        let listener = UnixListener::bind(socket).unwrap();
+        let filled = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (filled, stop) = (filled.clone(), stop.clone());
+            thread::spawn(move || Self::serve(&listener, memory.as_ref(), &filled, &stop))
+        };
+        Self {
+            filled,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn serve(
+        listener: &UnixListener,
+        memory: Option<&File>,
+        filled: &AtomicUsize,
+        stop: &AtomicBool,
+    ) {
+        let (stream, _) = listener.accept().unwrap();
+        let mut body = vec![0u8; 4096];
+        let (len, uffd) = stream.recv_with_fd(&mut body).unwrap();
+        let regions: Vec<GuestRegionUffdMapping> = serde_json::from_slice(&body[..len]).unwrap();
+        // SAFETY: Firecracker sent its userfaultfd, which no one else here owns.
+        let uffd = unsafe { userfaultfd::Uffd::from_raw_fd(uffd.unwrap().into_raw_fd()) };
+        let mut page = vec![0u8; regions[0].page_size];
+        while !stop.load(Ordering::Relaxed) {
+            let mut poll = libc::pollfd {
+                fd: uffd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: Polls the one descriptor it is given.
+            if unsafe { libc::poll(&mut poll, 1, 50) } <= 0 {
+                continue;
+            }
+            let Some(userfaultfd::Event::Pagefault { addr, .. }) = uffd.read_event().unwrap()
+            else {
+                continue;
+            };
+            let addr = addr as u64 & !(page.len() as u64 - 1);
+            let region = regions
+                .iter()
+                .find(|r| {
+                    (r.base_host_virt_addr..r.base_host_virt_addr + r.size as u64).contains(&addr)
+                })
+                .unwrap();
+            // A page two vCPUs faulted on is filled once; the other's fill finds it there.
+            let done = match memory {
+                Some(memory) => {
+                    memory
+                        .read_exact_at(&mut page, region.offset + addr - region.base_host_virt_addr)
+                        .unwrap();
+                    // SAFETY: Fills a page of the guest memory Firecracker registered.
+                    unsafe { uffd.copy(page.as_ptr().cast(), addr as *mut _, page.len(), true) }
+                }
+                // SAFETY: Fills a page of the guest memory Firecracker registered.
+                None => unsafe { uffd.zeropage(addr as *mut _, page.len(), true) },
+            };
+            if done.is_ok() {
+                filled.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn filled(&self) -> usize {
+        self.filled.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for UffdHandler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+/// A VM booted with a `Uffd` memory backend has every page of its memory filled by the handler,
+/// the kernel the VMM loads included; its snapshot restores through the same backend.
+#[test]
+fn test_boot_and_restore_with_uffd_memory_backend() {
+    let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    let snapshot_file = TempFile::new().unwrap();
+    let memory_file = TempFile::new().unwrap();
+
+    let boot_socket = dir.as_path().join("boot.sock");
+    let handler = UffdHandler::spawn(&boot_socket, None);
+    let mut resources = mock_resources(Some(NOISY_KERNEL_IMAGE), false, false, false);
+    resources
+        .set_memory_backend(MemBackendConfig {
+            backend_type: MemBackendType::Uffd,
+            backend_path: boot_socket,
+        })
+        .unwrap();
+    let (vmm, mut event_manager) = build_vmm(&resources, true);
+    // Loading the kernel filled pages before a vCPU ran.
+    assert!(handler.filled() > 0);
+    thread::sleep(Duration::from_millis(200));
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                #[cfg(not(feature = "cladefs"))]
+                mem_file_path: memory_file.as_path().to_path_buf(),
+                #[cfg(feature = "cladefs")]
+                mem_file_path: Some(memory_file.as_path().to_path_buf()),
+                sync_snapshot_files: true,
+                #[cfg(feature = "cladefs")]
+                memory_cell: None,
+                #[cfg(feature = "cladefs")]
+                for_migration: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    drop(handler);
+
+    let restore_socket = dir.as_path().join("restore.sock");
+    let handler = UffdHandler::spawn(
+        &restore_socket,
+        Some(File::open(memory_file.as_path()).unwrap()),
+    );
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot_api_controller = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+    preboot_api_controller
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: restore_socket,
+                backend_type: MemBackendType::Uffd,
+            },
+            track_dirty_pages: false,
+            resume_vm: true,
+            network_overrides: vec![],
+            vsock_override: None,
+            #[cfg(feature = "cladefs")]
+            cladefs_overrides: vec![],
+            #[cfg(feature = "cladefs")]
+            memory_cell: None,
+            clock_realtime: false,
+            huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+        }))
+        .unwrap();
+    let vmm = preboot_api_controller.built_vmm.take().unwrap();
+    assert_eq!(vmm.lock().unwrap().instance_info.state, VmState::Running);
+    thread::sleep(Duration::from_millis(200));
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    // The restored vCPUs' accesses were filled from the snapshot's memory.
+    assert!(handler.filled() > 0);
+}
+
+/// A booted VM's memory backend is `Uffd` alone: there is no snapshot memory file to load.
+#[test]
+fn test_boot_memory_backend_must_be_uffd() {
+    let mut resources = mock_resources(Some(NOISY_KERNEL_IMAGE), false, false, false);
+    assert_eq!(
+        resources.set_memory_backend(MemBackendConfig {
+            backend_type: MemBackendType::File,
+            backend_path: "/memory".into(),
+        }),
+        Err(vmm::vmm_config::snapshot::MemoryBackendConfigError::NotUffd(MemBackendType::File))
+    );
+    assert_eq!(resources.memory_backend, None);
 }

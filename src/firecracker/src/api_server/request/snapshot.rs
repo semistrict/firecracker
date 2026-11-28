@@ -144,6 +144,13 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
     Ok(parsed_req)
 }
 
+/// `PUT /memory-backend`: the handler a booted VM's memory is handed to, as `/snapshot/load`'s
+/// `mem_backend` is a restored VM's.
+pub(crate) fn parse_put_memory_backend(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let config = serde_json::from_slice::<MemBackendConfig>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::SetMemoryBackend(config)))
+}
+
 #[cfg(test)]
 mod tests {
     use vmm::vmm_config::snapshot::{
@@ -703,5 +710,29 @@ mod tests {
             "invalid": "Paused"
         }"#;
         parse_patch_vm_state(&Body::new(invalid_body)).unwrap_err();
+    }
+    #[test]
+    fn test_parse_put_memory_backend_request() {
+        use std::path::PathBuf;
+
+        parse_put_memory_backend(&Body::new("invalid_payload")).unwrap_err();
+        // A field it doesn't have.
+        parse_put_memory_backend(&Body::new(
+            r#"{"backend_type": "Uffd", "backend_path": "/uffd.sock", "other": 1}"#,
+        ))
+        .unwrap_err();
+
+        assert_eq!(
+            vmm_action_from_request(
+                parse_put_memory_backend(&Body::new(
+                    r#"{"backend_type": "Uffd", "backend_path": "/uffd.sock"}"#,
+                ))
+                .unwrap()
+            ),
+            VmmAction::SetMemoryBackend(MemBackendConfig {
+                backend_type: MemBackendType::Uffd,
+                backend_path: PathBuf::from("/uffd.sock"),
+            })
+        );
     }
 }

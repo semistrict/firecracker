@@ -29,7 +29,9 @@ use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::pmem::{parse_patch_pmem, parse_put_pmem};
-use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
+use super::request::snapshot::{
+    parse_patch_vm_state, parse_put_memory_backend, parse_put_snapshot,
+};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
 use crate::api_server::request::hotplug::memory::{
@@ -109,6 +111,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "cladefs", Some(body)) => parse_put_cladefs(body, path_tokens.next()),
             #[cfg(feature = "cladefs")]
             (Method::Put, "memory-cell", Some(body)) => parse_put_memory_cell(body),
+            (Method::Put, "memory-backend", Some(body)) => parse_put_memory_backend(body),
             (Method::Put, "logger", Some(body)) => parse_put_logger(body),
             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
             (Method::Put, "machine-config", Some(body)) => parse_put_machine_config(body),

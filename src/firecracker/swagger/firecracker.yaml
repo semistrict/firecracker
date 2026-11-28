@@ -475,6 +475,35 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /memory-backend:
+    put:
+      summary: Hands a booted VM's memory to a page fault handler. Pre-boot only.
+      description:
+        The handler serves a booted VM's guest memory as it does a restored VM's with
+        /snapshot/load's mem_backend: Firecracker makes the memory anonymous, registers it with a
+        userfaultfd for missing pages, and sends the handler the regions and the userfaultfd. The
+        handler fills each page as it is first touched, the VMM's loading of the kernel included.
+        Only the Uffd type is accepted, and not with a vhost-user device.
+      operationId: putMemoryBackend
+      parameters:
+        - name: body
+          in: body
+          description: The memory backend
+          required: true
+          schema:
+            $ref: "#/definitions/MemoryBackend"
+      responses:
+        204:
+          description: Memory backend set
+        400:
+          description: Memory backend cannot be set due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
   /pmem/{id}:
     put:
       summary: Creates or updates a pmem device. Pre-boot only.
@@ -1702,6 +1731,8 @@ definitions:
         $ref: "#/definitions/Metrics"
       memory-hotplug:
         $ref: "#/definitions/MemoryHotplugConfig"
+      memory-backend:
+        $ref: "#/definitions/MemoryBackend"
       mmds-config:
         $ref: "#/definitions/MmdsConfig"
       network-interfaces:

@@ -69,15 +69,23 @@ pub fn arch_mem_raw(mem_size_bytes: usize) -> Vec<GuestRegionMmap> {
 }
 
 pub fn create_vmm(
-    _kernel_image: Option<&str>,
+    kernel_image: Option<&str>,
     is_diff: bool,
     boot_microvm: bool,
     pci_enabled: bool,
     memory_hotplug_enabled: bool,
 ) -> (Arc<Mutex<Vmm>>, EventManager) {
-    let mut event_manager = EventManager::new().unwrap();
-    let empty_seccomp_filters = get_empty_filters();
+    let resources = mock_resources(kernel_image, is_diff, pci_enabled, memory_hotplug_enabled);
+    build_vmm(&resources, boot_microvm)
+}
 
+/// The resources [`create_vmm`] builds a VM of.
+pub fn mock_resources(
+    _kernel_image: Option<&str>,
+    is_diff: bool,
+    pci_enabled: bool,
+    memory_hotplug_enabled: bool,
+) -> VmResources {
     let boot_source_cfg = MockBootSourceConfig::new().with_default_boot_args();
     #[cfg(target_arch = "aarch64")]
     let boot_source_cfg: BootSourceConfig = boot_source_cfg.into();
@@ -105,9 +113,17 @@ pub fn create_vmm(
         });
     }
 
+    resources
+}
+
+/// Builds a VM of `resources`, and boots it if `boot_microvm`.
+pub fn build_vmm(resources: &VmResources, boot_microvm: bool) -> (Arc<Mutex<Vmm>>, EventManager) {
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+
     let vmm = build_microvm_for_boot(
         &InstanceInfo::default(),
-        &resources,
+        resources,
         &mut event_manager,
         &empty_seccomp_filters,
     )

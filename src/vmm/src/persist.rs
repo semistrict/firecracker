@@ -44,7 +44,7 @@ use crate::vstate::kvm::KvmState;
 #[cfg(feature = "cladefs")]
 use crate::vstate::memory::GuestMemoryExtension;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestAddress, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -601,13 +601,16 @@ pub fn restore_from_snapshot(
                 None,
             )
         }
-        MemBackendType::Uffd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Uffd => {
+            let (guest_memory, uffd) = guest_memory_from_uffd(
+                mem_backend_path,
+                mem_state.regions(),
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
+            (guest_memory, Some(uffd))
+        }
         // cladefs: a memory cell's window, by the code a fresh boot's is (TASK-456.3, board 14415).
         #[cfg(feature = "cladefs")]
         MemBackendType::Cell => (
@@ -707,14 +710,18 @@ pub enum GuestMemoryFromUffdError {
     Send(#[from] vmm_sys_util::errno::Error),
 }
 
-fn guest_memory_from_uffd(
+/// Guest memory of `regions`, anonymous, registered with a new userfaultfd for missing pages, and
+/// handed with it to the handler listening at `mem_uds_path`, which fills each page as it is
+/// first touched: a restored VM's memory, from its snapshot's, and a booted VM's
+/// (`PUT /memory-backend`), from nothing.
+pub(crate) fn guest_memory_from_uffd(
     mem_uds_path: &Path,
-    mem_state: &GuestMemoryState,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
-) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
+) -> Result<(Vec<GuestRegionMmap>, Uffd), GuestMemoryFromUffdError> {
     let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+        create_guest_memory(regions, track_dirty_pages, huge_pages)?;
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -738,15 +745,15 @@ fn guest_memory_from_uffd(
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
 
-    Ok((guest_memory, Some(uffd)))
+    Ok((guest_memory, uffd))
 }
 
 fn create_guest_memory(
-    mem_state: &GuestMemoryState,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let guest_memory = memory::anonymous(regions, track_dirty_pages, huge_pages)?;
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -958,7 +965,7 @@ mod tests {
         };
 
         let (_, uffd_regions) =
-            create_guest_memory(&mem_state, false, HugePageConfig::None).unwrap();
+            create_guest_memory(mem_state.regions(), false, HugePageConfig::None).unwrap();
 
         assert_eq!(uffd_regions.len(), 1);
         assert_eq!(uffd_regions[0].size, 0x20000);

@@ -36,6 +36,7 @@ use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::*;
 use crate::vmm_config::pmem::{PmemBuilder, PmemConfig, PmemConfigError};
 use crate::vmm_config::serial::SerialConfig;
+use crate::vmm_config::snapshot::{MemBackendConfig, MemoryBackendConfigError};
 use crate::vmm_config::vsock::*;
 use crate::vstate::memory;
 use crate::vstate::memory::{GuestRegionMmap, MemoryError};
@@ -76,6 +77,8 @@ pub enum ResourcesError {
     CladefsConfig(#[from] CladefsConfigError),
     /// Memory hotplug config error: {0}
     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
+    /// Memory backend error: {0}
+    MemoryBackend(#[from] MemoryBackendConfigError),
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -115,6 +118,9 @@ pub struct VmmConfig {
     #[serde(skip)]
     pub serial_config: Option<SerialConfig>,
     pub memory_hotplug: Option<MemoryHotplugConfig>,
+    /// The handler a booted VM's memory is handed to, as a restored VM's is (`Uffd`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_backend: Option<MemBackendConfig>,
     /// Enclave configuration for Nitro Enclaves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enclave: Option<EnclaveConfig>,
@@ -148,6 +154,8 @@ pub struct VmResources {
     pub memory_cell: Option<MemoryCellBootConfig>,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
+    /// The handler a booted VM's memory is handed to, as a restored VM's is (`Uffd`).
+    pub memory_backend: Option<MemBackendConfig>,
     /// The optional Mmds data store.
     // This is initialised on demand (if ever used), so that we don't allocate it unless it's
     // actually used.
@@ -269,6 +277,10 @@ impl VmResources {
         if let Some(serial_cfg) = vmm_config.serial_config {
             resources.serial_out_path = serial_cfg.serial_out_path;
             resources.serial_rate_limiter_cfg = serial_cfg.rate_limiter;
+        }
+
+        if let Some(memory_backend) = vmm_config.memory_backend {
+            resources.set_memory_backend(memory_backend)?;
         }
 
         if let Some(memory_hotplug_config) = vmm_config.memory_hotplug {
@@ -449,6 +461,16 @@ impl VmResources {
         Ok(())
     }
 
+    /// Sets the handler a booted VM's memory is handed to: `Uffd` alone.
+    pub fn set_memory_backend(
+        &mut self,
+        config: MemBackendConfig,
+    ) -> Result<(), MemoryBackendConfigError> {
+        config.validate_for_boot()?;
+        self.memory_backend = Some(config);
+        Ok(())
+    }
+
     /// Setter for mmds config.
     pub fn set_mmds_config(
         &mut self,
@@ -522,6 +544,14 @@ impl VmResources {
         Ok(())
     }
 
+    /// Whether a vhost-user-blk device is configured, whose back-end must map guest memory.
+    pub fn vhost_user_device_used(&self) -> bool {
+        self.block
+            .devices
+            .iter()
+            .any(|b| b.lock().expect("Poisoned lock").is_vhost_user())
+    }
+
     /// Allocates the given guest memory regions.
     ///
     /// If vhost-user-blk devices are in use, allocates memfd-backed shared memory, otherwise
@@ -530,11 +560,7 @@ impl VmResources {
         &self,
         regions: &[(GuestAddress, usize)],
     ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-        let vhost_user_device_used = self
-            .block
-            .devices
-            .iter()
-            .any(|b| b.lock().expect("Poisoned lock").is_vhost_user());
+        let vhost_user_device_used = self.vhost_user_device_used();
 
         // Page faults are more expensive for shared memory mapping, including  memfd.
         // For this reason, we only back guest memory with a memfd
@@ -572,7 +598,7 @@ impl VmResources {
         use crate::cladefs_memory::{CellMemoryError, Source, guest_memory};
         use crate::vmm_config::machine_config::HugePageConfig;
         let config = (self.memory_cell.as_ref()).ok_or(CellMemoryError::NoBootMemoryCell)?;
-        if (self.block.devices.iter()).any(|b| b.lock().expect("Poisoned lock").is_vhost_user()) {
+        if self.vhost_user_device_used() {
             return Err(CellMemoryError::VhostUser);
         }
         let regions =
@@ -627,6 +653,7 @@ impl From<&VmResources> for VmmConfig {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
+            memory_backend: resources.memory_backend.clone(),
             enclave: resources.enclave.clone(),
         }
     }
@@ -750,6 +777,7 @@ mod tests {
             serial_out_path: None,
             serial_rate_limiter_cfg: None,
             memory_hotplug: Default::default(),
+            memory_backend: None,
             enclave: None,
         }
     }

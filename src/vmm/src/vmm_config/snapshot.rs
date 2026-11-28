@@ -27,7 +27,7 @@ pub enum SnapshotType {
 /// 1) A file that contains the guest memory to be loaded,
 /// 2) An UDS where a custom page-fault handler process is listening for the UFFD set up by
 ///    Firecracker to handle its guest memory page faults.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum MemBackendType {
     /// Guest memory contents will be loaded from a file.
     File,
@@ -282,14 +282,33 @@ pub struct LoadSnapshotConfig {
     pub huge_pages: SnapshotLoadHugePageConfig,
 }
 
-/// Stores the configuration used for managing snapshot memory.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+/// Stores the configuration used for managing guest memory: a snapshot's, and a booted VM's
+/// (`PUT /memory-backend`, `Uffd` alone).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemBackendConfig {
     /// Path to the backend used to handle the guest memory.
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+}
+
+/// Errors of a booted VM's memory backend.
+#[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
+pub enum MemoryBackendConfigError {
+    /// A booted VM's memory backend must be `Uffd`: `{0:?}` names a snapshot's memory alone
+    NotUffd(MemBackendType),
+}
+
+impl MemBackendConfig {
+    /// Checks the backend may serve a booted VM's memory: `Uffd` alone, as there is no snapshot
+    /// memory to load.
+    pub fn validate_for_boot(&self) -> Result<(), MemoryBackendConfigError> {
+        match self.backend_type {
+            MemBackendType::Uffd => Ok(()),
+            other => Err(MemoryBackendConfigError::NotUffd(other)),
+        }
+    }
 }
 
 /// The microVM state options.

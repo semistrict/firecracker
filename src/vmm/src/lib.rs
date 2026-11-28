@@ -177,6 +177,7 @@ use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
+use crate::vmm_config::snapshot::MemBackendConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
@@ -336,6 +337,8 @@ pub struct Vmm {
     /// Machine config
     pub machine_config: MachineConfig,
     boot_source_config: BootSourceConfig,
+    /// The handler a booted VM's memory was handed to, if any.
+    memory_backend: Option<MemBackendConfig>,
     shutdown_exit_code: Option<FcExitCode>,
 
     /// VM object.
@@ -479,6 +482,7 @@ impl Vmm {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,
+            memory_backend: self.memory_backend.clone(),
             enclave: self.enclave_config(),
         }
     }

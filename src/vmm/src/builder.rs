@@ -42,7 +42,9 @@ use crate::initrd::{InitrdConfig, InitrdError};
 use crate::logger::debug;
 #[cfg(target_arch = "aarch64")]
 use crate::logger::warn;
-use crate::persist::{MicrovmState, MicrovmStateError};
+use crate::persist::{
+    GuestMemoryFromUffdError, MicrovmState, MicrovmStateError, guest_memory_from_uffd,
+};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
@@ -56,6 +58,7 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
+use crate::vmm_config::snapshot::MemBackendConfig;
 use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
@@ -113,6 +116,10 @@ pub enum StartMicrovmError {
     EnablePVTime(crate::arch::VcpuArchError),
     /// Invalid Memory Configuration: {0}
     GuestMemory(crate::vstate::memory::MemoryError),
+    /// Cannot hand guest memory to its memory backend: {0}
+    MemoryBackend(GuestMemoryFromUffdError),
+    /// A memory backend serves anonymous guest memory, which a vhost-user device's back-end can't map
+    MemoryBackendVhostUser,
     /// Error with initrd initialization: {0}.
     Initrd(#[from] InitrdError),
     /// Internal error while starting microVM: {0}
@@ -219,8 +226,13 @@ pub fn build_microvm_for_boot(
     let mut vcpus = vm.create_vcpus(vcpu_count)?;
     // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,
     // before they clone the GuestMemoryMmap object
-    let (guest_memory, hotpluggable) = allocate_guest_memory(&vm, vm_resources)?;
-    vm.register_dram_memory_regions(guest_memory)?;
+    let BootMemory {
+        dram,
+        hotpluggable,
+        uffd,
+    } = allocate_guest_memory(&vm, vm_resources)?;
+    vm.register_dram_memory_regions(dram)?;
+    vm.set_uffd(uffd);
     let virtio_mem_addr = match (hotpluggable, &vm_resources.memory_hotplug) {
         (Some((addr, hotplug_memory_region)), Some(memory_hotplug)) => {
             vm.register_hotpluggable_memory_region(
@@ -369,6 +381,7 @@ pub fn build_microvm_for_boot(
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
+        memory_backend: vm_resources.memory_backend.clone(),
         shutdown_exit_code: None,
         vm,
         device_manager,
@@ -564,6 +577,7 @@ pub fn build_microvm_from_snapshot(
         instance_info: instance_info.clone(),
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
+        memory_backend: vm_resources.memory_backend.clone(),
         shutdown_exit_code: None,
         vm,
         device_manager,
@@ -655,64 +669,132 @@ fn attach_entropy_device(
     )
 }
 
-/// The memory of the VM `vm_resources` boot into `vm`: its DRAM's regions, and its hotpluggable
-/// memory's region, with its address, if it has any.
-#[cfg(not(feature = "cladefs"))]
-fn allocate_guest_memory(
-    vm: &KvmVm,
-    vm_resources: &VmResources,
-) -> Result<
-    (
-        Vec<GuestRegionMmap>,
-        Option<(GuestAddress, GuestRegionMmap)>,
-    ),
-    StartMicrovmError,
-> {
-    let guest_memory = vm_resources
-        .allocate_guest_memory()
-        .map_err(StartMicrovmError::GuestMemory)?;
-    let Some(memory_hotplug) = &vm_resources.memory_hotplug else {
-        return Ok((guest_memory, None));
-    };
-    let addr = allocate_virtio_mem_address(vm, memory_hotplug.total_size_mib)?;
-    let hotplug_memory_region = vm_resources
-        .allocate_memory_region(
-            addr,
-            u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib)),
-        )
-        .map_err(StartMicrovmError::GuestMemory)?;
-    Ok((guest_memory, Some((addr, hotplug_memory_region))))
+/// A booted VM's guest memory.
+#[derive(Debug)]
+struct BootMemory {
+    /// Its DRAM's regions.
+    dram: Vec<GuestRegionMmap>,
+    /// Its hotpluggable memory's region, with its address, if it has any.
+    hotpluggable: Option<(GuestAddress, GuestRegionMmap)>,
+    /// The userfaultfd its memory backend serves it through, if it has one.
+    uffd: Option<Uffd>,
 }
 
-/// cladefs: the memory of the VM `vm_resources` boot into `vm`, as upstream's: but all of it, its
-/// hotpluggable memory's region last, one memory cell's window (board 14415), as a restored VM's
-/// is, the regions in the order a snapshot's memory lays them out.
-#[cfg(feature = "cladefs")]
+impl BootMemory {
+    /// The memory of `regions`, made in one piece, laid out as a snapshot's memory is: DRAM's,
+    /// then the hotpluggable memory's last, if `hotpluggable` gives its address.
+    fn split(
+        mut regions: Vec<GuestRegionMmap>,
+        hotpluggable: Option<GuestAddress>,
+        uffd: Option<Uffd>,
+    ) -> Self {
+        let hotpluggable = hotpluggable.map(|addr| {
+            let region = regions
+                .pop()
+                .expect("the hotpluggable memory's region, last");
+            (addr, region)
+        });
+        Self {
+            dram: regions,
+            hotpluggable,
+            uffd,
+        }
+    }
+}
+
+/// The memory of the VM `vm_resources` boot into `vm`.
 fn allocate_guest_memory(
     vm: &KvmVm,
     vm_resources: &VmResources,
-) -> Result<
-    (
-        Vec<GuestRegionMmap>,
-        Option<(GuestAddress, GuestRegionMmap)>,
-    ),
-    StartMicrovmError,
-> {
-    let hotpluggable = (vm_resources.memory_hotplug.as_ref())
+) -> Result<BootMemory, StartMicrovmError> {
+    match &vm_resources.memory_backend {
+        Some(backend) => allocate_backend_memory(vm, vm_resources, backend),
+        None => allocate_local_memory(vm, vm_resources),
+    }
+}
+
+/// The hotpluggable memory's region of the VM `vm_resources` boot into `vm`, if it has any: its
+/// address and size.
+fn hotpluggable_region(
+    vm: &KvmVm,
+    vm_resources: &VmResources,
+) -> Result<Option<(GuestAddress, usize)>, StartMicrovmError> {
+    (vm_resources.memory_hotplug.as_ref())
         .map(|memory_hotplug| {
             let addr = allocate_virtio_mem_address(vm, memory_hotplug.total_size_mib)?;
             let size = u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib));
-            Ok::<_, StartMicrovmError>((addr, size))
+            Ok((addr, size))
+        })
+        .transpose()
+}
+
+/// The memory of the VM `vm_resources` boot into `vm`, handed to its memory `backend` as a
+/// restored VM's is (`persist::guest_memory_from_uffd`), in one piece. Refused with a vhost-user
+/// device, whose back-end can't map such memory.
+fn allocate_backend_memory(
+    vm: &KvmVm,
+    vm_resources: &VmResources,
+    backend: &MemBackendConfig,
+) -> Result<BootMemory, StartMicrovmError> {
+    if vm_resources.vhost_user_device_used() {
+        return Err(StartMicrovmError::MemoryBackendVhostUser);
+    }
+    let hotpluggable = hotpluggable_region(vm, vm_resources)?;
+    let regions = crate::arch::arch_memory_regions(crate::utils::mib_to_bytes(
+        vm_resources.machine_config.mem_size_mib,
+    ));
+    let (guest_memory, uffd) = guest_memory_from_uffd(
+        &backend.backend_path,
+        regions.into_iter().chain(hotpluggable),
+        vm_resources.machine_config.track_dirty_pages,
+        vm_resources.machine_config.huge_pages,
+    )
+    .map_err(StartMicrovmError::MemoryBackend)?;
+    Ok(BootMemory::split(
+        guest_memory,
+        hotpluggable.map(|(addr, _)| addr),
+        Some(uffd),
+    ))
+}
+
+/// The memory of the VM `vm_resources` boot into `vm`, with no memory backend.
+#[cfg(not(feature = "cladefs"))]
+fn allocate_local_memory(
+    vm: &KvmVm,
+    vm_resources: &VmResources,
+) -> Result<BootMemory, StartMicrovmError> {
+    let dram = vm_resources
+        .allocate_guest_memory()
+        .map_err(StartMicrovmError::GuestMemory)?;
+    let hotpluggable = hotpluggable_region(vm, vm_resources)?
+        .map(|(addr, size)| {
+            let region = vm_resources
+                .allocate_memory_region(addr, size)
+                .map_err(StartMicrovmError::GuestMemory)?;
+            Ok::<_, StartMicrovmError>((addr, region))
         })
         .transpose()?;
-    let mut guest_memory = vm_resources.allocate_cell_memory(hotpluggable)?;
-    let hotpluggable = hotpluggable.map(|(addr, _)| {
-        let region = guest_memory
-            .pop()
-            .expect("the hotpluggable memory's region, last");
-        (addr, region)
-    });
-    Ok((guest_memory, hotpluggable))
+    Ok(BootMemory {
+        dram,
+        hotpluggable,
+        uffd: None,
+    })
+}
+
+/// cladefs: the memory of the VM `vm_resources` boot into `vm` with no memory backend, as
+/// upstream's: but in one piece, one memory cell's window (board 14415), as a restored VM's is.
+#[cfg(feature = "cladefs")]
+fn allocate_local_memory(
+    vm: &KvmVm,
+    vm_resources: &VmResources,
+) -> Result<BootMemory, StartMicrovmError> {
+    let hotpluggable = hotpluggable_region(vm, vm_resources)?;
+    let guest_memory = vm_resources.allocate_cell_memory(hotpluggable)?;
+    Ok(BootMemory::split(
+        guest_memory,
+        hotpluggable.map(|(addr, _)| addr),
+        None,
+    ))
 }
 
 fn allocate_virtio_mem_address(
@@ -1101,6 +1183,7 @@ pub(crate) mod tests {
             instance_info: InstanceInfo::default(),
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
+            memory_backend: None,
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
@@ -1119,6 +1202,7 @@ pub(crate) mod tests {
             instance_info: InstanceInfo::default(),
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
+            memory_backend: None,
             shutdown_exit_code: None,
             vm: Vm::Kvm(vm),
             device_manager,
