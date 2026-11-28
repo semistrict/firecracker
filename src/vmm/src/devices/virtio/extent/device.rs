@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(
             refused,
             "Extent device: the driver took features 0x120000001 of the 0x120000011 offered, \
-             where a driver of protocol version 2 takes every one: it is of another"
+             where a driver of protocol version 3 takes every one: it is of another"
         );
     }
 }
